@@ -612,6 +612,16 @@ class App(tk.Tk):
                      values=["strict", "namespace-wide", "cluster-wide"]) \
             .pack(side="left", padx=(4, 0))
 
+        # Controller name / namespace (only needed when the sealed-secrets
+        # controller isn't at its default kube-system/sealed-secrets-controller)
+        ctl = ttk.Frame(p); ctl.pack(fill="x", pady=(6, 2))
+        ttk.Label(ctl, text="Controller name:").pack(side="left")
+        self._ctl_name = ttk.Entry(ctl, width=24, font=(MONO, SZ))
+        self._ctl_name.pack(side="left", padx=(4, 12))
+        ttk.Label(ctl, text="NS:").pack(side="left")
+        self._ctl_ns = ttk.Entry(ctl, width=16, font=(MONO, SZ))
+        self._ctl_ns.pack(side="left", padx=(4, 0))
+
         cr = ttk.Frame(p); cr.pack(fill="x", pady=(6, 2))
         ttk.Label(cr, text="Cert (optional):").pack(side="left")
         self._cert_lbl = ttk.Label(cr, text="(none)", style="Dim.TLabel")
@@ -666,6 +676,12 @@ class App(tk.Tk):
             cmd.append(f"--context={self._seal_ctx.get()}")
         if self._cert:
             cmd.append(f"--cert={self._cert}")
+        ctl_name = self._ctl_name.get().strip()
+        if ctl_name:
+            cmd.append(f"--controller-name={ctl_name}")
+        ctl_ns = self._ctl_ns.get().strip()
+        if ctl_ns:
+            cmd.append(f"--controller-namespace={ctl_ns}")
         self._seal_btn.configure(state="disabled")
         self._status("Sealing…", "dim")
         run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r)),
@@ -678,7 +694,12 @@ class App(tk.Tk):
         if rc == -2:
             self._status("kubeseal timed out", "err"); return
         if rc != 0:
-            self._status(f"kubeseal error: {stderr.strip()[:80]}", "err"); return
+            err = stderr.strip() or "kubeseal failed"
+            # Show the full error in the output pane (it scrolls); the status bar
+            # only fits one truncated line.
+            self._set_text(self._sealed_out, "# kubeseal error\n" + err)
+            self._status(f"kubeseal error: {err.splitlines()[-1][:90]}", "err")
+            return
         self._set_text(self._sealed_out, stdout)
         self._status("Sealed successfully", "ok")
 
@@ -709,14 +730,48 @@ class App(tk.Tk):
             self._enc_ctx.set(ctxs[0])
             self._seal_ctx.set(ctxs[0])
             self._fetch_namespaces(ctxs[0])
+            self._detect_controller(ctxs[0])
 
     def _on_ctx_change(self, _=None):
         ctx = self._enc_ctx.get()
         self._seal_ctx.set(ctx)
         self._enc_ns.set(""); self._enc_sec.set("")
         self._ns_cb["values"] = []; self._sec_cb["values"] = []
+        # Controller is cluster-specific — clear so detection refills for the new ctx.
+        self._ctl_name.delete(0, "end"); self._ctl_ns.delete(0, "end")
         if ctx:
             self._fetch_namespaces(ctx)
+            self._detect_controller(ctx)
+
+    def _detect_controller(self, ctx: str):
+        """Find the sealed-secrets controller service in the cluster and
+        auto-fill the Controller name / NS fields (read-only lookup)."""
+        cmd = ["kubectl", "get", "svc", "-A", f"--context={ctx}", "-o",
+               "jsonpath={range .items[*]}{.metadata.namespace}{'\\t'}"
+               "{.metadata.name}{'\\n'}{end}"]
+        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_controller(o, e, r)))
+
+    def _got_controller(self, stdout, stderr, rc):
+        if rc != 0:
+            return
+        svcs = []
+        for line in stdout.splitlines():
+            if "\t" not in line:
+                continue
+            ns, name = line.split("\t", 1)
+            if "sealed-secrets" in name and "metrics" not in name:
+                svcs.append((ns.strip(), name.strip()))
+        if not svcs:
+            return
+        # Prefer the canonical "sealed-secrets-controller" service if present.
+        ns, name = next((s for s in svcs if s[1] == "sealed-secrets-controller"),
+                        svcs[0])
+        # Only fill fields the user hasn't already typed into.
+        if not self._ctl_name.get().strip():
+            self._ctl_name.delete(0, "end"); self._ctl_name.insert(0, name)
+        if not self._ctl_ns.get().strip():
+            self._ctl_ns.delete(0, "end"); self._ctl_ns.insert(0, ns)
+        self._status(f"Sealed-secrets controller: {ns}/{name}", "ok")
 
     def _fetch_namespaces(self, ctx: str):
         cmd = ["kubectl", "get", "namespaces", f"--context={ctx}",
