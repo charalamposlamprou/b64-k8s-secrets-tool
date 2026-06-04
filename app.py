@@ -605,6 +605,7 @@ class App(tk.Tk):
         self._seal_ctx = tk.StringVar()
         self._seal_ctx_cb = ttk.Combobox(cs, textvariable=self._seal_ctx, width=20,
                                          state="readonly")
+        self._seal_ctx_cb.bind("<<ComboboxSelected>>", self._on_seal_ctx_change)
         self._seal_ctx_cb.pack(side="left", padx=(4, 14))
         ttk.Label(cs, text="Scope:").pack(side="left")
         self._seal_scope = tk.StringVar(value="strict")
@@ -741,6 +742,14 @@ class App(tk.Tk):
         self._ctl_name.delete(0, "end"); self._ctl_ns.delete(0, "end")
         if ctx:
             self._fetch_namespaces(ctx)
+            self._detect_controller(ctx)
+
+    def _on_seal_ctx_change(self, _=None):
+        # Seal context picked independently of the Encode tab — re-detect the
+        # controller for the chosen cluster so the fields match what we seal against.
+        ctx = self._seal_ctx.get()
+        self._ctl_name.delete(0, "end"); self._ctl_ns.delete(0, "end")
+        if ctx:
             self._detect_controller(ctx)
 
     def _detect_controller(self, ctx: str):
