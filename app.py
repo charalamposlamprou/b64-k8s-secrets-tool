@@ -228,7 +228,10 @@ class App(tk.Tk):
         s.configure("TEntry",
             fieldbackground=BG3, foreground=FG, insertcolor=FG,
             bordercolor=BORDER, padding=[6, 4])
-        s.map("TEntry", bordercolor=[("focus", ACCENT)])
+        s.map("TEntry",
+            bordercolor=[("focus", ACCENT)],
+            fieldbackground=[("readonly", BG2)],
+            foreground=[("readonly", FGDIM)])
 
         # Scrollbars
         s.configure("Vertical.TScrollbar",
@@ -613,14 +616,14 @@ class App(tk.Tk):
                      values=["strict", "namespace-wide", "cluster-wide"]) \
             .pack(side="left", padx=(4, 0))
 
-        # Controller name / namespace (only needed when the sealed-secrets
-        # controller isn't at its default kube-system/sealed-secrets-controller)
+        # Controller name / namespace — auto-detected from the cluster and shown
+        # read-only (no manual entry; they refresh when the context changes).
         ctl = ttk.Frame(p); ctl.pack(fill="x", pady=(6, 2))
         ttk.Label(ctl, text="Controller name:").pack(side="left")
-        self._ctl_name = ttk.Entry(ctl, width=24, font=(MONO, SZ))
+        self._ctl_name = ttk.Entry(ctl, width=24, font=(MONO, SZ), state="readonly")
         self._ctl_name.pack(side="left", padx=(4, 12))
         ttk.Label(ctl, text="NS:").pack(side="left")
-        self._ctl_ns = ttk.Entry(ctl, width=16, font=(MONO, SZ))
+        self._ctl_ns = ttk.Entry(ctl, width=16, font=(MONO, SZ), state="readonly")
         self._ctl_ns.pack(side="left", padx=(4, 0))
 
         cr = ttk.Frame(p); cr.pack(fill="x", pady=(6, 2))
@@ -739,7 +742,7 @@ class App(tk.Tk):
         self._enc_ns.set(""); self._enc_sec.set("")
         self._ns_cb["values"] = []; self._sec_cb["values"] = []
         # Controller is cluster-specific — clear so detection refills for the new ctx.
-        self._ctl_name.delete(0, "end"); self._ctl_ns.delete(0, "end")
+        self._set_ro_entry(self._ctl_name, ""); self._set_ro_entry(self._ctl_ns, "")
         if ctx:
             self._fetch_namespaces(ctx)
             self._detect_controller(ctx)
@@ -748,7 +751,7 @@ class App(tk.Tk):
         # Seal context picked independently of the Encode tab — re-detect the
         # controller for the chosen cluster so the fields match what we seal against.
         ctx = self._seal_ctx.get()
-        self._ctl_name.delete(0, "end"); self._ctl_ns.delete(0, "end")
+        self._set_ro_entry(self._ctl_name, ""); self._set_ro_entry(self._ctl_ns, "")
         if ctx:
             self._detect_controller(ctx)
 
@@ -775,11 +778,8 @@ class App(tk.Tk):
         # Prefer the canonical "sealed-secrets-controller" service if present.
         ns, name = next((s for s in svcs if s[1] == "sealed-secrets-controller"),
                         svcs[0])
-        # Only fill fields the user hasn't already typed into.
-        if not self._ctl_name.get().strip():
-            self._ctl_name.delete(0, "end"); self._ctl_name.insert(0, name)
-        if not self._ctl_ns.get().strip():
-            self._ctl_ns.delete(0, "end"); self._ctl_ns.insert(0, ns)
+        self._set_ro_entry(self._ctl_name, name)
+        self._set_ro_entry(self._ctl_ns, ns)
         self._status(f"Sealed-secrets controller: {ns}/{name}", "ok")
 
     def _fetch_namespaces(self, ctx: str):
@@ -859,6 +859,13 @@ class App(tk.Tk):
         self._status(f"Loaded {len(data)} key(s) from {self._enc_sec.get()}", "ok")
 
     # --------------------------------------------------------------- helpers
+
+    def _set_ro_entry(self, entry: "tk.Entry", value: str):
+        """Set the text of a read-only ttk.Entry (toggles state to write)."""
+        entry.configure(state="normal")
+        entry.delete(0, "end")
+        entry.insert(0, value)
+        entry.configure(state="readonly")
 
     def _set_text(self, widget: tk.Text, text: str):
         widget.configure(state="normal")
