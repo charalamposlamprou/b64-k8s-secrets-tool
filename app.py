@@ -298,18 +298,19 @@ class App(tk.Tk):
         ttk.Label(p, text="Single Value Encoder", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
+        # Buttons packed right-first so they stay visible; the entry fills the gap.
         r = ttk.Frame(p); r.pack(fill="x", pady=2)
+        ttk.Button(r, text="Encode →", command=self._sv_encode) \
+            .pack(side="right", padx=(6, 0))
         self._sv_in = ttk.Entry(r, font=(MONO, SZ))
         self._sv_in.pack(side="left", fill="x", expand=True)
         self._sv_in.bind("<Return>", lambda _: self._sv_encode())
-        ttk.Button(r, text="Encode →", command=self._sv_encode) \
-            .pack(side="left", padx=(6, 0))
 
         r2 = ttk.Frame(p); r2.pack(fill="x", pady=2)
+        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._sv_out.get())) \
+            .pack(side="right", padx=(6, 0))
         self._sv_out = ttk.Entry(r2, font=(MONO, SZ), state="readonly")
         self._sv_out.pack(side="left", fill="x", expand=True)
-        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._sv_out.get())) \
-            .pack(side="left", padx=(6, 0))
 
         ttk.Separator(p).pack(fill="x", pady=10)
 
@@ -439,23 +440,24 @@ class App(tk.Tk):
         ttk.Label(p, text="Single Value Decoder", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
+        # Buttons packed right-first so they stay visible; the entry fills the gap.
         r = ttk.Frame(p); r.pack(fill="x", pady=2)
+        ttk.Button(r, text="Decode →", command=self._sv_decode) \
+            .pack(side="right", padx=(6, 0))
         self._dv_in = ttk.Entry(r, font=(MONO, SZ))
         self._dv_in.pack(side="left", fill="x", expand=True)
         self._dv_in.bind("<Return>", lambda _: self._sv_decode())
-        ttk.Button(r, text="Decode →", command=self._sv_decode) \
-            .pack(side="left", padx=(6, 0))
 
         r2 = ttk.Frame(p); r2.pack(fill="x", pady=2)
         self._dv_var = tk.StringVar()
+        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._dv_var.get())) \
+            .pack(side="right", padx=(6, 0))
+        self._dv_shown = False
+        self._dv_tog = ttk.Button(r2, text="Show", command=self._toggle_dv)
+        self._dv_tog.pack(side="right", padx=(6, 0))
         self._dv_out = ttk.Entry(r2, textvariable=self._dv_var, font=(MONO, SZ),
                                  state="readonly", show="•")
         self._dv_out.pack(side="left", fill="x", expand=True)
-        self._dv_shown = False
-        self._dv_tog = ttk.Button(r2, text="Show", command=self._toggle_dv)
-        self._dv_tog.pack(side="left", padx=(6, 0))
-        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._dv_var.get())) \
-            .pack(side="left", padx=(6, 0))
 
         if not PYYAML_OK:
             ttk.Label(p, text="⚠  PyYAML not installed — YAML decode table disabled",
