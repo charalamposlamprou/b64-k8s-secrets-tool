@@ -228,8 +228,16 @@ class App(tk.Tk):
         s.configure("TEntry",
             fieldbackground=BG3, foreground=FG, insertcolor=FG,
             bordercolor=BORDER, padding=[6, 4])
+        # Default entries (incl. readonly OUTPUT fields) keep full-contrast text.
         s.map("TEntry",
             bordercolor=[("focus", ACCENT)],
+            fieldbackground=[("readonly", BG3)],
+            foreground=[("readonly", FG)])
+        # Dimmed read-only style — used only for the auto-detected controller
+        # fields, to signal they aren't user-editable.
+        s.configure("RO.TEntry",
+            fieldbackground=BG2, foreground=FGDIM, bordercolor=BORDER, padding=[6, 4])
+        s.map("RO.TEntry",
             fieldbackground=[("readonly", BG2)],
             foreground=[("readonly", FGDIM)])
 
@@ -620,10 +628,12 @@ class App(tk.Tk):
         # read-only (no manual entry; they refresh when the context changes).
         ctl = ttk.Frame(p); ctl.pack(fill="x", pady=(6, 2))
         ttk.Label(ctl, text="Controller name:").pack(side="left")
-        self._ctl_name = ttk.Entry(ctl, width=24, font=(MONO, SZ), state="readonly")
+        self._ctl_name = ttk.Entry(ctl, width=24, font=(MONO, SZ),
+                                   state="readonly", style="RO.TEntry")
         self._ctl_name.pack(side="left", padx=(4, 12))
         ttk.Label(ctl, text="NS:").pack(side="left")
-        self._ctl_ns = ttk.Entry(ctl, width=16, font=(MONO, SZ), state="readonly")
+        self._ctl_ns = ttk.Entry(ctl, width=16, font=(MONO, SZ),
+                                  state="readonly", style="RO.TEntry")
         self._ctl_ns.pack(side="left", padx=(4, 0))
 
         cr = ttk.Frame(p); cr.pack(fill="x", pady=(6, 2))
