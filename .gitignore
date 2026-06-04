@@ -1,0 +1,19 @@
+# Virtualenv (recreate with `make setup`)
+.venv/
+
+# Runtime state
+.app.pid
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated / saved secrets — never commit these
+*.yaml
+*.yml
+.env
+sealed-*.yaml
+
+# macOS
+.DS_Store
