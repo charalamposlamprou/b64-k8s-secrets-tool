@@ -630,7 +630,7 @@ class App(tk.Tk):
         # read-only (no manual entry; they refresh when the context changes).
         ctl = ttk.Frame(p); ctl.pack(fill="x", pady=(6, 2))
         ttk.Label(ctl, text="Controller name:").pack(side="left")
-        self._ctl_name = ttk.Entry(ctl, width=24, font=(MONO, SZ),
+        self._ctl_name = ttk.Entry(ctl, width=28, font=(MONO, SZ),
                                    state="readonly", style="RO.TEntry")
         self._ctl_name.pack(side="left", padx=(4, 12))
         ttk.Label(ctl, text="NS:").pack(side="left")
