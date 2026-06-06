@@ -773,9 +773,14 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "svc", "-A", f"--context={ctx}", "-o",
                "jsonpath={range .items[*]}{.metadata.namespace}{'\\t'}"
                "{.metadata.name}{'\\n'}{end}"]
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_controller(o, e, r)))
+        run_bg(cmd, lambda o, e, r: self.after(0,
+               lambda: self._got_controller(ctx, o, e, r)))
 
-    def _got_controller(self, stdout, stderr, rc):
+    def _got_controller(self, ctx, stdout, stderr, rc):
+        # Lookups run on background threads and resolve out of order; ignore a
+        # stale result if the user has since switched to a different context.
+        if ctx != self._seal_ctx.get():
+            return
         if rc != 0:
             return
         svcs = []
