@@ -323,6 +323,7 @@ class App(tk.Tk):
         self._env_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel")
         self._env_lbl.pack(side="left", padx=6)
         ttk.Button(fp, text="Browse…", command=self._browse_env).pack(side="left")
+        ttk.Button(fp, text="Clear", command=self._clear_env).pack(side="left", padx=(4, 0))
 
         # cluster fetch row
         cf = ttk.Frame(p); cf.pack(fill="x", pady=(6, 2))
@@ -416,6 +417,11 @@ class App(tk.Tk):
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", text)
         self._status(f"Loaded {os.path.basename(path)}", "ok")
+
+    def _clear_env(self):
+        self._env_lbl.configure(text="(no file)")
+        self._kv.delete("1.0", "end")
+        self._status("Cleared", "ok")
 
     def _gen_yaml(self):
         data = parse_dotenv(self._kv.get("1.0", "end"))
