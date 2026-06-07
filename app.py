@@ -421,6 +421,7 @@ class App(tk.Tk):
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
         self._kv.delete("1.0", "end")
+        self._set_text(self._yaml_out, "")
         self._status("Cleared", "ok")
 
     def _gen_yaml(self):
