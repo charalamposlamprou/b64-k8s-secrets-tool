@@ -372,6 +372,13 @@ class App(tk.Tk):
         self._sec_ns_e.pack(side="left", padx=(4, 12))
         ttk.Button(mr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
 
+        # Pack bottom buttons before the expander so they are never pushed off-screen
+        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0), side="bottom")
+        ttk.Button(br, text="Copy YAML",
+                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"))) \
+            .pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="Save YAML…", command=self._save_yaml).pack(side="left")
+
         # YAML output — expands to fill remaining space
         yf = ttk.Frame(p); yf.pack(fill="both", expand=True, pady=(6, 2))
         xsb = ttk.Scrollbar(yf, orient="horizontal"); xsb.pack(side="bottom", fill="x")
@@ -384,12 +391,6 @@ class App(tk.Tk):
         self._yaml_out.pack(fill="both", expand=True)
         xsb.config(command=self._yaml_out.xview)
         ysb.config(command=self._yaml_out.yview)
-
-        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
-        ttk.Button(br, text="Copy YAML",
-                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"))) \
-            .pack(side="left", padx=(0, 6))
-        ttk.Button(br, text="Save YAML…", command=self._save_yaml).pack(side="left")
 
     def _sv_encode(self):
         t = self._sv_in.get()
@@ -501,15 +502,28 @@ class App(tk.Tk):
             lambda e: self._tbl_cv.configure(scrollregion=self._tbl_cv.bbox("all")))
         self._tbl_cv.bind("<Configure>",
             lambda e: self._tbl_cv.itemconfig(self._tbl_win, width=e.width))
-        self._tbl_cv.bind("<Enter>",
-            lambda e: self._tbl_cv.bind_all("<MouseWheel>", self._tbl_scroll))
-        self._tbl_cv.bind("<Leave>",
-            lambda e: self._tbl_cv.unbind_all("<MouseWheel>"))
+        self._tbl_cv.bind("<Enter>",  self._tbl_scroll_bind)
+        self._tbl_cv.bind("<Leave>",  self._tbl_scroll_unbind)
 
         self._tbl_rows = []
 
+    def _tbl_scroll_bind(self, _=None):
+        self._tbl_cv.bind_all("<MouseWheel>", self._tbl_scroll)
+        self._tbl_cv.bind_all("<Button-4>",   self._tbl_scroll)
+        self._tbl_cv.bind_all("<Button-5>",   self._tbl_scroll)
+
+    def _tbl_scroll_unbind(self, _=None):
+        self._tbl_cv.unbind_all("<MouseWheel>")
+        self._tbl_cv.unbind_all("<Button-4>")
+        self._tbl_cv.unbind_all("<Button-5>")
+
     def _tbl_scroll(self, e):
-        self._tbl_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        if e.num == 4:
+            self._tbl_cv.yview_scroll(-1, "units")
+        elif e.num == 5:
+            self._tbl_cv.yview_scroll(1, "units")
+        elif e.delta:
+            self._tbl_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
     def _sv_decode(self):
         t = self._dv_in.get().strip()
@@ -654,6 +668,13 @@ class App(tk.Tk):
         ttk.Label(sr, text="Seals the YAML generated on the Encode tab",
                   style="Dim.TLabel").pack(side="left", padx=10)
 
+        # Pack bottom buttons before the expander so they are never pushed off-screen
+        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0), side="bottom")
+        ttk.Button(br, text="Copy Sealed",
+                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"))) \
+            .pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="Save Sealed…", command=self._save_sealed).pack(side="left")
+
         of_ = ttk.Frame(p); of_.pack(fill="both", expand=True, pady=2)
         xsb = ttk.Scrollbar(of_, orient="horizontal"); xsb.pack(side="bottom", fill="x")
         ysb = ttk.Scrollbar(of_, orient="vertical");   ysb.pack(side="right",  fill="y")
@@ -665,12 +686,6 @@ class App(tk.Tk):
         self._sealed_out.pack(fill="both", expand=True)
         xsb.config(command=self._sealed_out.xview)
         ysb.config(command=self._sealed_out.yview)
-
-        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
-        ttk.Button(br, text="Copy Sealed",
-                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"))) \
-            .pack(side="left", padx=(0, 6))
-        ttk.Button(br, text="Save Sealed…", command=self._save_sealed).pack(side="left")
 
     def _browse_cert(self):
         path = filedialog.askopenfilename(

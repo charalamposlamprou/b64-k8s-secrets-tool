@@ -17,3 +17,7 @@ sealed-*.yaml
 
 # macOS
 .DS_Store
+
+# Editor / tooling
+.claude/
+.vscode/

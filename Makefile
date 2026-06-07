@@ -1,14 +1,18 @@
 # b64-k8s-secrets-tool
-#
-# Uses a venv built from a Homebrew Python (Tcl/Tk 9) because macOS system Tk 8.5
-# renders the dark theme incorrectly.
 
-# Python with a modern Tcl/Tk 9 (from `brew install python-tk@3.13`).
-# Falls back to plain python3 if the Homebrew one isn't present.
+UNAME := $(shell uname -s)
+
+# macOS: prefer Homebrew Python (Tcl/Tk 9) because system Tk 8.5 renders the
+# dark theme incorrectly. Linux: plain python3 with Tk 8.6 works fine.
+ifeq ($(UNAME), Darwin)
 PYTHON := $(shell [ -x /opt/homebrew/bin/python3.13 ] && echo /opt/homebrew/bin/python3.13 || command -v python3)
-VENV   := .venv
-PY     := $(VENV)/bin/python
-PIP    := $(VENV)/bin/pip
+else
+PYTHON := $(shell command -v python3)
+endif
+
+VENV    := .venv
+PY      := $(VENV)/bin/python
+PIP     := $(VENV)/bin/pip
 PIDFILE := .app.pid
 
 .PHONY: bootstrap deps start stop restart status setup clean
@@ -42,14 +46,18 @@ status:
 		echo "Not running"; \
 	fi
 
-## bootstrap: full fresh-install setup (Homebrew Tk + venv + deps)
+## bootstrap: full fresh-install setup (system deps + venv)
 bootstrap: deps setup
 	@echo "Bootstrap complete — run 'make start'"
 
-## deps: install the modern Tcl/Tk for Python via Homebrew (macOS)
+## deps: install system dependencies (macOS: Homebrew Tk; Linux: apt packages)
 deps:
+ifeq ($(UNAME), Darwin)
 	@command -v brew >/dev/null 2>&1 || { echo "Homebrew not found — install from https://brew.sh"; exit 1; }
 	brew list python-tk@3.13 >/dev/null 2>&1 || brew install python-tk@3.13
+else
+	sudo apt-get install -y python3-tk python3-venv python3-pip
+endif
 
 ## setup: create the venv and install Python dependencies (idempotent)
 setup: $(VENV)/.installed
