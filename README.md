@@ -28,7 +28,7 @@ cluster (read-only), and seal them with `kubeseal`.
 
 ## Requirements
 
-- macOS with [Homebrew](https://brew.sh)
+- macOS with [Homebrew](https://brew.sh), or Debian/Ubuntu Linux (incl. WSL) with `apt`
 - `kubectl` and `kubeseal` on your `PATH` (for the cluster-fetch and seal features)
 - A modern Tcl/Tk — see the note below
 

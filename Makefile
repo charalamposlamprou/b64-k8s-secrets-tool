@@ -3,9 +3,10 @@
 UNAME := $(shell uname -s)
 
 # macOS: prefer Homebrew Python (Tcl/Tk 9) because system Tk 8.5 renders the
-# dark theme incorrectly. Linux: plain python3 with Tk 8.6 works fine.
+# dark theme incorrectly. Homebrew lives in /opt/homebrew on Apple Silicon and
+# /usr/local on Intel. Linux: plain python3 with Tk 8.6 works fine.
 ifeq ($(UNAME), Darwin)
-PYTHON := $(shell [ -x /opt/homebrew/bin/python3.13 ] && echo /opt/homebrew/bin/python3.13 || command -v python3)
+PYTHON := $(shell [ -x /opt/homebrew/bin/python3.13 ] && echo /opt/homebrew/bin/python3.13 || { [ -x /usr/local/bin/python3.13 ] && echo /usr/local/bin/python3.13 || command -v python3; })
 else
 PYTHON := $(shell command -v python3)
 endif

@@ -60,15 +60,22 @@ def b64_encode(s: str) -> str:
     return base64.b64encode(s.encode()).decode()
 
 
-def b64_decode(s: str) -> str:
+def b64_decode(s: str, errors: str = "replace") -> str:
     s = s.strip()
     rem = len(s) % 4
     if rem:
         s += "=" * (4 - rem)
-    return base64.b64decode(s).decode("utf-8", errors="replace")
+    return base64.b64decode(s).decode("utf-8", errors=errors)
+
+
+_DOTENV_ESCAPES = {"\\": "\\", "n": "\n", "r": "\r", "t": "\t", '"': '"'}
+_DOTENV_UNESCAPE = re.compile(r'\\([\\nrt"])')
 
 
 def parse_dotenv(text: str) -> dict:
+    """Parse KEY=value lines. Single-quoted and bare values are literal;
+    double-quoted values un-escape \\\\, \\n, \\r, \\t and \\" (the inverse
+    of dotenv_line, so Load Template round-trips exactly)."""
     result = {}
     for line in text.splitlines():
         line = line.strip()
@@ -80,39 +87,66 @@ def parse_dotenv(text: str) -> dict:
             continue
         key, _, val = line.partition("=")
         key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-            val = val[1:-1]
-        val = val.replace("\\n", "\n")
+            quote, val = val[0], val[1:-1]
+            if quote == '"':
+                val = _DOTENV_UNESCAPE.sub(
+                    lambda m: _DOTENV_ESCAPES[m.group(1)], val)
         result[key] = val
     return result
+
+
+# Values that survive a bare (unquoted) .env line verbatim.
+_BARE_ENV = re.compile(r"[A-Za-z0-9_./:@+,=-]+\Z")
+
+
+def dotenv_line(key: str, val: str) -> str:
+    """Render KEY=value so parse_dotenv reads the exact value back:
+    bare when safe, otherwise double-quoted with escaping."""
+    if _BARE_ENV.match(val):
+        return f"{key}={val}"
+    esc = (val.replace("\\", "\\\\").replace('"', '\\"')
+              .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+    return f'{key}="{esc}"'
 
 
 # Plain (unquoted) YAML scalars: valid DNS-style k8s names/keys match this.
 _SAFE_YAML = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# Words a YAML 1.1 parser (kubectl) reads as booleans/null even when they are
+# meant as strings — e.g. a key "NO" or a base64 value "True".
+_YAML_AMBIG = {
+    "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO",
+    "true", "True", "TRUE", "false", "False", "FALSE",
+    "on", "On", "ON", "off", "Off", "OFF", "null", "Null", "NULL",
+}
+
 
 def yaml_scalar(v: str) -> str:
     """Return v as a YAML scalar, double-quoting (with escaping) if it isn't a
-    plain DNS-safe token, so hand-edited names/keys can't break the document."""
-    if _SAFE_YAML.match(v):
+    plain DNS-safe token, so hand-edited names/keys can't break the document.
+    The empty string is quoted too — a bare empty scalar reads as null."""
+    if _SAFE_YAML.match(v) and v not in _YAML_AMBIG:
         return v
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def build_secret_yaml(name: str, namespace: str, data: dict) -> str:
-    # base64 values are always plain-safe scalars; name/namespace/keys may be
-    # hand-edited, so quote them when necessary.
+def build_secret_yaml(name: str, namespace: str, data: dict,
+                      type_: str = "Opaque") -> str:
     lines = [
         "apiVersion: v1",
         "kind: Secret",
         "metadata:",
         f"  name: {yaml_scalar(name)}",
         f"  namespace: {yaml_scalar(namespace)}",
-        "type: Opaque",
+        f"type: {yaml_scalar(type_)}",
         "data:",
     ]
     for k, v in data.items():
-        lines.append(f"  {yaml_scalar(k)}: {b64_encode(v)}")
+        lines.append(f"  {yaml_scalar(k)}: {yaml_scalar(b64_encode(v))}")
     return "\n".join(lines) + "\n"
 
 
@@ -154,6 +188,9 @@ class App(tk.Tk):
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
         self._enc_sec = tk.StringVar()
+        # Secret type carried from Load Template into Generate YAML, so a
+        # fetched kubernetes.io/tls secret isn't regenerated as Opaque.
+        self._tpl_type = "Opaque"
 
         self._apply_style()
         self._build_ui()
@@ -411,17 +448,19 @@ class App(tk.Tk):
         try:
             with open(path) as f:
                 text = f.read()
-        except OSError as e:
-            self._status(f"File not found: {e}", "err"); return
+        except (OSError, UnicodeDecodeError) as e:
+            self._status(f"Could not read file: {e}", "err"); return
         self._env_lbl.configure(text=path)
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", text)
+        self._tpl_type = "Opaque"
         self._status(f"Loaded {os.path.basename(path)}", "ok")
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
         self._kv.delete("1.0", "end")
         self._set_text(self._yaml_out, "")
+        self._tpl_type = "Opaque"
         self._status("Cleared", "ok")
 
     def _gen_yaml(self):
@@ -430,7 +469,8 @@ class App(tk.Tk):
             self._status("No KEY=VALUE pairs found", "err"); return
         name = self._sec_name.get().strip() or "my-secret"
         ns   = self._sec_ns_e.get().strip()  or "default"
-        self._set_text(self._yaml_out, build_secret_yaml(name, ns, data))
+        self._set_text(self._yaml_out,
+                       build_secret_yaml(name, ns, data, self._tpl_type))
         self._status(f"Generated YAML with {len(data)} key(s)", "ok")
 
     def _save_yaml(self):
@@ -440,7 +480,7 @@ class App(tk.Tk):
             filetypes=[("YAML", "*.yaml"), ("All", "*.*")])
         if not path:
             return
-        self._write_file(path, self._yaml_out.get("1.0", "end"))
+        self._write_file(path, self._yaml_out.get("1.0", "end-1c"))
 
     # ---------------------------------------------------------------- decode tab
 
@@ -530,7 +570,12 @@ class App(tk.Tk):
         elif e.num == 5:
             self._tbl_cv.yview_scroll(1, "units")
         elif e.delta:
-            self._tbl_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            # macOS reports small deltas (±1…), not Windows-style ±120
+            # multiples — dividing by 120 truncates them to 0.
+            if sys.platform == "darwin":
+                self._tbl_cv.yview_scroll(-e.delta, "units")
+            else:
+                self._tbl_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
     def _sv_decode(self):
         t = self._dv_in.get().strip()
@@ -558,8 +603,8 @@ class App(tk.Tk):
         try:
             with open(path) as f:
                 content = f.read()
-        except OSError as e:
-            self._status(f"File not found: {e}", "err"); return
+        except (OSError, UnicodeDecodeError) as e:
+            self._status(f"Could not read file: {e}", "err"); return
         self._dec_lbl.configure(text=path)
         self._populate_table(content)
 
@@ -748,7 +793,7 @@ class App(tk.Tk):
             filetypes=[("YAML", "*.yaml"), ("All", "*.*")])
         if not path:
             return
-        self._write_file(path, self._sealed_out.get("1.0", "end"))
+        self._write_file(path, self._sealed_out.get("1.0", "end-1c"))
 
     # -------------------------------------------------------- kubectl integration
 
@@ -824,16 +869,20 @@ class App(tk.Tk):
     def _fetch_namespaces(self, ctx: str):
         cmd = ["kubectl", "get", "namespaces", f"--context={ctx}",
                "-o", "jsonpath={.items[*].metadata.name}"]
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_ns(o, e, r)))
+        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_ns(ctx, o, e, r)))
 
-    def _got_ns(self, stdout, stderr, rc):
+    def _got_ns(self, ctx, stdout, stderr, rc):
+        # Lookups run on background threads and resolve out of order; ignore a
+        # stale result if the user has since switched to a different context.
+        if ctx != self._enc_ctx.get():
+            return
         if rc != 0:
             self._status(f"Namespace fetch failed: {stderr.strip()[:60]}", "err"); return
         nss = stdout.strip().split()
         self._ns_cb["values"] = nss
         if nss:
             self._enc_ns.set(nss[0])
-            self._fetch_secrets(self._enc_ctx.get(), nss[0])
+            self._fetch_secrets(ctx, nss[0])
 
     def _on_ns_change(self, _=None):
         self._enc_sec.set(""); self._sec_cb["values"] = []
@@ -844,9 +893,12 @@ class App(tk.Tk):
     def _fetch_secrets(self, ctx: str, ns: str):
         cmd = ["kubectl", "get", "secrets", f"--context={ctx}", f"--namespace={ns}",
                "-o", "jsonpath={.items[*].metadata.name}"]
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_secrets(o, e, r)))
+        run_bg(cmd, lambda o, e, r: self.after(0,
+               lambda: self._got_secrets(ctx, ns, o, e, r)))
 
-    def _got_secrets(self, stdout, stderr, rc):
+    def _got_secrets(self, ctx, ns, stdout, stderr, rc):
+        if ctx != self._enc_ctx.get() or ns != self._enc_ns.get():
+            return
         if rc != 0:
             return
         secs = stdout.strip().split()
@@ -873,16 +925,18 @@ class App(tk.Tk):
             self._status(f"YAML parse error: {e}", "err"); return
         data = doc["data"] if isinstance(doc, dict) and isinstance(doc.get("data"), dict) else {}
         lines = []
+        skipped = 0
         for k, v in data.items():
             try:
-                dec = b64_decode(str(v)) if v else ""
+                dec = b64_decode(str(v), errors="strict") if v else ""
             except Exception:
-                dec = str(v)
-            # Escape newlines so multi-line values (certs, keys) stay on one
-            # KV line; parse_dotenv turns the literal \n back into a newline.
-            # (Mirrors parse_dotenv, which only un-escapes \n.)
-            dec = dec.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
-            lines.append(f"{k}={dec}")
+                # Binary (non-UTF-8) value: editing it as text would corrupt
+                # it on re-encode, so leave it out of the round-trip and keep
+                # the original base64 visible in a comment.
+                lines.append(f"# {k}: binary value skipped; base64: {v}")
+                skipped += 1
+                continue
+            lines.append(dotenv_line(k, dec))
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", "\n".join(lines))
 
@@ -894,8 +948,13 @@ class App(tk.Tk):
         ns   = meta.get("namespace") or self._enc_ns.get()
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, ns)
+        self._tpl_type = (doc.get("type") if isinstance(doc, dict) else None) \
+            or "Opaque"
 
-        self._status(f"Loaded {len(data)} key(s) from {self._enc_sec.get()}", "ok")
+        msg = f"Loaded {len(data) - skipped} key(s) from {self._enc_sec.get()}"
+        if skipped:
+            msg += f" — {skipped} binary value(s) skipped"
+        self._status(msg, "ok" if not skipped else "err")
 
     # --------------------------------------------------------------- helpers
 
@@ -919,7 +978,9 @@ class App(tk.Tk):
 
     def _write_file(self, path: str, content: str):
         try:
-            with open(path, "w") as f:
+            # Owner-only permissions — the file holds decodable secret data.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(content)
             self._status(f"Saved {os.path.basename(path)}", "ok")
         except OSError as e:
