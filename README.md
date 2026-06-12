@@ -16,7 +16,9 @@ cluster (read-only), and seal them with `kubeseal`.
     secret from a cluster, edit the `KEY=value` pairs, then generate, copy, or
     save the Secret YAML
   - Secret **type** selector (`Opaque`, `bootstrap.kubernetes.io/token`,
-    `kubernetes.io/tls`, …) — pick a built-in type or enter a custom one
+    `kubernetes.io/tls`, …) — pick a built-in type or enter a custom one;
+    while it is left at `Opaque`, the type is auto-detected from the keys
+    (e.g. `tls.crt` + `tls.key` → `kubernetes.io/tls`)
   - **Load Template** pulls a secret from the cluster and decodes it into the
     editor — also pre-filling the editable Secret name / Namespace / Type fields
 - **Decode tab**
