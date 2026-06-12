@@ -229,7 +229,10 @@ class App(tk.Tk):
 
         self._apply_style()
         self._build_ui()
-        self._fetch_contexts()
+        # Defer until mainloop is running: the fetch worker thread reports
+        # back via self.after(), which raises RuntimeError before mainloop
+        # starts (e.g. kubectl missing fails the thread instantly).
+        self.after(0, self._fetch_contexts)
 
     # ------------------------------------------------------------------ style
 
