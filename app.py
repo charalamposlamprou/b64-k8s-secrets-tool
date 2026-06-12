@@ -125,6 +125,7 @@ SECRET_TYPES = [
     "kubernetes.io/tls",
 ]
 
+
 def detect_secret_type(keys) -> str:
     """Infer the Secret type from its data keys, using the keys each built-in
     type requires. Conservative: anything ambiguous stays Opaque."""
@@ -155,12 +156,16 @@ _YAML_AMBIG = {
     "on", "On", "ON", "off", "Off", "OFF", "null", "Null", "NULL",
 }
 
+# Strings YAML reads as numbers — e.g. the valid secret name "1234".
+_YAML_NUMERIC = re.compile(r"^([0-9]+|0[xo][0-9A-Fa-f]+)$")
+
 
 def yaml_scalar(v: str) -> str:
     """Return v as a YAML scalar, double-quoting (with escaping) if it isn't a
     plain DNS-safe token, so hand-edited names/keys can't break the document.
     The empty string is quoted too — a bare empty scalar reads as null."""
-    if _SAFE_YAML.match(v) and v not in _YAML_AMBIG:
+    if _SAFE_YAML.match(v) and v not in _YAML_AMBIG \
+            and not _YAML_NUMERIC.match(v):
         return v
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -506,7 +511,10 @@ class App(tk.Tk):
             self._status("No KEY=VALUE pairs found", "err"); return
         name  = self._sec_name.get().strip() or "my-secret"
         ns    = self._sec_ns_e.get().strip()  or "default"
-        type_ = self._sec_type.get().strip()  or "Opaque"
+        type_ = self._sec_type.get().strip()
+        if not type_:
+            type_ = "Opaque"
+            self._sec_type.set(type_)
         msg = f"Generated YAML with {len(data)} key(s)"
         # Auto-detect only while the field is the default, so an explicit
         # selection (or a type carried over by Load Template) is never overridden.
