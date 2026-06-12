@@ -140,7 +140,9 @@ def detect_secret_type(keys) -> str:
         return "kubernetes.io/ssh-auth"
     if {"token-id", "token-secret"} <= ks:
         return "bootstrap.kubernetes.io/token"
-    if ks and ks <= {"username", "password"}:
+    # Both keys required: a lone "password" key is common in plain Opaque
+    # secrets (argocd-initial-admin-secret, Grafana, ...).
+    if ks == {"username", "password"}:
         return "kubernetes.io/basic-auth"
     return "Opaque"
 
