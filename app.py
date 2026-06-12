@@ -147,8 +147,10 @@ def detect_secret_type(keys) -> str:
     return "Opaque"
 
 
-# Plain (unquoted) YAML scalars: valid DNS-style k8s names/keys match this.
-_SAFE_YAML = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Plain (unquoted) YAML scalars. Letter-first so nothing digit-led can hit a
+# YAML 1.1 numeric form (1234, 0x1A, 1_000, 1.5, ...); digit-led names/keys
+# are rare and quoting them is always valid.
+_SAFE_YAML = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
 
 # Words a YAML 1.1 parser (kubectl) reads as booleans/null even when they are
 # meant as strings — e.g. a key "NO" or a base64 value "True".
@@ -158,16 +160,11 @@ _YAML_AMBIG = {
     "on", "On", "ON", "off", "Off", "OFF", "null", "Null", "NULL",
 }
 
-# Strings YAML reads as numbers — e.g. the valid secret name "1234".
-_YAML_NUMERIC = re.compile(r"^([0-9]+|0[xo][0-9A-Fa-f]+)$")
-
-
 def yaml_scalar(v: str) -> str:
     """Return v as a YAML scalar, double-quoting (with escaping) if it isn't a
     plain DNS-safe token, so hand-edited names/keys can't break the document.
     The empty string is quoted too — a bare empty scalar reads as null."""
-    if _SAFE_YAML.match(v) and v not in _YAML_AMBIG \
-            and not _YAML_NUMERIC.match(v):
+    if _SAFE_YAML.match(v) and v not in _YAML_AMBIG:
         return v
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
