@@ -113,6 +113,18 @@ def dotenv_line(key: str, val: str) -> str:
     return f'{key}="{esc}"'
 
 
+# Built-in Kubernetes Secret types (the field accepts any string).
+SECRET_TYPES = [
+    "Opaque",
+    "bootstrap.kubernetes.io/token",
+    "kubernetes.io/basic-auth",
+    "kubernetes.io/dockercfg",
+    "kubernetes.io/dockerconfigjson",
+    "kubernetes.io/service-account-token",
+    "kubernetes.io/ssh-auth",
+    "kubernetes.io/tls",
+]
+
 # Plain (unquoted) YAML scalars: valid DNS-style k8s names/keys match this.
 _SAFE_YAML = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -188,9 +200,6 @@ class App(tk.Tk):
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
         self._enc_sec = tk.StringVar()
-        # Secret type carried from Load Template into Generate YAML, so a
-        # fetched kubernetes.io/tls secret isn't regenerated as Opaque.
-        self._tpl_type = "Opaque"
 
         self._apply_style()
         self._build_ui()
@@ -398,7 +407,7 @@ class App(tk.Tk):
         self._kv.pack(fill="x")
         ksb.config(command=self._kv.yview)
 
-        # name + namespace + generate
+        # name + namespace
         mr = ttk.Frame(p); mr.pack(fill="x", pady=(6, 2))
         ttk.Label(mr, text="Secret name:").pack(side="left")
         self._sec_name = ttk.Entry(mr, width=22, font=(MONO, SZ))
@@ -408,7 +417,16 @@ class App(tk.Tk):
         self._sec_ns_e = ttk.Entry(mr, width=14, font=(MONO, SZ))
         self._sec_ns_e.insert(0, "default")
         self._sec_ns_e.pack(side="left", padx=(4, 12))
-        ttk.Button(mr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
+
+        # type + generate — editable combobox: pick a built-in type or type
+        # any custom one; Load Template fills it from the fetched secret.
+        tr = ttk.Frame(p); tr.pack(fill="x", pady=(0, 2))
+        ttk.Label(tr, text="Type:").pack(side="left")
+        self._sec_type = ttk.Combobox(tr, width=30, font=(MONO, SZ),
+                                      values=SECRET_TYPES)
+        self._sec_type.set("Opaque")
+        self._sec_type.pack(side="left", padx=(4, 12))
+        ttk.Button(tr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
 
         # Pack bottom buttons before the expander so they are never pushed off-screen
         br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0), side="bottom")
@@ -453,24 +471,25 @@ class App(tk.Tk):
         self._env_lbl.configure(text=path)
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", text)
-        self._tpl_type = "Opaque"
+        self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
         self._kv.delete("1.0", "end")
         self._set_text(self._yaml_out, "")
-        self._tpl_type = "Opaque"
+        self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
 
     def _gen_yaml(self):
         data = parse_dotenv(self._kv.get("1.0", "end"))
         if not data:
             self._status("No KEY=VALUE pairs found", "err"); return
-        name = self._sec_name.get().strip() or "my-secret"
-        ns   = self._sec_ns_e.get().strip()  or "default"
+        name  = self._sec_name.get().strip() or "my-secret"
+        ns    = self._sec_ns_e.get().strip()  or "default"
+        type_ = self._sec_type.get().strip()  or "Opaque"
         self._set_text(self._yaml_out,
-                       build_secret_yaml(name, ns, data, self._tpl_type))
+                       build_secret_yaml(name, ns, data, type_))
         self._status(f"Generated YAML with {len(data)} key(s)", "ok")
 
     def _save_yaml(self):
@@ -948,8 +967,8 @@ class App(tk.Tk):
         ns   = meta.get("namespace") or self._enc_ns.get()
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, ns)
-        self._tpl_type = (doc.get("type") if isinstance(doc, dict) else None) \
-            or "Opaque"
+        self._sec_type.set(
+            (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
 
         msg = f"Loaded {len(data) - skipped} key(s) from {self._enc_sec.get()}"
         if skipped:

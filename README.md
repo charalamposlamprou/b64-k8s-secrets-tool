@@ -15,8 +15,10 @@ cluster (read-only), and seal them with `kubeseal`.
   - `.env` → Kubernetes Secret YAML: load a `.env` file or fetch an existing
     secret from a cluster, edit the `KEY=value` pairs, then generate, copy, or
     save the Secret YAML
+  - Secret **type** selector (`Opaque`, `bootstrap.kubernetes.io/token`,
+    `kubernetes.io/tls`, …) — pick a built-in type or enter a custom one
   - **Load Template** pulls a secret from the cluster and decodes it into the
-    editor — also pre-filling the editable Secret name / Namespace fields
+    editor — also pre-filling the editable Secret name / Namespace / Type fields
 - **Decode tab**
   - Single-value base64 decoder with masked output + Show/Hide
   - Secret YAML → decoded table: per-row Show/Hide and Copy, plus Show All / Hide All
