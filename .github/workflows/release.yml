@@ -1,11 +1,11 @@
 name: Release
 
-# Releases are cut automatically when a pull request is merged into main.
-# Add ONE of these labels to the PR to trigger and size the release:
-#   release:major   v1.2.3 -> v2.0.0
+# Every merged PR into main cuts a release. The bump defaults to patch;
+# add a label to bump higher:
+#   (no label)      v1.2.3 -> v1.2.4   (patch, the default)
 #   release:minor   v1.2.3 -> v1.3.0
-#   release:patch   v1.2.3 -> v1.2.4
-# A merged PR with none of these labels does nothing.
+#   release:major   v1.2.3 -> v2.0.0
+# To merge WITHOUT releasing, add the `release:skip` label.
 on:
   pull_request:
     types: [closed]
@@ -23,14 +23,11 @@ concurrency:
 jobs:
   release:
     name: Create GitHub release
-    # Only on a real merge (not a closed-without-merge) that carries a release label.
+    # Every real merge releases (not a closed-without-merge), unless the PR
+    # carries the release:skip label.
     if: >
       github.event.pull_request.merged == true &&
-      (
-        contains(github.event.pull_request.labels.*.name, 'release:major') ||
-        contains(github.event.pull_request.labels.*.name, 'release:minor') ||
-        contains(github.event.pull_request.labels.*.name, 'release:patch')
-      )
+      !contains(github.event.pull_request.labels.*.name, 'release:skip')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
