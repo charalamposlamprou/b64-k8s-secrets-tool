@@ -8,6 +8,13 @@ cluster (read-only), and seal them with `kubeseal`.
 > `create`, `patch`, or `delete`. It only *reads* (contexts, namespaces,
 > secrets) and produces YAML locally.
 
+## Screenshots
+
+| Encode | Decode | Seal |
+|:---:|:---:|:---:|
+| ![Encode tab](docs/encode.png) | ![Decode tab](docs/decode.png) | ![Seal tab](docs/seal.png) |
+| Encode a single value or load a `.env` file, fetch a secret from the cluster, and generate Kubernetes Secret YAML. | Decode a single base64 value or load a Secret YAML file to view all keys in a masked, per-row table with Show/Hide and Copy. | Seal the generated YAML with `kubeseal` — auto-detects the controller name and namespace; supports strict, namespace-wide, and cluster-wide scopes. |
+
 ## Features
 
 - **Encode tab**
