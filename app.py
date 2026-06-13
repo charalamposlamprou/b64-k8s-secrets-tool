@@ -774,6 +774,11 @@ class App(tk.Tk):
         self._seal_btn = ttk.Button(sr, text="⊙  Seal →", style="Accent.TButton",
                                     command=self._do_seal)
         self._seal_btn.pack(side="left")
+        # Enabled only once there is sealed output to check; asks the controller
+        # to test-decrypt it (creates nothing — stays within the read-only promise).
+        self._validate_btn = ttk.Button(sr, text="Validate", command=self._do_validate,
+                                         state="disabled")
+        self._validate_btn.pack(side="left", padx=(6, 0))
         ttk.Label(sr, text="Seals the YAML generated on the Encode tab",
                   style="Dim.TLabel").pack(side="left", padx=10)
 
@@ -823,6 +828,9 @@ class App(tk.Tk):
         if ctl_ns:
             cmd.append(f"--controller-namespace={ctl_ns}")
         self._seal_btn.configure(state="disabled")
+        # The current sealed output (if any) is about to be replaced; a stale
+        # validation result would be misleading, so disable until the reseal lands.
+        self._validate_btn.configure(state="disabled")
         self._status("Sealing…", "dim")
         run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r)),
                stdin_data=yaml_text)
@@ -841,7 +849,41 @@ class App(tk.Tk):
             self._status(f"kubeseal error: {err.splitlines()[-1][:90]}", "err")
             return
         self._set_text(self._sealed_out, stdout)
+        self._validate_btn.configure(state="normal")
         self._status("Sealed successfully", "ok")
+
+    def _do_validate(self):
+        # Round-trips the sealed output through the controller's verify endpoint:
+        # catches a wrong key/controller, wrong scope, or wrong name/namespace —
+        # the mis-seals that otherwise only surface at apply time. Creates nothing.
+        sealed = self._sealed_out.get("1.0", "end").strip()
+        if not sealed or sealed.startswith("# kubeseal error"):
+            self._status("Seal a secret first", "err"); return
+        cmd = ["kubeseal", "--validate"]
+        if self._seal_ctx.get():
+            cmd.append(f"--context={self._seal_ctx.get()}")
+        ctl_name = self._ctl_name.get().strip()
+        if ctl_name:
+            cmd.append(f"--controller-name={ctl_name}")
+        ctl_ns = self._ctl_ns.get().strip()
+        if ctl_ns:
+            cmd.append(f"--controller-namespace={ctl_ns}")
+        self._validate_btn.configure(state="disabled")
+        self._status("Validating…", "dim")
+        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_validated(o, e, r)),
+               stdin_data=sealed)
+
+    def _on_validated(self, stdout, stderr, rc):
+        self._validate_btn.configure(state="normal")
+        if rc == -1:
+            self._status("kubeseal not in PATH", "err"); return
+        if rc == -2:
+            self._status("kubeseal timed out", "err"); return
+        if rc != 0:
+            # kubeseal prints the reason (e.g. "unable to decrypt") to stderr.
+            err = (stderr.strip() or "validation failed").splitlines()[-1][:90]
+            self._status(f"Invalid seal: {err}", "err"); return
+        self._status("Valid — the controller can decrypt this", "ok")
 
     def _save_sealed(self):
         name = self._sec_name.get().strip() or "my-secret"
