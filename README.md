@@ -35,6 +35,9 @@ cluster (read-only), and seal them with `kubeseal`.
   - Seals the YAML from the Encode tab with `kubeseal`
   - Context + scope (`strict` / `namespace-wide` / `cluster-wide`) and an
     optional cert file
+  - **Validate** round-trips the sealed output through the controller
+    (`kubeseal --validate`) to confirm it will actually decrypt — catching a
+    wrong key, scope, or name/namespace before you apply it (creates nothing)
 - All `kubectl` / `kubeseal` calls run on background threads, so the UI never blocks.
 
 ## Requirements

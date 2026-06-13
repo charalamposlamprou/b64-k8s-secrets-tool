@@ -15,6 +15,9 @@ __pycache__/
 .env
 sealed-*.yaml
 
+# Local test certs/keys
+certs/
+
 # ...but do track CI workflows
 !.github/workflows/*.yml
 
