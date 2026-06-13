@@ -86,3 +86,18 @@ Makefile      setup / start / stop / status
 README.md     this file
 .venv/        virtualenv with Tcl/Tk 9 + PyYAML (created by make)
 ```
+
+## Releases
+
+Releases are cut automatically when a pull request is merged into `main`
+carrying one of these labels, which also sizes the version bump:
+
+| Label | Bump | Example |
+|---|---|---|
+| `release:major` | major | `v1.2.3` → `v2.0.0` |
+| `release:minor` | minor | `v1.2.3` → `v1.3.0` |
+| `release:patch` | patch | `v1.2.3` → `v1.2.4` |
+
+The workflow computes the next version from the latest tag, then creates the
+tag and a GitHub release with auto-generated notes. Merging a PR without a
+`release:*` label does nothing.
