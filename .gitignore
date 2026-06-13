@@ -15,6 +15,9 @@ __pycache__/
 .env
 sealed-*.yaml
 
+# ...but do track CI workflows
+!.github/workflows/*.yml
+
 # macOS
 .DS_Store
 

@@ -1,0 +1,94 @@
+name: Release
+
+# Releases are cut automatically when a pull request is merged into main.
+# Add ONE of these labels to the PR to trigger and size the release:
+#   release:major   v1.2.3 -> v2.0.0
+#   release:minor   v1.2.3 -> v1.3.0
+#   release:patch   v1.2.3 -> v1.2.4
+# A merged PR with none of these labels does nothing.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub release
+    # Only on a real merge (not a closed-without-merge) that carries a release label.
+    if: >
+      github.event.pull_request.merged == true &&
+      (
+        contains(github.event.pull_request.labels.*.name, 'release:major') ||
+        contains(github.event.pull_request.labels.*.name, 'release:minor') ||
+        contains(github.event.pull_request.labels.*.name, 'release:patch')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Sanity check (app.py parses)
+        run: python -c "import ast; ast.parse(open('app.py').read()); print('app.py parses OK')"
+
+      - name: Compute next version
+        id: version
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          # Pick the bump level from the PR labels (major beats minor beats patch).
+          if echo "$LABELS" | grep -q 'release:major'; then bump=major
+          elif echo "$LABELS" | grep -q 'release:minor'; then bump=minor
+          else bump=patch
+          fi
+
+          # Latest existing vX.Y.Z tag, or v0.0.0 if there are none yet.
+          latest="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1)"
+          latest="${latest:-v0.0.0}"
+          echo "Latest tag: $latest (bump: $bump)"
+
+          ver="${latest#v}"
+          major="${ver%%.*}"
+          rest="${ver#*.}"
+          minor="${rest%%.*}"
+          patch="${rest#*.}"
+
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          next="v${major}.${minor}.${patch}"
+          echo "Next version: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Build source archive
+        run: |
+          set -euo pipefail
+          archive="b64-k8s-secrets-tool-${{ steps.version.outputs.tag }}.tar.gz"
+          git archive --format=tar.gz \
+            --prefix="b64-k8s-secrets-tool-${{ steps.version.outputs.tag }}/" \
+            -o "$archive" HEAD
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: ${{ env.ARCHIVE }}
