@@ -89,15 +89,15 @@ README.md     this file
 
 ## Releases
 
-Releases are cut automatically when a pull request is merged into `main`
-carrying one of these labels, which also sizes the version bump:
+**Every pull request merged into `main` cuts a release.** The version bump
+defaults to **patch**; add a label to bump higher, or skip the release:
 
 | Label | Bump | Example |
 |---|---|---|
-| `release:major` | major | `v1.2.3` → `v2.0.0` |
+| `release:patch` _or no label_ | patch | `v1.2.3` → `v1.2.4` |
 | `release:minor` | minor | `v1.2.3` → `v1.3.0` |
-| `release:patch` | patch | `v1.2.3` → `v1.2.4` |
+| `release:major` | major | `v1.2.3` → `v2.0.0` |
+| `release:skip` | _no release_ | — |
 
 The workflow computes the next version from the latest tag, then creates the
-tag and a GitHub release with auto-generated notes. Merging a PR without a
-`release:*` label does nothing.
+tag and a GitHub release with auto-generated notes.
