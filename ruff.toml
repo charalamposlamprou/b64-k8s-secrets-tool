@@ -1,0 +1,5 @@
+# Lint config. The codebase deliberately uses `stmt; return` one-liners for
+# terse UI callbacks, so E702 (multiple statements on one line) is disabled;
+# the rest of ruff's default checks (pyflakes F-rules, pycodestyle E/W) apply.
+[lint]
+ignore = ["E702"]
