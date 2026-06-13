@@ -94,7 +94,7 @@ defaults to **patch**; add a label to bump higher, or skip the release:
 
 | Label | Bump | Example |
 |---|---|---|
-| _(none)_ | patch | `v1.2.3` → `v1.2.4` |
+| `release:patch` _or no label_ | patch | `v1.2.3` → `v1.2.4` |
 | `release:minor` | minor | `v1.2.3` → `v1.3.0` |
 | `release:major` | major | `v1.2.3` → `v2.0.0` |
 | `release:skip` | _no release_ | — |

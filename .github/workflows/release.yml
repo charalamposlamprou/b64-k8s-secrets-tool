@@ -1,8 +1,8 @@
 name: Release
 
 # Every merged PR into main cuts a release. The bump defaults to patch;
-# add a label to bump higher:
-#   (no label)      v1.2.3 -> v1.2.4   (patch, the default)
+# add a label to size it explicitly:
+#   release:patch   v1.2.3 -> v1.2.4   (same as no label)
 #   release:minor   v1.2.3 -> v1.3.0
 #   release:major   v1.2.3 -> v2.0.0
 # To merge WITHOUT releasing, add the `release:skip` label.
