@@ -64,11 +64,12 @@ endif
 setup: $(VENV)/.installed
 
 $(VENV)/.installed: pyproject.toml
-	@echo "Creating venv with $(PYTHON)"
-	$(PYTHON) -m venv $(VENV)
-	$(PIP) install --quiet --upgrade pip
-	$(PIP) install --quiet -e '.[dev]'
+	@echo "Syncing dependencies into $(VENV) (pyproject.toml changed)..."
+	@$(PYTHON) -m venv $(VENV)
+	@$(PIP) install --quiet --upgrade pip
+	@$(PIP) install --quiet -e '.[dev]'
 	@touch $@
+	@echo "Dependencies up to date."
 
 ## clean: remove the venv, pidfile, build artifacts and tooling caches
 clean: stop
