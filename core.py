@@ -19,11 +19,11 @@ def b64_encode(s: str) -> str:
 
 
 def b64_decode(s: str, errors: str = "replace") -> str:
-    s = s.strip()
+    s = "".join(s.split())   # drop ALL whitespace, incl. line wraps
     rem = len(s) % 4
     if rem:
         s += "=" * (4 - rem)
-    return base64.b64decode(s).decode("utf-8", errors=errors)
+    return base64.b64decode(s, validate=True).decode("utf-8", errors=errors)
 
 
 # ---------------------------------------------------------------------------
