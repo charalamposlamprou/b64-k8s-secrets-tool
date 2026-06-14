@@ -4,6 +4,8 @@ core.py has no tkinter import, so these run anywhere — no display needed.
 """
 
 import base64
+import os
+import stat
 
 import pytest
 import yaml
@@ -179,3 +181,44 @@ def test_kubeseal_validate_cmd_has_no_cert_or_scope():
     # Validate never takes --cert/--scope/--format; guard against copy-paste drift.
     cmd = core.kubeseal_validate_cmd(context="prod", ctl_name="ss")
     assert not any(a.startswith(("--cert", "--scope", "--format")) for a in cmd)
+
+
+# --------------------------------------------------------------------------
+# raw_data passthrough (binary values that can't survive a plaintext round-trip)
+# --------------------------------------------------------------------------
+
+def test_build_secret_yaml_raw_data_emitted_verbatim():
+    # raw_data values are ALREADY base64 — they must not be re-encoded.
+    already_b64 = core.b64_encode("\x00\x01binary")
+    out = core.build_secret_yaml("s", "ns", {"FOO": "bar"},
+                                 raw_data={"CERT": already_b64})
+    doc = yaml.safe_load(out)
+    assert doc["data"]["CERT"] == already_b64               # verbatim, not double-encoded
+    assert core.b64_decode(doc["data"]["FOO"]) == "bar"     # plaintext still encoded once
+
+
+def test_build_secret_yaml_raw_data_none_is_noop():
+    assert core.build_secret_yaml("s", "ns", {"A": "b"}) == \
+        core.build_secret_yaml("s", "ns", {"A": "b"}, raw_data=None)
+
+
+# --------------------------------------------------------------------------
+# write_secret_file — owner-only permissions, even on overwrite
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
+def test_write_secret_file_is_owner_only_on_create(tmp_path):
+    p = tmp_path / "secret.yaml"
+    core.write_secret_file(str(p), "data: x\n")
+    assert p.read_text() == "data: x\n"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
+def test_write_secret_file_tightens_existing_world_readable_file(tmp_path):
+    p = tmp_path / "secret.yaml"
+    p.write_text("old")
+    os.chmod(p, 0o644)               # pre-existing, world-readable
+    core.write_secret_file(str(p), "new")
+    assert p.read_text() == "new"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600   # must be tightened, not left 0o644

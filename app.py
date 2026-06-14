@@ -91,6 +91,7 @@ from core import (  # noqa: E402
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
     parse_dotenv,
+    write_secret_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,11 @@ class App(tk.Tk):
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
         self._enc_sec = tk.StringVar()
+
+        # Binary (non-UTF-8) values from a loaded template, kept as their
+        # original base64 so Generate YAML can re-emit them verbatim instead of
+        # silently dropping them (they can't be edited as plaintext .env).
+        self._tpl_binary = {}
 
         self._apply_style()
         self._build_ui()
@@ -405,6 +411,7 @@ class App(tk.Tk):
         except (OSError, UnicodeDecodeError) as e:
             self._status(f"Could not read file: {e}", "err"); return
         self._env_lbl.configure(text=path)
+        self._tpl_binary = {}  # a plain .env carries no binary passthrough
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", text)
         self._sec_type.set("Opaque")
@@ -412,6 +419,7 @@ class App(tk.Tk):
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
+        self._tpl_binary = {}
         self._kv.delete("1.0", "end")
         self._set_text(self._yaml_out, "")
         self._sec_type.set("Opaque")
@@ -419,7 +427,10 @@ class App(tk.Tk):
 
     def _gen_yaml(self):
         data = parse_dotenv(self._kv.get("1.0", "end"))
-        if not data:
+        # Binary keys from a loaded template are re-emitted verbatim; an edited
+        # plaintext key of the same name wins over the original.
+        raw = {k: v for k, v in self._tpl_binary.items() if k not in data}
+        if not data and not raw:
             self._status("No KEY=VALUE pairs found", "err"); return
         name  = self._sec_name.get().strip() or "my-secret"
         ns    = self._sec_ns_e.get().strip()  or "default"
@@ -427,9 +438,11 @@ class App(tk.Tk):
         if not type_:
             type_ = "Opaque"
             self._sec_type.set(type_)
-        msg = f"Generated YAML with {len(data)} key(s)"
         self._set_text(self._yaml_out,
-                       build_secret_yaml(name, ns, data, type_))
+                       build_secret_yaml(name, ns, data, type_, raw_data=raw))
+        msg = f"Generated YAML with {len(data) + len(raw)} key(s)"
+        if raw:
+            msg += f" ({len(raw)} binary kept as-is)"
         self._status(msg, "ok")
 
     def _save_yaml(self):
@@ -922,17 +935,18 @@ class App(tk.Tk):
         except yaml.YAMLError as e:
             self._status(f"YAML parse error: {e}", "err"); return
         data = doc["data"] if isinstance(doc, dict) and isinstance(doc.get("data"), dict) else {}
+        self._tpl_binary = {}
         lines = []
-        skipped = 0
         for k, v in data.items():
             try:
                 dec = b64_decode(str(v), errors="strict") if v else ""
             except Exception:
-                # Binary (non-UTF-8) value: editing it as text would corrupt
-                # it on re-encode, so leave it out of the round-trip and keep
-                # the original base64 visible in a comment.
-                lines.append(f"# {k}: binary value skipped; base64: {v}")
-                skipped += 1
+                # Binary (non-UTF-8) value: editing it as text would corrupt it
+                # on re-encode, so keep the original base64 and re-emit it
+                # verbatim at Generate (tracked in _tpl_binary). A comment marks
+                # it in the editor so the user knows it's there.
+                self._tpl_binary[k] = str(v)
+                lines.append(f"# {k}: binary value kept as-is on Generate")
                 continue
             lines.append(dotenv_line(k, dec))
         self._kv.delete("1.0", "end")
@@ -949,10 +963,11 @@ class App(tk.Tk):
         self._sec_type.set(
             (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
 
-        msg = f"Loaded {len(data) - skipped} key(s) from {self._enc_sec.get()}"
-        if skipped:
-            msg += f" — {skipped} binary value(s) skipped"
-        self._status(msg, "ok" if not skipped else "err")
+        binary = len(self._tpl_binary)
+        msg = f"Loaded {len(data)} key(s) from {self._enc_sec.get()}"
+        if binary:
+            msg += f" — {binary} binary value(s) kept as-is"
+        self._status(msg, "ok")
 
     # --------------------------------------------------------------- helpers
 
@@ -976,10 +991,7 @@ class App(tk.Tk):
 
     def _write_file(self, path: str, content: str):
         try:
-            # Owner-only permissions — the file holds decodable secret data.
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(content)
+            write_secret_file(path, content)  # owner-only (0o600) — holds secrets
             self._status(f"Saved {os.path.basename(path)}", "ok")
         except OSError as e:
             self._status(f"Save failed: {e}", "err")
