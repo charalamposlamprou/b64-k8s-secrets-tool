@@ -78,40 +78,6 @@ def test_dotenv_line_round_trips(value):
 
 
 # --------------------------------------------------------------------------
-# secret type detection
-# --------------------------------------------------------------------------
-
-def test_detect_tls():
-    assert app.detect_secret_type(["tls.crt", "tls.key"]) == "kubernetes.io/tls"
-
-
-def test_detect_dockerconfigjson():
-    assert app.detect_secret_type([".dockerconfigjson"]) == "kubernetes.io/dockerconfigjson"
-
-
-def test_detect_ssh_auth():
-    assert app.detect_secret_type(["ssh-privatekey"]) == "kubernetes.io/ssh-auth"
-
-
-def test_detect_bootstrap_token():
-    got = app.detect_secret_type(["token-id", "token-secret"])
-    assert got == "bootstrap.kubernetes.io/token"
-
-
-def test_detect_basic_auth_requires_both_keys():
-    assert app.detect_secret_type(["username", "password"]) == "kubernetes.io/basic-auth"
-
-
-def test_lone_password_stays_opaque():
-    # A lone "password" key is common in plain Opaque secrets.
-    assert app.detect_secret_type(["password"]) == "Opaque"
-
-
-def test_detect_unknown_is_opaque():
-    assert app.detect_secret_type(["foo", "bar"]) == "Opaque"
-
-
-# --------------------------------------------------------------------------
 # YAML scalar quoting
 # --------------------------------------------------------------------------
 

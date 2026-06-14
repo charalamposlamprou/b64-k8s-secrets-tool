@@ -126,27 +126,6 @@ SECRET_TYPES = [
 ]
 
 
-def detect_secret_type(keys) -> str:
-    """Infer the Secret type from its data keys, using the keys each built-in
-    type requires. Conservative: anything ambiguous stays Opaque."""
-    ks = set(keys)
-    if {"tls.crt", "tls.key"} <= ks:
-        return "kubernetes.io/tls"
-    if ks == {".dockerconfigjson"}:
-        return "kubernetes.io/dockerconfigjson"
-    if ks == {".dockercfg"}:
-        return "kubernetes.io/dockercfg"
-    if "ssh-privatekey" in ks:
-        return "kubernetes.io/ssh-auth"
-    if {"token-id", "token-secret"} <= ks:
-        return "bootstrap.kubernetes.io/token"
-    # Both keys required: a lone "password" key is common in plain Opaque
-    # secrets (argocd-initial-admin-secret, Grafana, ...).
-    if ks == {"username", "password"}:
-        return "kubernetes.io/basic-auth"
-    return "Opaque"
-
-
 # Plain (unquoted) YAML scalars. Letter-first so nothing digit-led can hit a
 # YAML 1.1 numeric form (1234, 0x1A, 1_000, 1.5, ...); digit-led names/keys
 # are rare and quoting them is always valid.
@@ -452,9 +431,6 @@ class App(tk.Tk):
                                       values=SECRET_TYPES)
         self._sec_type.set("Opaque")
         self._sec_type.pack(side="left", padx=(4, 12))
-        self._type_user_set = False
-        self._sec_type.bind("<<ComboboxSelected>>", lambda _: setattr(self, "_type_user_set", True))
-        self._sec_type.bind("<KeyRelease>", lambda _: setattr(self, "_type_user_set", True))
         ttk.Button(tr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
 
         # Pack bottom buttons before the expander so they are never pushed off-screen
@@ -501,7 +477,6 @@ class App(tk.Tk):
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", text)
         self._sec_type.set("Opaque")
-        self._type_user_set = False
         self._status(f"Loaded {os.path.basename(path)}", "ok")
 
     def _clear_env(self):
@@ -509,7 +484,6 @@ class App(tk.Tk):
         self._kv.delete("1.0", "end")
         self._set_text(self._yaml_out, "")
         self._sec_type.set("Opaque")
-        self._type_user_set = False
         self._status("Cleared", "ok")
 
     def _gen_yaml(self):
@@ -523,13 +497,6 @@ class App(tk.Tk):
             type_ = "Opaque"
             self._sec_type.set(type_)
         msg = f"Generated YAML with {len(data)} key(s)"
-        # Auto-detect only when the user hasn't explicitly chosen a type.
-        if type_ == "Opaque" and not self._type_user_set:
-            detected = detect_secret_type(data)
-            if detected != "Opaque":
-                type_ = detected
-                self._sec_type.set(detected)
-                msg += f" — detected type {detected}"
         self._set_text(self._yaml_out,
                        build_secret_yaml(name, ns, data, type_))
         self._status(msg, "ok")
@@ -1053,7 +1020,6 @@ class App(tk.Tk):
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, ns)
         self._sec_type.set(
             (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
-        self._type_user_set = True  # lock the type read from the cluster secret
 
         msg = f"Loaded {len(data) - skipped} key(s) from {self._enc_sec.get()}"
         if skipped:
