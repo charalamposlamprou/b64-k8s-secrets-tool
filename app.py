@@ -622,7 +622,7 @@ class App(tk.Tk):
             else:
                 tb.configure(command=lambda shown=shown, masked=masked, sv=sv,
                              vl=vl, tb=tb: self._set_row_visible(
-                                 shown, masked, sv, vl, tb, False, not sv.get()))
+                                 shown, masked, sv, vl, tb, not sv.get()))
             tb.pack(side="left", padx=(6, 2), pady=2)
             tk.Button(af, text="Copy", bg=BG3, fg=FG,
                       activebackground=BORDER, activeforeground=FG,
@@ -637,18 +637,16 @@ class App(tk.Tk):
         self._status(f"Loaded {len(entries)} key(s)", "ok")
 
     @staticmethod
-    def _set_row_visible(shown, masked, sv, vl, tb, binary, show):
-        """Reveal/hide one decoded-table row. Binary rows have nothing to
-        reveal, so they're left alone."""
-        if binary:
-            return
+    def _set_row_visible(shown, masked, sv, vl, tb, show):
+        """Reveal/hide one decoded-table row."""
         vl.configure(text=shown if show else masked)
         sv.set(show)
         tb.configure(text="Hide" if show else "Show")
 
     def _tbl_show_all(self, show: bool):
         for shown, masked, sv, vl, tb, binary in self._tbl_rows:
-            self._set_row_visible(shown, masked, sv, vl, tb, binary, show)
+            if not binary:  # binary rows have nothing to reveal
+                self._set_row_visible(shown, masked, sv, vl, tb, show)
 
     # ----------------------------------------------------------------- seal tab
 
@@ -995,29 +993,33 @@ class App(tk.Tk):
         widget.insert("1.0", text)
         widget.configure(state="disabled")
 
+    def _run_async(self, work, done):
+        """Run work() on a daemon thread, then done(result) on the UI thread.
+        Drops the result if the app is destroyed mid-call (window closed)."""
+        def worker():
+            result = work()
+            try:
+                self.after(0, done, result)
+            except (tk.TclError, RuntimeError):
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
     def _clip(self, text: str):
         payload = text.rstrip("\n")
         # On X11 the Tk clipboard is lost when the app exits, so prefer a real
-        # clipboard manager (xclip/xsel) that keeps the value after we quit.
-        # It can block, so run it off the UI thread (like every other
-        # subprocess call) and fall back to the Tk clipboard on the main thread.
+        # clipboard manager (xclip/xsel) that keeps the value after we quit. It
+        # can block, so run it off the UI thread and fall back to the Tk
+        # clipboard (handled on the main thread by _clip_done).
         if sys.platform.startswith("linux"):
-            threading.Thread(
-                target=lambda: self.after(
-                    0, self._after_clip, self._clip_external(payload), payload),
-                daemon=True).start()
-            return
-        self._tk_clip(payload)
+            self._run_async(lambda: self._clip_external(payload),
+                            lambda ok: self._clip_done(ok, payload))
+        else:
+            self._clip_done(False, payload)
 
-    def _after_clip(self, ok: bool, payload: str):
-        if ok:
-            self._status("Copied to clipboard", "ok")
-        else:  # no external tool — Tk clipboard (lost when the app exits)
-            self._tk_clip(payload)
-
-    def _tk_clip(self, payload: str):
-        self.clipboard_clear()
-        self.clipboard_append(payload)
+    def _clip_done(self, external_ok: bool, payload: str):
+        if not external_ok:  # no external tool — Tk clipboard (lost on exit)
+            self.clipboard_clear()
+            self.clipboard_append(payload)
         self._status("Copied to clipboard", "ok")
 
     @staticmethod
