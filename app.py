@@ -452,6 +452,9 @@ class App(tk.Tk):
                                       values=SECRET_TYPES)
         self._sec_type.set("Opaque")
         self._sec_type.pack(side="left", padx=(4, 12))
+        self._type_user_set = False
+        self._sec_type.bind("<<ComboboxSelected>>", lambda _: setattr(self, "_type_user_set", True))
+        self._sec_type.bind("<KeyRelease>", lambda _: setattr(self, "_type_user_set", True))
         ttk.Button(tr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
 
         # Pack bottom buttons before the expander so they are never pushed off-screen
@@ -498,6 +501,7 @@ class App(tk.Tk):
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", text)
         self._sec_type.set("Opaque")
+        self._type_user_set = False
         self._status(f"Loaded {os.path.basename(path)}", "ok")
 
     def _clear_env(self):
@@ -505,6 +509,7 @@ class App(tk.Tk):
         self._kv.delete("1.0", "end")
         self._set_text(self._yaml_out, "")
         self._sec_type.set("Opaque")
+        self._type_user_set = False
         self._status("Cleared", "ok")
 
     def _gen_yaml(self):
@@ -518,9 +523,8 @@ class App(tk.Tk):
             type_ = "Opaque"
             self._sec_type.set(type_)
         msg = f"Generated YAML with {len(data)} key(s)"
-        # Auto-detect only while the field is the default, so an explicit
-        # selection (or a type carried over by Load Template) is never overridden.
-        if type_ == "Opaque":
+        # Auto-detect only when the user hasn't explicitly chosen a type.
+        if type_ == "Opaque" and not self._type_user_set:
             detected = detect_secret_type(data)
             if detected != "Opaque":
                 type_ = detected
@@ -1049,6 +1053,7 @@ class App(tk.Tk):
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, ns)
         self._sec_type.set(
             (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
+        self._type_user_set = True  # lock the type read from the cluster secret
 
         msg = f"Loaded {len(data) - skipped} key(s) from {self._enc_sec.get()}"
         if skipped:
