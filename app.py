@@ -25,6 +25,33 @@ try:
 except ImportError:
     PYYAML_OK = False
 
+
+def _resolve_version() -> str:
+    """Best-effort app version.
+
+    Release tarballs carry a stamped ``_version.py`` (written by the release
+    workflow); a plain git checkout falls back to ``git describe``; failing
+    both, the version is unknown.
+    """
+    try:
+        from _version import __version__ as stamped
+        return stamped
+    except Exception:
+        pass
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(
+            ["git", "describe", "--tags", "--match", "v[0-9]*", "--dirty"],
+            cwd=here, capture_output=True, text=True, timeout=2)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip().lstrip("v")
+    except Exception:
+        pass
+    return "unknown"
+
+
+__version__ = _resolve_version()
+
 # ---------------------------------------------------------------------------
 # Dark palette
 # ---------------------------------------------------------------------------
@@ -193,7 +220,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("b64 - Kubernetes Secrets Tool")
+        self.title(f"b64 - Kubernetes Secrets Tool — v{__version__}")
         self.geometry("880x720")
         self.minsize(740, 580)
         self.configure(bg=BG)
@@ -310,11 +337,13 @@ class App(tk.Tk):
         bar = tk.Frame(self, bg=BG, height=26)
         bar.pack(side="bottom", fill="x")
         tk.Frame(self, bg=BORDER, height=1).pack(side="bottom", fill="x")
+        tk.Label(bar, text=f"v{__version__}", bg=BG, fg=FGDIM,
+                 anchor="e", padx=10, font=(SANS, SZ - 1)).pack(side="right")
         self._status_var = tk.StringVar(value="Ready")
         self._status_lbl = tk.Label(
             bar, textvariable=self._status_var,
             bg=BG, fg=FGDIM, anchor="w", padx=10, font=(SANS, SZ - 1))
-        self._status_lbl.pack(fill="both", expand=True)
+        self._status_lbl.pack(side="left", fill="both", expand=True)
 
     def _status(self, msg: str, kind: str = "dim"):
         color = {"ok": OK_C, "err": ERR_C, "dim": FGDIM}.get(kind, FGDIM)

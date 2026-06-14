@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "b64-k8s-secrets-tool"
+# Released versions are cut from git tags by the release workflow; this static
+# value is just a placeholder so the project is installable for dev/test.
+version = "0.0.0"
+description = "A dark-themed Tkinter GUI for working with Kubernetes secrets: encode/decode base64, build Secret YAML from a .env file, fetch existing secrets from a cluster (read-only), and seal them with kubeseal."
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools]
+# Single-module app rather than a package.
+py-modules = ["app"]
+
+[tool.ruff.lint]
+# The codebase deliberately uses `stmt; return` one-liners for terse UI
+# callbacks, so E702 (multiple statements on one line) is disabled; the rest
+# of ruff's default checks (pyflakes F-rules, pycodestyle E/W) apply.
+ignore = ["E702"]

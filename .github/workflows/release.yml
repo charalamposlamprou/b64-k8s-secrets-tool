@@ -45,7 +45,7 @@ jobs:
       - name: Lint and test
         run: |
           python -m pip install --quiet --upgrade pip
-          python -m pip install --quiet pyyaml pytest ruff
+          python -m pip install --quiet -e '.[dev]'
           python -m ruff check .
           python -m pytest tests/ -v
 
@@ -86,10 +86,16 @@ jobs:
       - name: Build source archive
         run: |
           set -euo pipefail
-          archive="b64-k8s-secrets-tool-${{ steps.version.outputs.tag }}.tar.gz"
+          tag="${{ steps.version.outputs.tag }}"
+          archive="b64-k8s-secrets-tool-${tag}.tar.gz"
+          # Stamp the resolved version into the archive so the GUI shows it
+          # without needing a git checkout (the tarball has no .git).
+          printf '__version__ = "%s"\n' "${tag#v}" > _version.py
           git archive --format=tar.gz \
-            --prefix="b64-k8s-secrets-tool-${{ steps.version.outputs.tag }}/" \
+            --prefix="b64-k8s-secrets-tool-${tag}/" \
+            --add-file=_version.py \
             -o "$archive" HEAD
+          rm -f _version.py
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Create release

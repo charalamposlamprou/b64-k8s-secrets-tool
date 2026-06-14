@@ -63,12 +63,15 @@ endif
 ## setup: create the venv and install Python dependencies (idempotent)
 setup: $(VENV)/.installed
 
-$(VENV)/.installed:
+$(VENV)/.installed: pyproject.toml
 	@echo "Creating venv with $(PYTHON)"
 	$(PYTHON) -m venv $(VENV)
-	$(PIP) install --quiet --upgrade pip pyyaml
+	$(PIP) install --quiet --upgrade pip
+	$(PIP) install --quiet -e '.[dev]'
 	@touch $@
 
-## clean: remove the venv, pidfile and bytecode cache
+## clean: remove the venv, pidfile, build artifacts and tooling caches
 clean: stop
-	rm -rf $(VENV) __pycache__ $(PIDFILE)
+	rm -rf $(VENV) $(PIDFILE)
+	rm -rf *.egg-info build dist .pytest_cache .ruff_cache _version.py
+	find . -name __pycache__ -type d -prune -exec rm -rf {} +
