@@ -6,6 +6,7 @@ a display.
 """
 
 import base64
+import os
 import re
 
 # ---------------------------------------------------------------------------
@@ -115,7 +116,10 @@ def yaml_scalar(v: str) -> str:
 
 
 def build_secret_yaml(name: str, namespace: str, data: dict,
-                      type_: str = "Opaque") -> str:
+                      type_: str = "Opaque", raw_data: dict = None) -> str:
+    """Build Secret YAML. `data` holds plaintext values (base64-encoded here);
+    `raw_data` holds values that are ALREADY base64 and are emitted verbatim —
+    used for binary keys that can't survive a plaintext round-trip."""
     lines = [
         "apiVersion: v1",
         "kind: Secret",
@@ -127,6 +131,8 @@ def build_secret_yaml(name: str, namespace: str, data: dict,
     ]
     for k, v in data.items():
         lines.append(f"  {yaml_scalar(k)}: {yaml_scalar(b64_encode(v))}")
+    for k, v in (raw_data or {}).items():
+        lines.append(f"  {yaml_scalar(k)}: {yaml_scalar(v)}")
     return "\n".join(lines) + "\n"
 
 
@@ -162,3 +168,22 @@ def kubeseal_validate_cmd(context: str = None, ctl_name: str = None,
                           ctl_ns: str = None) -> list:
     """argv to validate a SealedSecret read from stdin against the controller."""
     return ["kubeseal", "--validate"] + _controller_flags(context, ctl_name, ctl_ns)
+
+
+# ---------------------------------------------------------------------------
+# Secret-bearing file output
+# ---------------------------------------------------------------------------
+
+def write_secret_file(path: str, content: str) -> None:
+    """Write secret-bearing content with owner-only (0o600) permissions.
+
+    O_CREAT only applies the mode when the file is *created*, so overwriting an
+    existing (possibly world-readable) file would otherwise keep its old mode;
+    fchmod forces 0o600 regardless. (fchmod is absent on Windows, where POSIX
+    permissions don't apply — there the open mode is the best available.)
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        if hasattr(os, "fchmod"):
+            os.fchmod(f.fileno(), 0o600)
+        f.write(content)
