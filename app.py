@@ -91,6 +91,7 @@ from core import (  # noqa: E402
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
     parse_dotenv,
+    secret_entries,
     write_secret_file,
 )
 
@@ -586,17 +587,19 @@ class App(tk.Tk):
         except yaml.YAMLError as e:
             self._status(f"YAML parse error: {e}", "err"); return
 
-        raw = doc["data"] if isinstance(doc, dict) and isinstance(doc.get("data"), dict) else {}
+        entries = secret_entries(doc)  # data + stringData, decoded
 
         for w in self._tbl_body.winfo_children():
             w.destroy()
         self._tbl_rows.clear()
 
-        for i, (key, val) in enumerate(raw.items()):
-            try:
-                decoded = b64_decode(str(val)) if val else ""
-            except Exception:
-                decoded = "(decode error)"
+        for i, (key, value, kind) in enumerate(entries):
+            binary = kind == "binary"
+            # Binary values can't be shown as text; display a marker and let
+            # Copy hand back the raw base64 instead of rendering mojibake.
+            shown = "⟨binary — Copy gives base64⟩" if binary else value
+            masked = shown if binary else "•" * min(len(shown), 32)
+            copy_val = value
             bg = ROW_A if i % 2 == 0 else ROW_B
             row = tk.Frame(self._tbl_body, bg=bg)
             row.pack(fill="x")
@@ -604,7 +607,6 @@ class App(tk.Tk):
             tk.Label(row, text=key, bg=bg, fg=FG, width=22, anchor="w",
                      padx=6, pady=3, font=(MONO, SZ)).pack(side="left")
             sv = tk.BooleanVar(value=False)
-            masked = "•" * min(len(decoded), 32)
             vl = tk.Label(row, text=masked, bg=bg, fg=BLUE, width=40, anchor="w",
                           padx=6, pady=3, font=(MONO, SZ))
             vl.pack(side="left")
@@ -613,35 +615,39 @@ class App(tk.Tk):
             af.pack(side="left", fill="x")
             tb_ref = [None]
 
-            def _toggle(sv=sv, vl=vl, decoded=decoded, tb_ref=tb_ref):
+            def _toggle(sv=sv, vl=vl, shown=shown, masked=masked, tb_ref=tb_ref):
                 if sv.get():
-                    vl.configure(text="•" * min(len(decoded), 32)); sv.set(False)
+                    vl.configure(text=masked); sv.set(False)
                     tb_ref[0].configure(text="Show")
                 else:
-                    vl.configure(text=decoded); sv.set(True)
+                    vl.configure(text=shown); sv.set(True)
                     tb_ref[0].configure(text="Hide")
 
             tb = tk.Button(af, text="Show", bg=BG3, fg=FG,
                            activebackground=BORDER, activeforeground=FG,
                            relief="flat", bd=0, padx=8, pady=1, font=(SANS, SZ - 1),
                            highlightthickness=0, cursor="hand2", command=_toggle)
+            if binary:
+                tb.configure(state="disabled")  # nothing to reveal
             tb.pack(side="left", padx=(6, 2), pady=2)
             tb_ref[0] = tb
             tk.Button(af, text="Copy", bg=BG3, fg=FG,
                       activebackground=BORDER, activeforeground=FG,
                       relief="flat", bd=0, padx=8, pady=1, font=(SANS, SZ - 1),
                       highlightthickness=0, cursor="hand2",
-                      command=lambda d=decoded: self._clip(d)).pack(side="left", pady=2)
+                      command=lambda d=copy_val: self._clip(d)).pack(side="left", pady=2)
 
-            self._tbl_rows.append((decoded, sv, vl, tb))
+            self._tbl_rows.append((shown, masked, sv, vl, tb, binary))
 
         self._tbl_body.update_idletasks()
         self._tbl_cv.configure(scrollregion=self._tbl_cv.bbox("all"))
-        self._status(f"Loaded {len(raw)} key(s)", "ok")
+        self._status(f"Loaded {len(entries)} key(s)", "ok")
 
     def _tbl_show_all(self, show: bool):
-        for decoded, sv, vl, tb in self._tbl_rows:
-            vl.configure(text=decoded if show else "•" * min(len(decoded), 32))
+        for shown, masked, sv, vl, tb, binary in self._tbl_rows:
+            if binary:
+                continue  # nothing to reveal
+            vl.configure(text=shown if show else masked)
             sv.set(show)
             tb.configure(text="Hide" if show else "Show")
 
@@ -924,31 +930,37 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "secret", sec,
                f"--context={ctx}", f"--namespace={ns}", "-o", "yaml"]
         self._load_btn.configure(state="disabled")
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_template(o, e, r)))
+        run_bg(cmd, lambda o, e, r: self.after(0,
+               lambda: self._got_template(ctx, ns, sec, o, e, r)))
 
-    def _got_template(self, stdout, stderr, rc):
+    def _got_template(self, ctx, ns, sec, stdout, stderr, rc):
+        # Re-enable the button regardless — the load attempt is done — *before*
+        # the stale check, or a discarded result would leave it stuck disabled.
         self._load_btn.configure(state="normal" if PYYAML_OK else "disabled")
+        # Guard against a stale load: the user may have changed the context /
+        # namespace / secret while this kubectl fetch was in flight.
+        if (ctx, ns, sec) != (self._enc_ctx.get(), self._enc_ns.get(),
+                              self._enc_sec.get()):
+            return
         if rc != 0:
             self._status(f"kubectl error: {stderr.strip()[:80]}", "err"); return
         try:
             doc = yaml.safe_load(stdout)
         except yaml.YAMLError as e:
             self._status(f"YAML parse error: {e}", "err"); return
-        data = doc["data"] if isinstance(doc, dict) and isinstance(doc.get("data"), dict) else {}
+
         self._tpl_binary = {}
         lines = []
-        for k, v in data.items():
-            try:
-                dec = b64_decode(str(v), errors="strict") if v else ""
-            except Exception:
-                # Binary (non-UTF-8) value: editing it as text would corrupt it
-                # on re-encode, so keep the original base64 and re-emit it
-                # verbatim at Generate (tracked in _tpl_binary). A comment marks
-                # it in the editor so the user knows it's there.
-                self._tpl_binary[k] = str(v)
+        entries = secret_entries(doc)  # data + stringData, decoded
+        for k, value, kind in entries:
+            if kind == "binary":
+                # Can't edit binary as text without corrupting it on re-encode:
+                # keep the original base64 and re-emit it verbatim at Generate
+                # (tracked in _tpl_binary). A comment marks it in the editor.
+                self._tpl_binary[k] = value
                 lines.append(f"# {k}: binary value kept as-is on Generate")
-                continue
-            lines.append(dotenv_line(k, dec))
+            else:
+                lines.append(dotenv_line(k, value))
         self._kv.delete("1.0", "end")
         self._kv.insert("1.0", "\n".join(lines))
 
@@ -956,15 +968,15 @@ class App(tk.Tk):
         # fetched secret's metadata (falling back to the selected combo values),
         # so they can be tweaked before Generate YAML.
         meta = doc.get("metadata", {}) if isinstance(doc, dict) else {}
-        name = meta.get("name") or self._enc_sec.get()
-        ns   = meta.get("namespace") or self._enc_ns.get()
+        name = meta.get("name") or sec
+        nsv  = meta.get("namespace") or ns
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
-        self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, ns)
+        self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
         self._sec_type.set(
             (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
 
         binary = len(self._tpl_binary)
-        msg = f"Loaded {len(data)} key(s) from {self._enc_sec.get()}"
+        msg = f"Loaded {len(entries)} key(s) from {sec}"
         if binary:
             msg += f" — {binary} binary value(s) kept as-is"
         self._status(msg, "ok")
@@ -985,9 +997,28 @@ class App(tk.Tk):
         widget.configure(state="disabled")
 
     def _clip(self, text: str):
+        payload = text.rstrip("\n")
+        # On X11 the Tk clipboard is lost when the app exits, so prefer a real
+        # clipboard manager (xclip/xsel) that keeps the value after we quit.
+        if sys.platform.startswith("linux") and self._clip_external(payload):
+            self._status("Copied to clipboard", "ok"); return
         self.clipboard_clear()
-        self.clipboard_append(text.rstrip("\n"))
+        self.clipboard_append(payload)
         self._status("Copied to clipboard", "ok")
+
+    @staticmethod
+    def _clip_external(text: str) -> bool:
+        # Runs on the UI thread, so keep the timeout short: a well-behaved
+        # xclip/xsel forks to hold the selection and returns at once; a build
+        # that doesn't would otherwise block the mainloop.
+        for cmd in (["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"]):
+            try:
+                subprocess.run(cmd, input=text, text=True, timeout=1, check=True)
+                return True
+            except (OSError, subprocess.SubprocessError):
+                continue
+        return False
 
     def _write_file(self, path: str, content: str):
         try:

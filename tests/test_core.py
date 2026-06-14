@@ -206,6 +206,40 @@ def test_build_secret_yaml_raw_data_none_is_noop():
 # write_secret_file — owner-only permissions, even on overwrite
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# secret_entries — flatten data + stringData, decode, detect binary
+# --------------------------------------------------------------------------
+
+def test_secret_entries_decodes_data():
+    doc = {"data": {"FOO": core.b64_encode("bar"), "EMPTY": ""}}
+    assert core.secret_entries(doc) == [("FOO", "bar", "text"), ("EMPTY", "", "text")]
+
+
+def test_secret_entries_flags_binary_and_keeps_base64():
+    b64 = base64.b64encode(b"\xff\xfe\x00raw").decode()  # not valid UTF-8 once decoded
+    [(key, value, kind)] = core.secret_entries({"data": {"CERT": b64}})
+    assert (key, kind) == ("CERT", "binary")
+    assert value == b64  # original base64 preserved for copy/round-trip
+
+
+def test_secret_entries_includes_stringdata_as_plaintext():
+    doc = {"stringData": {"USER": "alice"}}
+    assert core.secret_entries(doc) == [("USER", "alice", "text")]
+
+
+def test_secret_entries_stringdata_overrides_data_in_place():
+    doc = {"data": {"A": core.b64_encode("from-data"), "B": core.b64_encode("b")},
+           "stringData": {"A": "from-stringdata"}}
+    # 'A' is overridden but keeps its original position; 'B' untouched.
+    assert core.secret_entries(doc) == [
+        ("A", "from-stringdata", "text"), ("B", "b", "text")]
+
+
+@pytest.mark.parametrize("doc", [None, "string", 42, {}, {"data": "notadict"}])
+def test_secret_entries_non_secret_returns_empty(doc):
+    assert core.secret_entries(doc) == []
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
 def test_write_secret_file_is_owner_only_on_create(tmp_path):
     p = tmp_path / "secret.yaml"
