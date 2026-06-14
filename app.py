@@ -599,7 +599,6 @@ class App(tk.Tk):
             # Copy hand back the raw base64 instead of rendering mojibake.
             shown = "⟨binary — Copy gives base64⟩" if binary else value
             masked = shown if binary else "•" * min(len(shown), 32)
-            copy_val = value
             bg = ROW_A if i % 2 == 0 else ROW_B
             row = tk.Frame(self._tbl_body, bg=bg)
             row.pack(fill="x")
@@ -613,29 +612,23 @@ class App(tk.Tk):
 
             af = tk.Frame(row, bg=bg)
             af.pack(side="left", fill="x")
-            tb_ref = [None]
-
-            def _toggle(sv=sv, vl=vl, shown=shown, masked=masked, tb_ref=tb_ref):
-                if sv.get():
-                    vl.configure(text=masked); sv.set(False)
-                    tb_ref[0].configure(text="Show")
-                else:
-                    vl.configure(text=shown); sv.set(True)
-                    tb_ref[0].configure(text="Hide")
 
             tb = tk.Button(af, text="Show", bg=BG3, fg=FG,
                            activebackground=BORDER, activeforeground=FG,
                            relief="flat", bd=0, padx=8, pady=1, font=(SANS, SZ - 1),
-                           highlightthickness=0, cursor="hand2", command=_toggle)
+                           highlightthickness=0, cursor="hand2")
             if binary:
                 tb.configure(state="disabled")  # nothing to reveal
+            else:
+                tb.configure(command=lambda shown=shown, masked=masked, sv=sv,
+                             vl=vl, tb=tb: self._set_row_visible(
+                                 shown, masked, sv, vl, tb, False, not sv.get()))
             tb.pack(side="left", padx=(6, 2), pady=2)
-            tb_ref[0] = tb
             tk.Button(af, text="Copy", bg=BG3, fg=FG,
                       activebackground=BORDER, activeforeground=FG,
                       relief="flat", bd=0, padx=8, pady=1, font=(SANS, SZ - 1),
                       highlightthickness=0, cursor="hand2",
-                      command=lambda d=copy_val: self._clip(d)).pack(side="left", pady=2)
+                      command=lambda d=value: self._clip(d)).pack(side="left", pady=2)
 
             self._tbl_rows.append((shown, masked, sv, vl, tb, binary))
 
@@ -643,13 +636,19 @@ class App(tk.Tk):
         self._tbl_cv.configure(scrollregion=self._tbl_cv.bbox("all"))
         self._status(f"Loaded {len(entries)} key(s)", "ok")
 
+    @staticmethod
+    def _set_row_visible(shown, masked, sv, vl, tb, binary, show):
+        """Reveal/hide one decoded-table row. Binary rows have nothing to
+        reveal, so they're left alone."""
+        if binary:
+            return
+        vl.configure(text=shown if show else masked)
+        sv.set(show)
+        tb.configure(text="Hide" if show else "Show")
+
     def _tbl_show_all(self, show: bool):
         for shown, masked, sv, vl, tb, binary in self._tbl_rows:
-            if binary:
-                continue  # nothing to reveal
-            vl.configure(text=shown if show else masked)
-            sv.set(show)
-            tb.configure(text="Hide" if show else "Show")
+            self._set_row_visible(shown, masked, sv, vl, tb, binary, show)
 
     # ----------------------------------------------------------------- seal tab
 
@@ -1000,23 +999,40 @@ class App(tk.Tk):
         payload = text.rstrip("\n")
         # On X11 the Tk clipboard is lost when the app exits, so prefer a real
         # clipboard manager (xclip/xsel) that keeps the value after we quit.
-        if sys.platform.startswith("linux") and self._clip_external(payload):
-            self._status("Copied to clipboard", "ok"); return
+        # It can block, so run it off the UI thread (like every other
+        # subprocess call) and fall back to the Tk clipboard on the main thread.
+        if sys.platform.startswith("linux"):
+            threading.Thread(
+                target=lambda: self.after(
+                    0, self._after_clip, self._clip_external(payload), payload),
+                daemon=True).start()
+            return
+        self._tk_clip(payload)
+
+    def _after_clip(self, ok: bool, payload: str):
+        if ok:
+            self._status("Copied to clipboard", "ok")
+        else:  # no external tool — Tk clipboard (lost when the app exits)
+            self._tk_clip(payload)
+
+    def _tk_clip(self, payload: str):
         self.clipboard_clear()
         self.clipboard_append(payload)
         self._status("Copied to clipboard", "ok")
 
     @staticmethod
     def _clip_external(text: str) -> bool:
-        # Runs on the UI thread, so keep the timeout short: a well-behaved
-        # xclip/xsel forks to hold the selection and returns at once; a build
-        # that doesn't would otherwise block the mainloop.
+        # Encode stdin as UTF-8 explicitly: with text=True a non-UTF-8 locale
+        # (e.g. LC_ALL=C) raises UnicodeEncodeError on non-ASCII secrets.
+        # Keep the timeout short — a well-behaved xclip/xsel forks and returns
+        # at once; this only bounds a misbehaving build.
         for cmd in (["xclip", "-selection", "clipboard"],
                     ["xsel", "--clipboard", "--input"]):
             try:
-                subprocess.run(cmd, input=text, text=True, timeout=1, check=True)
+                subprocess.run(cmd, input=text, encoding="utf-8",
+                               timeout=1, check=True)
                 return True
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, ValueError, subprocess.SubprocessError):
                 continue
         return False
 
