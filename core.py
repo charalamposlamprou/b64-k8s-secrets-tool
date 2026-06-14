@@ -137,6 +137,52 @@ def build_secret_yaml(name: str, namespace: str, data: dict,
 
 
 # ---------------------------------------------------------------------------
+# Secret introspection
+# ---------------------------------------------------------------------------
+
+def secret_entries(doc) -> list:
+    """Flatten a Secret's `data` and `stringData` into an ordered list of
+    (key, value, kind) tuples:
+
+      - kind "text":   value is the decoded/plaintext string
+      - kind "binary": value couldn't be decoded as UTF-8; value is the
+                       ORIGINAL base64 (so callers can still copy/round-trip it)
+
+    `data` is base64 (decoded here, strictly); `stringData` is already plaintext
+    and overrides `data` on a key conflict, matching how Kubernetes merges them.
+    Returns [] for anything that isn't a Secret-shaped mapping.
+    """
+    if not isinstance(doc, dict):
+        return []
+    out, index = [], {}
+
+    def put(key, entry):
+        if key in index:
+            out[index[key]] = entry
+        else:
+            index[key] = len(out)
+            out.append(entry)
+
+    data = doc.get("data")
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if not v:
+                put(k, (k, "", "text"))
+                continue
+            try:
+                put(k, (k, b64_decode(str(v), errors="strict"), "text"))
+            except Exception:
+                put(k, (k, str(v), "binary"))
+
+    sdata = doc.get("stringData")
+    if isinstance(sdata, dict):
+        for k, v in sdata.items():
+            put(k, (k, "" if v is None else str(v), "text"))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # kubeseal command construction
 # ---------------------------------------------------------------------------
 
