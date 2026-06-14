@@ -126,27 +126,6 @@ SECRET_TYPES = [
 ]
 
 
-def detect_secret_type(keys) -> str:
-    """Infer the Secret type from its data keys, using the keys each built-in
-    type requires. Conservative: anything ambiguous stays Opaque."""
-    ks = set(keys)
-    if {"tls.crt", "tls.key"} <= ks:
-        return "kubernetes.io/tls"
-    if ks == {".dockerconfigjson"}:
-        return "kubernetes.io/dockerconfigjson"
-    if ks == {".dockercfg"}:
-        return "kubernetes.io/dockercfg"
-    if "ssh-privatekey" in ks:
-        return "kubernetes.io/ssh-auth"
-    if {"token-id", "token-secret"} <= ks:
-        return "bootstrap.kubernetes.io/token"
-    # Both keys required: a lone "password" key is common in plain Opaque
-    # secrets (argocd-initial-admin-secret, Grafana, ...).
-    if ks == {"username", "password"}:
-        return "kubernetes.io/basic-auth"
-    return "Opaque"
-
-
 # Plain (unquoted) YAML scalars. Letter-first so nothing digit-led can hit a
 # YAML 1.1 numeric form (1234, 0x1A, 1_000, 1.5, ...); digit-led names/keys
 # are rare and quoting them is always valid.
@@ -518,14 +497,6 @@ class App(tk.Tk):
             type_ = "Opaque"
             self._sec_type.set(type_)
         msg = f"Generated YAML with {len(data)} key(s)"
-        # Auto-detect only while the field is the default, so an explicit
-        # selection (or a type carried over by Load Template) is never overridden.
-        if type_ == "Opaque":
-            detected = detect_secret_type(data)
-            if detected != "Opaque":
-                type_ = detected
-                self._sec_type.set(detected)
-                msg += f" — detected type {detected}"
         self._set_text(self._yaml_out,
                        build_secret_yaml(name, ns, data, type_))
         self._status(msg, "ok")
