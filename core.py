@@ -166,7 +166,7 @@ def secret_entries(doc) -> list:
     data = doc.get("data")
     if isinstance(data, dict):
         for k, v in data.items():
-            if not v:
+            if v is None:  # genuinely missing value (`KEY:`); 0/False are real
                 put(k, (k, "", "text"))
                 continue
             try:

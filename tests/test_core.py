@@ -222,6 +222,14 @@ def test_secret_entries_flags_binary_and_keeps_base64():
     assert value == b64  # original base64 preserved for copy/round-trip
 
 
+def test_secret_entries_distinguishes_missing_from_falsy():
+    # `KEY:` with no value (None) is an empty value...
+    assert core.secret_entries({"data": {"K": None}}) == [("K", "", "text")]
+    # ...but a present falsy value (e.g. int 0) must NOT be silently blanked.
+    [(k, value, _kind)] = core.secret_entries({"data": {"K": 0}})
+    assert (k, value) == ("K", "0")
+
+
 def test_secret_entries_includes_stringdata_as_plaintext():
     doc = {"stringData": {"USER": "alice"}}
     assert core.secret_entries(doc) == [("USER", "alice", "text")]
