@@ -4,6 +4,7 @@ core.py has no tkinter import, so these run anywhere — no display needed.
 """
 
 import base64
+import binascii
 import os
 import stat
 
@@ -33,6 +34,17 @@ def test_b64_decode_tolerates_missing_padding():
 
 def test_b64_decode_strips_whitespace():
     assert core.b64_decode("  aGVsbG8=\n") == "hello"
+
+
+def test_b64_decode_handles_wrapped_base64():
+    # PEM-style line wraps must still decode (all whitespace is dropped first).
+    assert core.b64_decode("aGVs\nbG8=") == "hello"
+
+
+def test_b64_decode_raises_on_invalid_input():
+    # Junk outside the base64 alphabet must error, not be silently discarded.
+    with pytest.raises(binascii.Error):
+        core.b64_decode("!!!!aGVsbG8=")
 
 
 # --------------------------------------------------------------------------
