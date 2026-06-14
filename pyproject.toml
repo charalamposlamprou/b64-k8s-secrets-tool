@@ -20,8 +20,8 @@ dev = [
 ]
 
 [tool.setuptools]
-# Single-module app rather than a package.
-py-modules = ["app"]
+# Flat single-file modules rather than a package.
+py-modules = ["app", "core"]
 
 [tool.ruff.lint]
 # The codebase deliberately uses `stmt; return` one-liners for terse UI
