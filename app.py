@@ -133,6 +133,11 @@ class App(tk.Tk):
         # fast leaves the Controller fields blank until detection lands; Validate
         # checks this so it doesn't run against an empty/stale controller.
         self._ctl_pending = None
+        # Whether a seal / validate kubeseal run is currently in flight. These
+        # gate the action buttons (see _refresh_action_buttons) so a controller
+        # lookup landing mid-operation can't re-enable a button under it.
+        self._sealing = False
+        self._validating = False
 
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
@@ -753,10 +758,10 @@ class App(tk.Tk):
             cert=self._cert or None,
             ctl_name=self._ctl_name.get().strip() or None,
             ctl_ns=self._ctl_ns.get().strip() or None)
-        self._seal_btn.configure(state="disabled")
-        # The current sealed output (if any) is about to be replaced; a stale
-        # validation result would be misleading, so disable until the reseal lands.
-        self._validate_btn.configure(state="disabled")
+        # Sealing disables both buttons (the current sealed output, and thus any
+        # validation of it, is about to be replaced) until _on_sealed lands.
+        self._sealing = True
+        self._refresh_action_buttons()
         self._status("Sealing…", "dim")
         run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r)),
                stdin_data=yaml_text)
@@ -771,27 +776,46 @@ class App(tk.Tk):
         return None
 
     def _on_sealed(self, stdout, stderr, rc):
-        self._seal_btn.configure(state="normal")
+        self._sealing = False
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
+            self._refresh_action_buttons()
             self._status(sentinel, "err"); return
         if rc != 0:
             err = stderr.strip() or "kubeseal failed"
             # Show the full error in the output pane (it scrolls); the status bar
             # only fits one truncated line.
             self._set_text(self._sealed_out, "# kubeseal error\n" + err)
+            self._refresh_action_buttons()
             self._status(f"kubeseal error: {err.splitlines()[-1][:90]}", "err")
             return
         self._set_text(self._sealed_out, stdout)
-        self._validate_btn.configure(state="normal")
+        self._refresh_action_buttons()
         self._status("Sealed successfully", "ok")
+
+    def _sealed_output(self) -> str:
+        """The sealed YAML in the output pane, or '' when empty / an error."""
+        sealed = self._sealed_out.get("1.0", "end").strip()
+        return "" if not sealed or sealed.startswith("# kubeseal error") else sealed
+
+    def _refresh_action_buttons(self):
+        """Single source of truth for the Seal / Validate button states. Seal is
+        live unless a controller lookup or a seal is in flight; Validate also
+        needs sealed output and no validate already running."""
+        detecting = self._ctl_pending == self._seal_ctx.get()
+        self._seal_btn.configure(
+            state="disabled" if (detecting or self._sealing) else "normal")
+        can_validate = (bool(self._sealed_output())
+                        and not detecting and not self._sealing
+                        and not self._validating)
+        self._validate_btn.configure(state="normal" if can_validate else "disabled")
 
     def _do_validate(self):
         # Round-trips the sealed output through the controller's verify endpoint:
         # catches a wrong key/controller, wrong scope, or wrong name/namespace —
         # the mis-seals that otherwise only surface at apply time. Creates nothing.
-        sealed = self._sealed_out.get("1.0", "end").strip()
-        if not sealed or sealed.startswith("# kubeseal error"):
+        sealed = self._sealed_output()
+        if not sealed:
             self._status("Seal a secret first", "err"); return
         # Controller lookup for the current context hasn't landed yet — validating
         # now would hit an empty/stale controller and fail confusingly.
@@ -801,13 +825,15 @@ class App(tk.Tk):
             context=self._seal_ctx.get() or None,
             ctl_name=self._ctl_name.get().strip() or None,
             ctl_ns=self._ctl_ns.get().strip() or None)
-        self._validate_btn.configure(state="disabled")
+        self._validating = True
+        self._refresh_action_buttons()
         self._status("Validating…", "dim")
         run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_validated(o, e, r)),
                stdin_data=sealed)
 
     def _on_validated(self, stdout, stderr, rc):
-        self._validate_btn.configure(state="normal")
+        self._validating = False
+        self._refresh_action_buttons()
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
             self._status(sentinel, "err"); return
@@ -873,6 +899,9 @@ class App(tk.Tk):
         """Find the sealed-secrets controller service in the cluster and
         auto-fill the Controller name / NS fields (read-only lookup)."""
         self._ctl_pending = ctx
+        # Block Seal/Validate while the controller for the new context resolves —
+        # acting now would seal/validate against an empty or stale controller.
+        self._refresh_action_buttons()
         cmd = ["kubectl", "get", "svc", "-A", f"--context={ctx}", "-o",
                "jsonpath={range .items[*]}{.metadata.namespace}{'\\t'}"
                "{.metadata.name}{'\\n'}{end}"]
@@ -885,8 +914,10 @@ class App(tk.Tk):
         if ctx != self._seal_ctx.get():
             return
         # This is the result for the current context — detection is no longer in
-        # flight, whatever the outcome (error / no controller / found).
+        # flight, whatever the outcome (error / no controller / found). Re-enable
+        # the buttons, unless a seal/validate is still running under us.
         self._ctl_pending = None
+        self._refresh_action_buttons()
         if rc != 0:
             return
         svcs = []

@@ -105,3 +105,70 @@ def test_seal_with_cert_ignores_in_flight_lookup(monkeypatch):
         assert len(calls) == 1       # sealed anyway
     finally:
         win.destroy()
+
+
+def test_context_switch_disables_seal_and_validate(monkeypatch):
+    """Starting a controller lookup (e.g. on context switch) greys out both
+    action buttons so they can't be clicked against an unresolved controller."""
+    win = _make_win()
+    try:
+        monkeypatch.setattr(app, "run_bg", lambda *a, **k: None)  # lookup stays pending
+        win._seal_ctx.set("ctxA")
+
+        win._detect_controller("ctxA")
+
+        assert str(win._seal_btn.cget("state")) == "disabled"
+        assert str(win._validate_btn.cget("state")) == "disabled"
+    finally:
+        win.destroy()
+
+
+def test_controller_landing_reenables_seal_only(monkeypatch):
+    """When the lookup lands, Seal comes back; Validate stays disabled until
+    there is sealed output to check."""
+    win = _make_win()
+    try:
+        win._seal_ctx.set("ctxA")
+        win._seal_btn.configure(state="disabled")
+        win._validate_btn.configure(state="disabled")
+
+        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+
+        assert str(win._seal_btn.cget("state")) == "normal"
+        assert str(win._validate_btn.cget("state")) == "disabled"
+    finally:
+        win.destroy()
+
+
+def test_controller_landing_reenables_validate_with_output():
+    """With existing sealed output, the lookup landing re-enables Validate too."""
+    win = _make_win()
+    try:
+        win._seal_ctx.set("ctxA")
+        win._set_text(win._sealed_out, "kind: SealedSecret\n")
+        win._validate_btn.configure(state="disabled")
+
+        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+
+        assert str(win._validate_btn.cget("state")) == "normal"
+    finally:
+        win.destroy()
+
+
+def test_controller_landing_mid_seal_keeps_buttons_disabled():
+    """A lookup resolving while a seal is still in flight must not re-enable the
+    buttons under the running operation (would allow a duplicate concurrent seal)."""
+    win = _make_win()
+    try:
+        win._seal_ctx.set("ctxA")
+        win._set_text(win._sealed_out, "kind: SealedSecret\n")
+        win._sealing = True  # a seal started by _do_seal is still running
+        win._seal_btn.configure(state="disabled")
+        win._validate_btn.configure(state="disabled")
+
+        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+
+        assert str(win._seal_btn.cget("state")) == "disabled"
+        assert str(win._validate_btn.cget("state")) == "disabled"
+    finally:
+        win.destroy()
