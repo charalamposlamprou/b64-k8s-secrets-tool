@@ -664,7 +664,11 @@ class App(tk.Tk):
         self._seal_ctx_cb = ttk.Combobox(cs, textvariable=self._seal_ctx, width=20,
                                          state="readonly")
         self._seal_ctx_cb.bind("<<ComboboxSelected>>", self._on_seal_ctx_change)
-        self._seal_ctx_cb.pack(side="left", padx=(4, 14))
+        self._seal_ctx_cb.pack(side="left", padx=(4, 4))
+        # Re-read kubeconfig: picks up a context for a cluster created after the
+        # app started, without a restart.
+        ttk.Button(cs, text="⟳", style="Icon.TButton", width=2,
+                   command=self._fetch_contexts).pack(side="left", padx=(0, 14))
         ttk.Label(cs, text="Scope:").pack(side="left")
         self._seal_scope = tk.StringVar(value="strict")
         ttk.Combobox(cs, textvariable=self._seal_scope, width=16, state="readonly",
@@ -841,6 +845,10 @@ class App(tk.Tk):
             self._seal_ctx.set(ctxs[0])
             self._fetch_namespaces(ctxs[0])
             self._detect_controller(ctxs[0])
+        else:
+            # A manual refresh (button); confirm so the user knows it landed and
+            # whether a freshly-created context showed up.
+            self._status(f"Loaded {len(ctxs)} context(s)", "ok")
 
     def _on_ctx_change(self, _=None):
         ctx = self._enc_ctx.get()
