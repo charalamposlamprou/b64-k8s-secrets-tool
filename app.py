@@ -129,6 +129,10 @@ class App(tk.Tk):
         self.minsize(740, 580)
         self.configure(bg=BG)
         self._status_job = None
+        # Context whose controller lookup is still in flight. Switching contexts
+        # fast leaves the Controller fields blank until detection lands; Validate
+        # checks this so it doesn't run against an empty/stale controller.
+        self._ctl_pending = None
 
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
@@ -734,6 +738,11 @@ class App(tk.Tk):
         yaml_text = self._yaml_out.get("1.0", "end").strip()
         if not yaml_text:
             self._status("Generate YAML on the Encode tab first", "err"); return
+        # Without a cert, kubeseal fetches the cert from the controller; if its
+        # lookup hasn't landed yet we'd silently seal against kubeseal's defaults
+        # (wrong cert → undecryptable). With a cert the controller is irrelevant.
+        if not self._cert and self._ctl_pending == self._seal_ctx.get():
+            self._status("Detecting controller… try again in a moment", "dim"); return
         cmd = kubeseal_seal_cmd(
             self._seal_scope.get(),
             context=self._seal_ctx.get() or None,
@@ -780,6 +789,10 @@ class App(tk.Tk):
         sealed = self._sealed_out.get("1.0", "end").strip()
         if not sealed or sealed.startswith("# kubeseal error"):
             self._status("Seal a secret first", "err"); return
+        # Controller lookup for the current context hasn't landed yet — validating
+        # now would hit an empty/stale controller and fail confusingly.
+        if self._ctl_pending == self._seal_ctx.get():
+            self._status("Detecting controller… try again in a moment", "dim"); return
         cmd = kubeseal_validate_cmd(
             context=self._seal_ctx.get() or None,
             ctl_name=self._ctl_name.get().strip() or None,
@@ -851,6 +864,7 @@ class App(tk.Tk):
     def _detect_controller(self, ctx: str):
         """Find the sealed-secrets controller service in the cluster and
         auto-fill the Controller name / NS fields (read-only lookup)."""
+        self._ctl_pending = ctx
         cmd = ["kubectl", "get", "svc", "-A", f"--context={ctx}", "-o",
                "jsonpath={range .items[*]}{.metadata.namespace}{'\\t'}"
                "{.metadata.name}{'\\n'}{end}"]
@@ -862,6 +876,9 @@ class App(tk.Tk):
         # stale result if the user has since switched to a different context.
         if ctx != self._seal_ctx.get():
             return
+        # This is the result for the current context — detection is no longer in
+        # flight, whatever the outcome (error / no controller / found).
+        self._ctl_pending = None
         if rc != 0:
             return
         svcs = []
