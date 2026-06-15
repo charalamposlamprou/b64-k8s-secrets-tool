@@ -87,7 +87,6 @@ from core import (  # noqa: E402
     b64_decode,
     b64_encode,
     build_secret_yaml,
-    dotenv_line,
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
     parse_dotenv,
@@ -129,6 +128,9 @@ class App(tk.Tk):
         self.minsize(740, 580)
         self.configure(bg=BG)
         self._status_job = None
+        # Sub-pixel remainder carried between wheel events (see _on_wheel) so slow
+        # macOS trackpad deltas accumulate instead of rounding away to nothing.
+        self._wheel_accum = 0.0
         # Context whose controller lookup is still in flight. Switching contexts
         # fast leaves the Controller fields blank until detection lands; Validate
         # checks this so it doesn't run against an empty/stale controller.
@@ -280,15 +282,81 @@ class App(tk.Tk):
     def _build_ui(self):
         self._build_status_bar()
         nb = ttk.Notebook(self)
+        self._nb = nb
         nb.pack(fill="both", expand=True, padx=0, pady=0)
 
-        ef = ttk.Frame(nb, padding=10); nb.add(ef, text="Encode")
+        ef = ttk.Frame(nb); nb.add(ef, text="Encode")
         df = ttk.Frame(nb, padding=10); nb.add(df, text="Decode")
-        sf = ttk.Frame(nb, padding=10); nb.add(sf, text="Seal")
+        sf = ttk.Frame(nb); nb.add(sf, text="Seal")
 
-        self._build_encode_tab(ef)
-        self._build_decode_tab(df)
-        self._build_seal_tab(sf)
+        # Encode and Seal can outgrow the window, so wrap each in a vertical
+        # canvas that scrolls as a whole; Decode has its own table canvas.
+        self._enc_cv, enc_inner = self._scrollable(ef)
+        enc_inner.configure(padding=10)
+        self._build_encode_tab(enc_inner)
+        self._build_decode_tab(df)   # sets self._tbl_cv
+        self._seal_cv, seal_inner = self._scrollable(sf)
+        seal_inner.configure(padding=10)
+        self._build_seal_tab(seal_inner)
+
+        # Route the mouse wheel to whichever tab's canvas is showing, so the
+        # wheel scrolls the page no matter what it's hovering over.
+        self._tab_canvas = {str(ef): self._enc_cv, str(df): self._tbl_cv,
+                            str(sf): self._seal_cv}
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(seq, self._on_wheel)
+        # Comboboxes cycle their value on the wheel by default (ttk's
+        # combobox::Scroll). Now that the page scrolls, that would silently change
+        # the selected context / namespace / secret / type as you scroll past one
+        # — so neutralise it (no "break" → the bind_all page-scroller still runs).
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_class("TCombobox", seq, lambda e: None)
+
+    def _scrollable(self, parent):
+        """Wrap `parent`'s content in a vertical Canvas + Scrollbar so the page
+        can scroll when it outgrows the window. Returns (canvas, inner_frame);
+        build the tab's widgets into inner_frame."""
+        # yscrollincrement=1 makes "scroll N units" mean N pixels, so _on_wheel
+        # can scroll by the exact pixel amount Tk's own wheel bindings use.
+        cv = tk.Canvas(parent, bg=BG2, bd=0, highlightthickness=0,
+                       yscrollincrement=1)
+        sb = ttk.Scrollbar(parent, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(cv)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfig(win, width=e.width))
+        return cv, inner
+
+    def _on_wheel(self, e):
+        """Global mouse-wheel / trackpad handler: scroll the active tab's page
+        canvas so the wheel works anywhere in the window. Over a Text widget that
+        has its own overflow, leave the scroll to the Text; otherwise move the
+        whole page."""
+        cv = self._tab_canvas.get(self._nb.select())
+        if cv is None:
+            return
+        w = e.widget
+        if isinstance(w, tk.Text) and w.yview() != (0.0, 1.0):
+            return  # the Text scrolls itself — don't also move the page
+        if e.num in (4, 5):                  # X11 wheel buttons (Linux)
+            cv.yview_scroll(-60 if e.num == 4 else 60, "units")  # ~3 lines/click
+            return
+        if not e.delta:
+            return
+        # Scroll by pixels (canvas units are pinned to 1px). 0.5px per delta unit
+        # matches Tk's own Listbox/page wheel feel (it scrolls delta/40 lines, a
+        # line ≈ 20px); plain "-delta units" jumped the whole page because raw
+        # macOS deltas are large. Carry the sub-pixel remainder so slow trackpad
+        # deltas accumulate instead of rounding away to nothing.
+        self._wheel_accum += -e.delta * 0.5
+        step = int(self._wheel_accum)
+        self._wheel_accum -= step
+        if step:
+            cv.yview_scroll(step, "units")
 
     # ---------------------------------------------------------------- encode tab
 
@@ -347,17 +415,14 @@ class App(tk.Tk):
             self._load_btn.configure(state="disabled")
         self._load_btn.pack(side="left", padx=(8, 0))
 
-        # KV editable text area (6 rows)
-        kf = ttk.Frame(p); kf.pack(fill="x", pady=(6, 2))
-        ksb = ttk.Scrollbar(kf, orient="vertical")
-        ksb.pack(side="right", fill="y")
-        self._kv = tk.Text(
-            kf, height=6, bg=BG3, fg=FG, insertbackground=FG,
-            font=(MONO, SZ), relief="flat", bd=0, padx=6, pady=4,
-            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
-            yscrollcommand=ksb.set)
-        self._kv.pack(fill="x")
-        ksb.config(command=self._kv.yview)
+        # Row-based KV editor — one row per key/value, with a multiline popup
+        # (Edit…) for long values like PEM certs or JSON.
+        ttk.Label(p, text="Key / value pairs:").pack(anchor="w", pady=(8, 2))
+        self._kv_frame = ttk.Frame(p); self._kv_frame.pack(fill="x")
+        ttk.Button(p, text="+ Add", command=lambda: self._kv_add_row(focus=True)) \
+            .pack(anchor="w", pady=(4, 0))
+        self._kv_rows = []
+        self._kv_add_row()  # always keep at least one row
 
         # name + namespace
         mr = ttk.Frame(p); mr.pack(fill="x", pady=(6, 2))
@@ -380,25 +445,26 @@ class App(tk.Tk):
         self._sec_type.pack(side="left", padx=(4, 12))
         ttk.Button(tr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
 
-        # Pack bottom buttons before the expander so they are never pushed off-screen
-        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0), side="bottom")
-        ttk.Button(br, text="Copy YAML",
-                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"))) \
-            .pack(side="left", padx=(0, 6))
-        ttk.Button(br, text="Save YAML…", command=self._save_yaml).pack(side="left")
-
-        # YAML output — expands to fill remaining space
-        yf = ttk.Frame(p); yf.pack(fill="both", expand=True, pady=(6, 2))
+        # YAML output — fixed height so the scrollable page has a definite size
+        # (an expanding pane would fight the canvas for vertical space).
+        yf = ttk.Frame(p); yf.pack(fill="x", pady=(6, 2))
         xsb = ttk.Scrollbar(yf, orient="horizontal"); xsb.pack(side="bottom", fill="x")
         ysb = ttk.Scrollbar(yf, orient="vertical");   ysb.pack(side="right",  fill="y")
         self._yaml_out = tk.Text(
-            yf, bg=BG3, fg=BLUE, insertbackground=FG,
+            yf, height=14, bg=BG3, fg=BLUE, insertbackground=FG,
             font=(MONO, SZ), relief="flat", bd=0, padx=6, pady=4, wrap="none",
             highlightthickness=1, highlightbackground=BORDER,
             xscrollcommand=xsb.set, yscrollcommand=ysb.set, state="disabled")
         self._yaml_out.pack(fill="both", expand=True)
         xsb.config(command=self._yaml_out.xview)
         ysb.config(command=self._yaml_out.yview)
+
+        # Output actions sit below the pane now that the page scrolls.
+        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
+        ttk.Button(br, text="Copy YAML",
+                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"))) \
+            .pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="Save YAML…", command=self._save_yaml).pack(side="left")
 
     def _sv_encode(self):
         t = self._sv_in.get()
@@ -409,6 +475,128 @@ class App(tk.Tk):
         self._sv_out.insert(0, b64_encode(t))
         self._sv_out.configure(state="readonly")
         self._status("Encoded", "ok")
+
+    # ---------------------------------------------------------- KV row editor
+
+    def _kv_add_row(self, key="", value="", binary=False, focus=False):
+        """Append one key/value row. A `binary` row is a read-only marker for a
+        template value that can't be edited as text (re-emitted verbatim on
+        Generate); a normal row is an editable key Entry + value Entry, with an
+        Edit… popup for long values."""
+        row = ttk.Frame(self._kv_frame); row.pack(fill="x", pady=1)
+        var = tk.StringVar(value=value)
+        rd = {"frame": row, "binary": binary, "key": key, "var": var}
+
+        key_e = ttk.Entry(row, font=(MONO, SZ), width=22)
+        key_e.insert(0, key)
+        key_e.pack(side="left")
+        rd["key_e"] = key_e
+        ttk.Label(row, text="=").pack(side="left", padx=4)
+
+        # Delete (and, for text rows, Edit…) hug the right; pack them before the
+        # value field so it fills the gap between "=" and the buttons.
+        ttk.Button(row, text="✕", style="Icon.TButton", width=2,
+                   command=lambda: self._kv_del_row(rd)).pack(side="right")
+        if binary:
+            key_e.configure(state="readonly")  # binary keys aren't text-editable
+            ttk.Label(row, text="⟨binary — kept as-is on Generate⟩",
+                      style="Dim.TLabel").pack(side="left", fill="x",
+                                               expand=True, padx=(0, 4))
+        else:
+            ttk.Button(row, text="Edit…", style="Icon.TButton",
+                       command=lambda: self._kv_edit_value(rd)) \
+                .pack(side="right", padx=(0, 4))
+            val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ))
+            val_e.pack(side="left", fill="x", expand=True, padx=(0, 4))
+            rd["val_e"] = val_e
+
+        self._kv_rows.append(rd)
+        if focus:
+            key_e.focus_set()
+        return rd
+
+    def _kv_del_row(self, rd):
+        if rd in self._kv_rows:
+            self._kv_rows.remove(rd)
+        if rd["binary"]:
+            self._tpl_binary.pop(rd["key"], None)  # drop its passthrough value
+        rd["frame"].destroy()
+        if not self._kv_rows:  # always keep at least one editable row
+            self._kv_add_row()
+
+    def _kv_clear(self):
+        for rd in list(self._kv_rows):
+            rd["frame"].destroy()
+        self._kv_rows.clear()
+        self._kv_add_row()
+
+    def _kv_set_pairs(self, pairs, binary_keys=None):
+        """Replace all rows with `pairs` (key, value) plus a read-only marker row
+        for each key in `binary_keys`. Keeps one blank row if everything's empty."""
+        for rd in list(self._kv_rows):
+            rd["frame"].destroy()
+        self._kv_rows.clear()
+        for k, v in pairs:
+            self._kv_add_row(k, v)
+        for k in (binary_keys or []):
+            self._kv_add_row(k, binary=True)
+        if not self._kv_rows:
+            self._kv_add_row()
+
+    def _kv_get_pairs(self):
+        """Editable rows as {key: value}, reading values from the StringVars.
+        Blank keys (and binary marker rows) are skipped; last duplicate wins."""
+        pairs = {}
+        for rd in self._kv_rows:
+            if rd["binary"]:
+                continue
+            key = rd["key_e"].get().strip()
+            if key:
+                pairs[key] = rd["var"].get()
+        return pairs
+
+    def _kv_edit_value(self, rd):
+        """Modal multiline editor for one row's value (PEM certs/keys, JSON)."""
+        top = tk.Toplevel(self)
+        top.title("Edit value")
+        top.configure(bg=BG2)
+        top.transient(self)
+        top.geometry("760x520")
+        top.minsize(480, 320)
+        key = rd["key_e"].get().strip() or "value"
+
+        # Buttons go in first, packed to the bottom, so a tall value can't push
+        # them off-screen / clip them.
+        btns = ttk.Frame(top, padding=(10, 8)); btns.pack(side="bottom", fill="x")
+
+        def save(_=None):
+            rd["var"].set(txt.get("1.0", "end-1c"))
+            top.destroy()
+
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=save) \
+            .pack(side="right")
+        ttk.Button(btns, text="Cancel", command=top.destroy) \
+            .pack(side="right", padx=(0, 6))
+        ttk.Label(btns, text="⌘/Ctrl+Enter to save · Esc to cancel",
+                  style="Dim.TLabel").pack(side="left")
+
+        ttk.Label(top, text=f"Value for {key}", style="Head.TLabel") \
+            .pack(anchor="w", padx=10, pady=(10, 4))
+        ef = ttk.Frame(top, padding=(10, 0)); ef.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(ef, orient="vertical"); sb.pack(side="right", fill="y")
+        txt = tk.Text(ef, bg=BG3, fg=FG, insertbackground=FG, font=(MONO, SZ),
+                      relief="flat", bd=0, padx=6, pady=4, wrap="word",
+                      highlightthickness=1, highlightbackground=BORDER,
+                      highlightcolor=ACCENT, yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=txt.yview)
+        txt.insert("1.0", rd["var"].get())
+        txt.focus_set()
+
+        top.bind("<Escape>", lambda _: top.destroy())
+        txt.bind("<Command-Return>", save)
+        txt.bind("<Control-Return>", save)
+        top.grab_set()  # modal
 
     def _browse_env(self):
         path = filedialog.askopenfilename(
@@ -422,21 +610,20 @@ class App(tk.Tk):
             self._status(f"Could not read file: {e}", "err"); return
         self._env_lbl.configure(text=path)
         self._tpl_binary = {}  # a plain .env carries no binary passthrough
-        self._kv.delete("1.0", "end")
-        self._kv.insert("1.0", text)
+        self._kv_set_pairs(parse_dotenv(text).items())
         self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
         self._tpl_binary = {}
-        self._kv.delete("1.0", "end")
+        self._kv_clear()
         self._set_text(self._yaml_out, "")
         self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
 
     def _gen_yaml(self):
-        data = parse_dotenv(self._kv.get("1.0", "end"))
+        data = self._kv_get_pairs()
         # Binary keys from a loaded template are re-emitted verbatim; an edited
         # plaintext key of the same name wins over the original.
         raw = {k: v for k, v in self._tpl_binary.items() if k not in data}
@@ -520,7 +707,7 @@ class App(tk.Tk):
         body = ttk.Frame(p); body.pack(fill="both", expand=True)
         vsb = ttk.Scrollbar(body, orient="vertical"); vsb.pack(side="right", fill="y")
         self._tbl_cv = tk.Canvas(body, bg=BG2, bd=0, highlightthickness=0,
-                                 yscrollcommand=vsb.set)
+                                 yscrollincrement=1, yscrollcommand=vsb.set)
         self._tbl_cv.pack(side="left", fill="both", expand=True)
         vsb.config(command=self._tbl_cv.yview)
 
@@ -531,33 +718,10 @@ class App(tk.Tk):
             lambda e: self._tbl_cv.configure(scrollregion=self._tbl_cv.bbox("all")))
         self._tbl_cv.bind("<Configure>",
             lambda e: self._tbl_cv.itemconfig(self._tbl_win, width=e.width))
-        self._tbl_cv.bind("<Enter>",  self._tbl_scroll_bind)
-        self._tbl_cv.bind("<Leave>",  self._tbl_scroll_unbind)
+        # Wheel scrolling is handled globally by _on_wheel, which routes to this
+        # canvas while the Decode tab is showing (see self._tab_canvas).
 
         self._tbl_rows = []
-
-    def _tbl_scroll_bind(self, _=None):
-        self._tbl_cv.bind_all("<MouseWheel>", self._tbl_scroll)
-        self._tbl_cv.bind_all("<Button-4>",   self._tbl_scroll)
-        self._tbl_cv.bind_all("<Button-5>",   self._tbl_scroll)
-
-    def _tbl_scroll_unbind(self, _=None):
-        self._tbl_cv.unbind_all("<MouseWheel>")
-        self._tbl_cv.unbind_all("<Button-4>")
-        self._tbl_cv.unbind_all("<Button-5>")
-
-    def _tbl_scroll(self, e):
-        if e.num == 4:
-            self._tbl_cv.yview_scroll(-1, "units")
-        elif e.num == 5:
-            self._tbl_cv.yview_scroll(1, "units")
-        elif e.delta:
-            # macOS reports small deltas (±1…), not Windows-style ±120
-            # multiples — dividing by 120 truncates them to 0.
-            if sys.platform == "darwin":
-                self._tbl_cv.yview_scroll(-e.delta, "units")
-            else:
-                self._tbl_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
     def _sv_decode(self):
         t = self._dv_in.get().strip()
@@ -713,24 +877,25 @@ class App(tk.Tk):
         ttk.Label(sr, text="Seals the YAML generated on the Encode tab",
                   style="Dim.TLabel").pack(side="left", padx=10)
 
-        # Pack bottom buttons before the expander so they are never pushed off-screen
-        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0), side="bottom")
-        ttk.Button(br, text="Copy Sealed",
-                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"))) \
-            .pack(side="left", padx=(0, 6))
-        ttk.Button(br, text="Save Sealed…", command=self._save_sealed).pack(side="left")
-
-        of_ = ttk.Frame(p); of_.pack(fill="both", expand=True, pady=2)
+        # Sealed output — fixed height so the scrollable page has a definite size.
+        of_ = ttk.Frame(p); of_.pack(fill="x", pady=2)
         xsb = ttk.Scrollbar(of_, orient="horizontal"); xsb.pack(side="bottom", fill="x")
         ysb = ttk.Scrollbar(of_, orient="vertical");   ysb.pack(side="right",  fill="y")
         self._sealed_out = tk.Text(
-            of_, bg=BG3, fg=BLUE, insertbackground=FG,
+            of_, height=14, bg=BG3, fg=BLUE, insertbackground=FG,
             font=(MONO, SZ), relief="flat", bd=0, padx=6, pady=4, wrap="none",
             highlightthickness=1, highlightbackground=BORDER,
             xscrollcommand=xsb.set, yscrollcommand=ysb.set, state="disabled")
         self._sealed_out.pack(fill="both", expand=True)
         xsb.config(command=self._sealed_out.xview)
         ysb.config(command=self._sealed_out.yview)
+
+        # Output actions sit below the pane now that the page scrolls.
+        br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
+        ttk.Button(br, text="Copy Sealed",
+                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"))) \
+            .pack(side="left", padx=(0, 6))
+        ttk.Button(br, text="Save Sealed…", command=self._save_sealed).pack(side="left")
 
     def _browse_cert(self):
         path = filedialog.askopenfilename(
@@ -1003,19 +1168,17 @@ class App(tk.Tk):
             self._status(f"YAML parse error: {e}", "err"); return
 
         self._tpl_binary = {}
-        lines = []
+        text_pairs = []
         entries = secret_entries(doc)  # data + stringData, decoded
         for k, value, kind in entries:
             if kind == "binary":
                 # Can't edit binary as text without corrupting it on re-encode:
                 # keep the original base64 and re-emit it verbatim at Generate
-                # (tracked in _tpl_binary). A comment marks it in the editor.
+                # (tracked in _tpl_binary). A marker row shows it in the editor.
                 self._tpl_binary[k] = value
-                lines.append(f"# {k}: binary value kept as-is on Generate")
             else:
-                lines.append(dotenv_line(k, value))
-        self._kv.delete("1.0", "end")
-        self._kv.insert("1.0", "\n".join(lines))
+                text_pairs.append((k, value))
+        self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
 
         # Also populate the editable Secret name / Namespace fields from the
         # fetched secret's metadata (falling back to the selected combo values),
