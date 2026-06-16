@@ -493,22 +493,27 @@ class App(tk.Tk):
         rd["key_e"] = key_e
         ttk.Label(row, text="=").pack(side="left", padx=4)
 
-        # Delete (and, for text rows, Edit…) hug the right; pack them before the
-        # value field so it fills the gap between "=" and the buttons.
-        ttk.Button(row, text="✕", style="Icon.TButton", width=2,
-                   command=lambda: self._kv_del_row(rd)).pack(side="right")
         if binary:
             key_e.configure(state="readonly")  # binary keys aren't text-editable
+            ttk.Button(row, text="✕", style="Icon.TButton", width=2,
+                       command=lambda: self._kv_del_row(rd)).pack(side="right")
             ttk.Label(row, text="⟨binary — kept as-is on Generate⟩",
                       style="Dim.TLabel").pack(side="left", fill="x",
                                                expand=True, padx=(0, 4))
         else:
-            ttk.Button(row, text="Edit…", style="Icon.TButton",
-                       command=lambda: self._kv_edit_value(rd)) \
-                .pack(side="right", padx=(0, 4))
+            # Create the value field before the buttons so Tab moves
+            # key → value → Edit… → ✕ (Tk traversal follows creation order),
+            # but pack the buttons first (side="right") so the value fills the
+            # gap between "=" and the buttons.
             val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ))
-            val_e.pack(side="left", fill="x", expand=True, padx=(0, 4))
             rd["val_e"] = val_e
+            edit_b = ttk.Button(row, text="Edit…", style="Icon.TButton",
+                                command=lambda: self._kv_edit_value(rd))
+            del_b = ttk.Button(row, text="✕", style="Icon.TButton", width=2,
+                               command=lambda: self._kv_del_row(rd))
+            del_b.pack(side="right")
+            edit_b.pack(side="right", padx=(0, 4))
+            val_e.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
         self._kv_rows.append(rd)
         if focus:
