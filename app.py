@@ -151,11 +151,45 @@ class App(tk.Tk):
         self._tpl_binary = {}
 
         self._apply_style()
+        self._fix_x11_paste()
         self._build_ui()
         # Defer until mainloop is running: the fetch worker thread reports
         # back via self.after(), which raises RuntimeError before mainloop
         # starts (e.g. kubectl missing fails the thread instantly).
         self.after(0, self._fetch_contexts)
+
+    def _fix_x11_paste(self):
+        """On X11, tk.Text's default <<Paste>> inserts at the cursor without
+        first removing the current selection, so pasting over selected text
+        appends instead of replacing it (Windows/macOS delete the selection
+        first). Reimplement Ctrl+V to delete any selection before inserting.
+
+        Only tk.Text is affected: ttk entries/combobox already replace the
+        selection on all platforms (ttk::entry::Paste runs PendingDelete first),
+        so they are left untouched. Middle-click paste uses <<PasteSelection>>
+        and is also left untouched."""
+        if self.tk.call("tk", "windowingsystem") != "x11":
+            return
+
+        def paste(event):
+            w = event.widget
+            # Fetch the clipboard before touching the selection: on an empty /
+            # unavailable CLIPBOARD (common on X11 once the source app exits)
+            # ::tk::GetSelection raises, and deleting first would destroy the
+            # selection with nothing pasted. ::tk::GetSelection tries
+            # UTF8_STRING then STRING, matching the default handler.
+            try:
+                text = w.tk.call("::tk::GetSelection", w, "CLIPBOARD")
+            except tk.TclError:
+                return "break"  # nothing to paste — leave the selection intact
+            try:
+                w.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass  # nothing selected
+            w.insert("insert", text)
+            return "break"
+
+        self.bind_class("Text", "<<Paste>>", paste)
 
     # ------------------------------------------------------------------ style
 
