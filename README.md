@@ -42,9 +42,12 @@ cluster (read-only), and seal them with `kubeseal`.
 
 ## Requirements
 
-- macOS with [Homebrew](https://brew.sh), or Debian/Ubuntu Linux (incl. WSL) with `apt`
+- macOS, or Debian/Ubuntu Linux (incl. WSL)
 - `kubectl` and `kubeseal` on your `PATH` (for the cluster-fetch and seal features)
 - A modern Tcl/Tk — see the note below
+
+`bash install.sh` sets all of these up for you (Homebrew + Command Line Tools on
+macOS, or `apt` on Linux/WSL), so you don't need them in place beforehand.
 
 > **Why a Homebrew Python?** macOS ships a deprecated **system Tk 8.5** that
 > renders custom widget colours incorrectly (invisible labels, blank panels).
@@ -54,15 +57,28 @@ cluster (read-only), and seal them with `kubeseal`.
 
 ## Quick start
 
-Fresh machine — install the modern Tk, create the venv, install deps:
+Fresh machine — one command does everything (Command Line Tools / Homebrew on
+macOS, or `apt` on Ubuntu/Debian/WSL), then the Tk + venv + deps, plus a
+best-effort `kubectl`/`kubeseal`:
+
+```bash
+bash install.sh
+```
+
+It also installs a global `b64secrets` launcher on your `PATH`, so you can start
+the app from anywhere:
+
+```bash
+b64secrets
+```
+
+> The `b64secrets` launcher just delegates to `make` in this repo, so it hardcodes
+> the repo path at install time — if you move the repo, re-run `bash install.sh`.
+
+Prefer to do it by hand? Install the modern Tk + venv + deps and run it directly:
 
 ```bash
 make bootstrap
-```
-
-Then run it:
-
-```bash
 make start
 ```
 
@@ -70,6 +86,8 @@ make start
 
 | Command | Action |
 |---|---|
+| `bash install.sh` | One-command install: prerequisites + `make bootstrap` + `kubectl`/`kubeseal` + the `b64secrets` launcher (`--start` to launch when done) |
+| `b64secrets`     | Launch the app from anywhere (also `b64secrets stop` / `restart` / `status`) |
 | `make bootstrap` | Full fresh-install setup (Homebrew Tk + venv + deps) |
 | `make setup`     | Create the venv and install Python deps (idempotent) |
 | `make start`     | Launch the app in the background |
@@ -85,6 +103,7 @@ use `make stop`. The running process ID is tracked in `.app.pid`.
 
 ```
 app.py        the application (single file)
+install.sh    one-command cross-platform installer (+ b64secrets launcher)
 Makefile      setup / start / stop / status
 README.md     this file
 .venv/        virtualenv with Tcl/Tk 9 + PyYAML (created by make)
