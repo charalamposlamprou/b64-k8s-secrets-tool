@@ -399,10 +399,15 @@ class App(tk.Tk):
             .pack(anchor="w", pady=(0, 4))
 
         # Buttons packed right-first so they stay visible; the entry fills the gap.
+        # The input is the plaintext secret, so mask it by default (like the
+        # Decode tab masks its decoded output) with a Show/Hide toggle.
         r = ttk.Frame(p); r.pack(fill="x", pady=2)
         ttk.Button(r, text="Encode →", command=self._sv_encode) \
             .pack(side="right", padx=(6, 0))
-        self._sv_in = ttk.Entry(r, font=(MONO, SZ))
+        self._sv_in = ttk.Entry(r, font=(MONO, SZ), show="•")
+        self._sv_shown = False
+        self._sv_tog = ttk.Button(r, text="Show", command=self._toggle_sv)
+        self._sv_tog.pack(side="right", padx=(6, 0))
         self._sv_in.pack(side="left", fill="x", expand=True)
         self._sv_in.bind("<Return>", lambda _: self._sv_encode())
 
@@ -509,6 +514,12 @@ class App(tk.Tk):
         self._sv_out.insert(0, b64_encode(t))
         self._sv_out.configure(state="readonly")
         self._status("Encoded", "ok")
+
+    def _toggle_sv(self):
+        """Reveal/mask the plaintext input, mirroring the Decode tab's _toggle_dv."""
+        self._sv_shown = not self._sv_shown
+        self._sv_in.configure(show="" if self._sv_shown else "•")
+        self._sv_tog.configure(text="Hide" if self._sv_shown else "Show")
 
     # ---------------------------------------------------------- KV row editor
 
