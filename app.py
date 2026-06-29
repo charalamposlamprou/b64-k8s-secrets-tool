@@ -536,17 +536,23 @@ class App(tk.Tk):
                                                expand=True, padx=(0, 4))
         else:
             # Create the value field before the buttons so Tab moves
-            # key → value → Edit… → ✕ (Tk traversal follows creation order),
-            # but pack the buttons first (side="right") so the value fills the
-            # gap between "=" and the buttons.
-            val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ))
+            # key → value → Show → Edit… → ✕ (Tk traversal follows creation
+            # order), but pack the buttons first (side="right") so the value
+            # fills the gap between "=" and the buttons. Values are masked by
+            # default (like the Decode table) so they don't leak on screen.
+            val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ), show="•")
             rd["val_e"] = val_e
+            rd["shown"] = False
+            show_b = ttk.Button(row, text="Show", style="Icon.TButton",
+                                command=lambda: self._kv_toggle_show(rd))
+            rd["show_b"] = show_b
             edit_b = ttk.Button(row, text="Edit…", style="Icon.TButton",
                                 command=lambda: self._kv_edit_value(rd))
             del_b = ttk.Button(row, text="✕", style="Icon.TButton", width=2,
                                command=lambda: self._kv_del_row(rd))
             del_b.pack(side="right")
             edit_b.pack(side="right", padx=(0, 4))
+            show_b.pack(side="right", padx=(0, 4))
             val_e.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
         self._kv_rows.append(rd)
@@ -562,6 +568,12 @@ class App(tk.Tk):
         rd["frame"].destroy()
         if not self._kv_rows:  # always keep at least one editable row
             self._kv_add_row()
+
+    def _kv_toggle_show(self, rd):
+        """Reveal/mask one row's value, mirroring the Decode table's Show/Hide."""
+        rd["shown"] = not rd.get("shown", False)
+        rd["val_e"].configure(show="" if rd["shown"] else "•")
+        rd["show_b"].configure(text="Hide" if rd["shown"] else "Show")
 
     def _kv_clear(self):
         for rd in list(self._kv_rows):
