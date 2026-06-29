@@ -422,16 +422,29 @@ class App(tk.Tk):
         ttk.Label(p, text=".env → Kubernetes Secret YAML", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
-        # file picker
+        # file picker — buttons live in a right-pinned sub-frame so a long file
+        # path can't push them off-screen; the path label takes the middle and
+        # clips if too long. The sub-frame keeps Tab order matching the layout.
         fp = ttk.Frame(p); fp.pack(fill="x", pady=2)
         ttk.Label(fp, text="File:").pack(side="left")
-        self._env_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel")
-        self._env_lbl.pack(side="left", padx=6)
-        ttk.Button(fp, text="Browse…", command=self._browse_env).pack(side="left")
-        ttk.Button(fp, text="Clear", command=self._clear_env).pack(side="left", padx=(4, 0))
+        env_btns = ttk.Frame(fp); env_btns.pack(side="right")
+        ttk.Button(env_btns, text="Browse…", command=self._browse_env).pack(side="left")
+        ttk.Button(env_btns, text="Clear", command=self._clear_env) \
+            .pack(side="left", padx=(6, 0))
+        self._env_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel", anchor="w")
+        self._env_lbl.pack(side="left", padx=6, fill="x", expand=True)
 
         # cluster fetch row
         cf = ttk.Frame(p); cf.pack(fill="x", pady=(6, 2))
+        # Pin Load Template to the right (packed first so it reserves the right
+        # edge) so the Context/NS/Secret combos can't push it off-screen; the
+        # Secret combo expands to take the slack between them.
+        self._load_btn = ttk.Button(cf, text="Load Template",
+                                    command=self._load_template)
+        if not PYYAML_OK:
+            self._load_btn.configure(state="disabled")
+        self._load_btn.pack(side="right", padx=(8, 0))
+
         ttk.Label(cf, text="Context:").pack(side="left")
         self._ctx_cb = ttk.Combobox(cf, textvariable=self._enc_ctx, width=16,
                                     state="readonly")
@@ -447,42 +460,63 @@ class App(tk.Tk):
         ttk.Label(cf, text="Secret:").pack(side="left", padx=(6, 0))
         self._sec_cb = ttk.Combobox(cf, textvariable=self._enc_sec, width=16,
                                     state="readonly")
-        self._sec_cb.pack(side="left", padx=(4, 0))
-        self._load_btn = ttk.Button(cf, text="Load Template",
-                                    command=self._load_template)
-        if not PYYAML_OK:
-            self._load_btn.configure(state="disabled")
-        self._load_btn.pack(side="left", padx=(8, 0))
+        self._sec_cb.pack(side="left", padx=(4, 0), fill="x", expand=True)
+        # Load Template was created first (to reserve the right edge); raise it
+        # to the top of the stacking order so Tab reaches it last — matching its
+        # rightmost visual position rather than its creation order.
+        self._load_btn.lift()
 
         # Row-based KV editor — one row per key/value, with a multiline popup
         # (Edit…) for long values like PEM certs or JSON.
-        ttk.Label(p, text="Key / value pairs:").pack(anchor="w", pady=(8, 2))
+        # Column header bar, mirroring the Decode tab's decoded-table header so
+        # the editor reads as a table (Key | Value | Actions) instead of rows
+        # joined by "=".
+        kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
+        tk.Label(kv_hdr, text="Key", bg=BG3, fg=ACCENT, width=22, anchor="w",
+                 padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
+        tk.Label(kv_hdr, text="Actions", bg=BG3, fg=ACCENT, anchor="e",
+                 padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="right")
+        tk.Label(kv_hdr, text="Value", bg=BG3, fg=ACCENT, anchor="w",
+                 padx=6, pady=4, font=(SANS, SZ, "bold")) \
+            .pack(side="left", fill="x", expand=True)
         self._kv_frame = ttk.Frame(p); self._kv_frame.pack(fill="x")
-        ttk.Button(p, text="+ Add", command=lambda: self._kv_add_row(focus=True)) \
-            .pack(anchor="w", pady=(4, 0))
+        # + Add plus bulk reveal/mask controls, grouped on one row.
+        kv_ctrls = ttk.Frame(p); kv_ctrls.pack(fill="x", pady=(4, 0))
+        ttk.Button(kv_ctrls, text="+ Add",
+                   command=lambda: self._kv_add_row(focus=True)).pack(side="left")
+        ttk.Button(kv_ctrls, text="Show All",
+                   command=lambda: self._kv_show_all(True)) \
+            .pack(side="left", padx=(6, 0))
+        ttk.Button(kv_ctrls, text="Hide All",
+                   command=lambda: self._kv_show_all(False)) \
+            .pack(side="left", padx=(6, 0))
         self._kv_rows = []
         self._kv_add_row()  # always keep at least one row
 
-        # name + namespace
-        mr = ttk.Frame(p); mr.pack(fill="x", pady=(6, 2))
-        ttk.Label(mr, text="Secret name:").pack(side="left")
-        self._sec_name = ttk.Entry(mr, width=22, font=(MONO, SZ))
+        # Secret name / namespace / type / generate — all on one row. Generate
+        # YAML is pinned right (packed first to reserve the edge) so the fields
+        # can't push it off-screen; the Type combo expands to take the slack.
+        # The editable type combo lets you pick a built-in type or enter a
+        # custom one; Load Template fills it from the fetched secret.
+        form = ttk.Frame(p); form.pack(fill="x", pady=(6, 2))
+        gen_btn = ttk.Button(form, text="Generate YAML", command=self._gen_yaml)
+        gen_btn.pack(side="right", padx=(12, 0))
+        ttk.Label(form, text="Secret name:").pack(side="left")
+        self._sec_name = ttk.Entry(form, width=16, font=(MONO, SZ))
         self._sec_name.insert(0, "my-secret")
-        self._sec_name.pack(side="left", padx=(4, 12))
-        ttk.Label(mr, text="Namespace:").pack(side="left")
-        self._sec_ns_e = ttk.Entry(mr, width=14, font=(MONO, SZ))
+        self._sec_name.pack(side="left", padx=(6, 12))
+        ttk.Label(form, text="Namespace:").pack(side="left")
+        self._sec_ns_e = ttk.Entry(form, width=10, font=(MONO, SZ))
         self._sec_ns_e.insert(0, "default")
-        self._sec_ns_e.pack(side="left", padx=(4, 12))
-
-        # type + generate — editable combobox: pick a built-in type or type
-        # any custom one; Load Template fills it from the fetched secret.
-        tr = ttk.Frame(p); tr.pack(fill="x", pady=(0, 2))
-        ttk.Label(tr, text="Type:").pack(side="left")
-        self._sec_type = ttk.Combobox(tr, width=30, font=(MONO, SZ),
+        self._sec_ns_e.pack(side="left", padx=(6, 12))
+        ttk.Label(form, text="Type:").pack(side="left")
+        self._sec_type = ttk.Combobox(form, width=18, font=(MONO, SZ),
                                       values=SECRET_TYPES)
         self._sec_type.set("Opaque")
-        self._sec_type.pack(side="left", padx=(4, 12))
-        ttk.Button(tr, text="Generate YAML", command=self._gen_yaml).pack(side="left")
+        self._sec_type.pack(side="left", padx=(6, 12), fill="x", expand=True)
+        # Generate was created first to pin it right; raise it so Tab reaches it
+        # last (matching its rightmost position) rather than its creation order.
+        gen_btn.lift()
 
         # YAML output — fixed height so the scrollable page has a definite size
         # (an expanding pane would fight the canvas for vertical space).
@@ -534,9 +568,8 @@ class App(tk.Tk):
 
         key_e = ttk.Entry(row, font=(MONO, SZ), width=22)
         key_e.insert(0, key)
-        key_e.pack(side="left")
+        key_e.pack(side="left", padx=(0, 6))
         rd["key_e"] = key_e
-        ttk.Label(row, text="=").pack(side="left", padx=4)
 
         if binary:
             key_e.configure(state="readonly")  # binary keys aren't text-editable
@@ -549,8 +582,8 @@ class App(tk.Tk):
             # Create the value field before the buttons so Tab moves
             # key → value → Show → Edit… → ✕ (Tk traversal follows creation
             # order), but pack the buttons first (side="right") so the value
-            # fills the gap between "=" and the buttons. Values are masked by
-            # default (like the Decode table) so they don't leak on screen.
+            # fills the gap between the key and the buttons. Values are masked
+            # by default (like the Decode table) so they don't leak on screen.
             val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ), show="•")
             rd["val_e"] = val_e
             rd["shown"] = False
@@ -580,11 +613,22 @@ class App(tk.Tk):
         if not self._kv_rows:  # always keep at least one editable row
             self._kv_add_row()
 
+    @staticmethod
+    def _kv_set_row_visible(rd, show):
+        """Reveal/mask one editable row's value (mirrors _set_row_visible)."""
+        rd["shown"] = show
+        rd["val_e"].configure(show="" if show else "•")
+        rd["show_b"].configure(text="Hide" if show else "Show")
+
     def _kv_toggle_show(self, rd):
         """Reveal/mask one row's value, mirroring the Decode table's Show/Hide."""
-        rd["shown"] = not rd.get("shown", False)
-        rd["val_e"].configure(show="" if rd["shown"] else "•")
-        rd["show_b"].configure(text="Hide" if rd["shown"] else "Show")
+        self._kv_set_row_visible(rd, not rd.get("shown", False))
+
+    def _kv_show_all(self, show):
+        """Reveal/mask every editable row at once (binary rows have no value)."""
+        for rd in self._kv_rows:
+            if not rd["binary"]:
+                self._kv_set_row_visible(rd, show)
 
     def _kv_clear(self):
         for rd in list(self._kv_rows):
@@ -749,21 +793,29 @@ class App(tk.Tk):
 
         fp = ttk.Frame(p); fp.pack(fill="x", pady=2)
         ttk.Label(fp, text="File:").pack(side="left")
-        self._dec_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel")
-        self._dec_lbl.pack(side="left", padx=6)
-        ttk.Button(fp, text="Browse…", command=self._browse_yaml).pack(side="left")
-        ttk.Button(fp, text="Show All", command=lambda: self._tbl_show_all(True)) \
+        # Buttons live in a right-pinned sub-frame so a long file path can't
+        # push them off-screen; the path label takes the middle and clips. The
+        # sub-frame keeps Tab order (Browse… → Show All → Hide All) = layout.
+        dec_btns = ttk.Frame(fp); dec_btns.pack(side="right")
+        ttk.Button(dec_btns, text="Browse…", command=self._browse_yaml).pack(side="left")
+        ttk.Button(dec_btns, text="Show All", command=lambda: self._tbl_show_all(True)) \
             .pack(side="left", padx=(10, 0))
-        ttk.Button(fp, text="Hide All", command=lambda: self._tbl_show_all(False)) \
+        ttk.Button(dec_btns, text="Hide All", command=lambda: self._tbl_show_all(False)) \
             .pack(side="left", padx=(6, 0))
+        self._dec_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel", anchor="w")
+        self._dec_lbl.pack(side="left", padx=6, fill="x", expand=True)
 
-        # fixed header
-        cols = [("Key", 22), ("Decoded value", 40), ("Actions", 16)]
-        hdr = tk.Frame(p, bg=BG3)
-        hdr.pack(fill="x", pady=(8, 0))
-        for txt, w in cols:
-            tk.Label(hdr, text=txt, bg=BG3, fg=ACCENT, width=w, anchor="w",
-                     padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
+        # fixed header — Key fixed, Decoded value fills the middle, Actions
+        # pinned right so it lines up with the row buttons (which are themselves
+        # right-pinned so they're never clipped by the scrollbar).
+        hdr = tk.Frame(p, bg=BG3); hdr.pack(fill="x", pady=(8, 0))
+        tk.Label(hdr, text="Key", bg=BG3, fg=ACCENT, width=22, anchor="w",
+                 padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
+        tk.Label(hdr, text="Actions", bg=BG3, fg=ACCENT, anchor="e",
+                 padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="right")
+        tk.Label(hdr, text="Decoded value", bg=BG3, fg=ACCENT, anchor="w",
+                 padx=6, pady=4, font=(SANS, SZ, "bold")) \
+            .pack(side="left", fill="x", expand=True)
 
         # scrollable canvas body
         body = ttk.Frame(p); body.pack(fill="both", expand=True)
@@ -841,17 +893,16 @@ class App(tk.Tk):
             tk.Label(row, text=key, bg=bg, fg=FG, width=22, anchor="w",
                      padx=6, pady=3, font=(MONO, SZ)).pack(side="left")
             sv = tk.BooleanVar(value=False)
-            vl = tk.Label(row, text=masked, bg=bg, fg=BLUE, width=40, anchor="w",
+            vl = tk.Label(row, text=masked, bg=bg, fg=BLUE, anchor="w",
                           padx=6, pady=3, font=(MONO, SZ))
-            vl.pack(side="left")
 
+            # Action buttons pinned right so they're never clipped by the
+            # scrollbar; the value label (packed last) fills the middle. Use the
+            # Encode tab's Icon.TButton style so they match the KV editor.
             af = tk.Frame(row, bg=bg)
-            af.pack(side="left", fill="x")
+            af.pack(side="right")
 
-            tb = tk.Button(af, text="Show", bg=BG3, fg=FG,
-                           activebackground=BORDER, activeforeground=FG,
-                           relief="flat", bd=0, padx=8, pady=1, font=(SANS, SZ - 1),
-                           highlightthickness=0, cursor="hand2")
+            tb = ttk.Button(af, text="Show", style="Icon.TButton")
             if binary:
                 tb.configure(state="disabled")  # nothing to reveal
             else:
@@ -859,11 +910,10 @@ class App(tk.Tk):
                              vl=vl, tb=tb: self._set_row_visible(
                                  shown, masked, sv, vl, tb, not sv.get()))
             tb.pack(side="left", padx=(6, 2), pady=2)
-            tk.Button(af, text="Copy", bg=BG3, fg=FG,
-                      activebackground=BORDER, activeforeground=FG,
-                      relief="flat", bd=0, padx=8, pady=1, font=(SANS, SZ - 1),
-                      highlightthickness=0, cursor="hand2",
-                      command=lambda d=value: self._clip(d)).pack(side="left", pady=2)
+            ttk.Button(af, text="Copy", style="Icon.TButton",
+                       command=lambda d=value: self._clip(d)) \
+                .pack(side="left", padx=(0, 6), pady=2)
+            vl.pack(side="left", fill="x", expand=True)
 
             self._tbl_rows.append((shown, masked, sv, vl, tb, binary))
 
