@@ -25,6 +25,8 @@ _version.py
 *.yaml
 *.yml
 .env
+*.env
+.env.*
 sealed-*.yaml
 
 # Local test certs/keys
