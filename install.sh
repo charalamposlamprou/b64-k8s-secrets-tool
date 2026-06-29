@@ -109,32 +109,34 @@ ensure_cluster_tools() {
   # Linux: pull official static binaries into /usr/local/bin (best-effort).
   if ! command -v kubectl >/dev/null 2>&1; then
     info "Installing kubectl…"
+    _kc_tmp=""
     if ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" \
-       && curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${ver}/bin/linux/${ARCH}/kubectl"; then
-      if $SUDO install -m 0755 /tmp/kubectl /usr/local/bin/kubectl; then
-        rm -f /tmp/kubectl
-      else
-        warn "kubectl install failed — install it later for cluster features"
-      fi
+       && _kc_tmp="$(mktemp)" \
+       && curl -fsSL "https://dl.k8s.io/release/${ver}/bin/linux/${ARCH}/kubectl" -o "$_kc_tmp"; then
+      $SUDO install -m 0755 "$_kc_tmp" /usr/local/bin/kubectl \
+        || warn "kubectl install failed — install it later for cluster features"
+      rm -f "$_kc_tmp"
     else
+      if [ -n "$_kc_tmp" ]; then rm -f "$_kc_tmp"; fi
       warn "kubectl download failed — install it later for cluster features"
     fi
   fi
   if ! command -v kubeseal >/dev/null 2>&1; then
     info "Installing kubeseal…"
-    if tag="$(curl -fsSL https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest \
-                | grep -m1 '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/')" \
-       && [ -n "$tag" ] \
-       && curl -fsSLo /tmp/kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${tag}/kubeseal-${tag}-linux-${ARCH}.tar.gz" \
-       && tar -xzf /tmp/kubeseal.tgz -C /tmp kubeseal; then
-      if $SUDO install -m 0755 /tmp/kubeseal /usr/local/bin/kubeseal; then
-        rm -f /tmp/kubeseal /tmp/kubeseal.tgz
-      else
-        warn "kubeseal install failed — install it later for the Seal tab"
-      fi
+    _ks_tmpdir=""
+    if _ks_tag="$(curl -fsSL https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest \
+                   | grep -m1 '"tag_name"' | cut -d '"' -f4)" \
+       && [ -n "$_ks_tag" ] \
+       && _ks_ver="${_ks_tag#v}" \
+       && _ks_tmpdir="$(mktemp -d)" \
+       && curl -fsSL "https://github.com/bitnami-labs/sealed-secrets/releases/download/${_ks_tag}/kubeseal-${_ks_ver}-linux-${ARCH}.tar.gz" \
+            | tar -xzf - -C "$_ks_tmpdir" kubeseal; then
+      $SUDO install -m 0755 "$_ks_tmpdir/kubeseal" /usr/local/bin/kubeseal \
+        || warn "kubeseal install failed — install it later for the Seal tab"
     else
       warn "kubeseal download failed — install it later for the Seal tab"
     fi
+    if [ -n "$_ks_tmpdir" ]; then rm -rf "$_ks_tmpdir"; fi
   fi
 }
 
