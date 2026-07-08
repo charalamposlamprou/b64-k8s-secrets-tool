@@ -87,10 +87,12 @@ from core import (  # noqa: E402
     b64_decode,
     b64_encode,
     build_secret_yaml,
+    has_sealed_secret,
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
     parse_dotenv,
     secret_entries,
+    select_secret_doc,
     write_secret_file,
 )
 
@@ -429,6 +431,13 @@ class App(tk.Tk):
         ttk.Label(fp, text="File:").pack(side="left")
         env_btns = ttk.Frame(fp); env_btns.pack(side="right")
         ttk.Button(env_btns, text="Browse…", command=self._browse_env).pack(side="left")
+        # Import an existing Secret YAML from disk (e.g. one that never made it
+        # into the cluster, so Load Template can't fetch it) to edit and re-emit.
+        imp_btn = ttk.Button(env_btns, text="Import Secret…",
+                             command=self._import_secret)
+        if not PYYAML_OK:
+            imp_btn.configure(state="disabled")
+        imp_btn.pack(side="left", padx=(6, 0))
         ttk.Button(env_btns, text="Clear", command=self._clear_env) \
             .pack(side="left", padx=(6, 0))
         self._env_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel", anchor="w")
@@ -709,16 +718,55 @@ class App(tk.Tk):
             filetypes=[(".env files", "*.env"), ("All files", "*.*")])
         if not path:
             return
-        try:
-            with open(path) as f:
-                text = f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            self._status(f"Could not read file: {e}", "err"); return
+        text = self._read_file(path)
+        if text is None:
+            return
         self._env_lbl.configure(text=path)
         self._tpl_binary = {}  # a plain .env carries no binary passthrough
         self._kv_set_pairs(parse_dotenv(text).items())
         self._sec_type.set("Opaque")
+        # Any generated YAML matches the *previous* editor contents — clear it
+        # so the Seal tab can't quietly seal a stale secret.
+        self._set_text(self._yaml_out, "")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
+
+    def _import_secret(self):
+        """Import a Kubernetes Secret YAML from disk into the KV editor — for
+        editing a secret that never reached the cluster (a mis-sealed deploy,
+        say), where Load Template has nothing to fetch. Decodes data /
+        stringData into editable rows and fills name / namespace / type."""
+        if not PYYAML_OK:
+            self._status("PyYAML not installed", "err"); return
+        path = filedialog.askopenfilename(
+            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")])
+        if not path:
+            return
+        content = self._read_file(path)
+        if content is None:
+            return
+        doc = self._yaml_secret_doc(content, verb="import")
+        if doc is None:
+            return
+        # Guards before touching the editor, so a rejected import can't
+        # destroy in-progress rows.
+        entries = secret_entries(doc)
+        if not entries:
+            self._status("Secret has no data/stringData — nothing to import",
+                         "err")
+            return
+        # "invalid" means Kubernetes itself would reject the value at apply
+        # time — in a hand-written file that's almost always plaintext put
+        # under `data` instead of `stringData`. Importing it would silently
+        # round-trip the plaintext as if it were base64 (garbage on deploy).
+        bad = next((k for k, _v, kind in entries if kind == "invalid"), None)
+        if bad is not None:
+            self._status(f"data.{bad} is not valid base64 — plaintext values "
+                         "belong under stringData", "err")
+            return
+        self._env_lbl.configure(text=path)
+        total, binary = self._apply_secret_doc(doc)
+        self._status(self._applied_msg("Imported", total, binary,
+                                       os.path.basename(path)), "ok")
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
@@ -860,19 +908,16 @@ class App(tk.Tk):
             filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")])
         if not path:
             return
-        try:
-            with open(path) as f:
-                content = f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            self._status(f"Could not read file: {e}", "err"); return
+        content = self._read_file(path)
+        if content is None:
+            return
         self._dec_lbl.configure(text=path)
         self._populate_table(content)
 
     def _populate_table(self, content: str):
-        try:
-            doc = yaml.safe_load(content)
-        except yaml.YAMLError as e:
-            self._status(f"YAML parse error: {e}", "err"); return
+        doc = self._yaml_secret_doc(content, verb="decode")
+        if doc is None:
+            return
 
         entries = secret_entries(doc)  # data + stringData, decoded
 
@@ -881,10 +926,15 @@ class App(tk.Tk):
         self._tbl_rows.clear()
 
         for i, (key, value, kind) in enumerate(entries):
-            binary = kind == "binary"
-            # Binary values can't be shown as text; display a marker and let
-            # Copy hand back the raw base64 instead of rendering mojibake.
-            shown = "⟨binary — Copy gives base64⟩" if binary else value
+            binary = kind != "text"
+            # Non-text values can't be shown as plaintext; display a marker and
+            # let Copy hand back the original value instead of mojibake.
+            if kind == "binary":
+                shown = "⟨binary — Copy gives base64⟩"
+            elif kind == "invalid":
+                shown = "⟨not valid base64 — Copy gives raw value⟩"
+            else:
+                shown = value
             masked = shown if binary else "•" * min(len(shown), 32)
             bg = ROW_A if i % 2 == 0 else ROW_B
             row = tk.Frame(self._tbl_body, bg=bg)
@@ -1279,35 +1329,52 @@ class App(tk.Tk):
         except yaml.YAMLError as e:
             self._status(f"YAML parse error: {e}", "err"); return
 
+        total, binary = self._apply_secret_doc(doc, fb_name=sec, fb_ns=ns)
+        self._status(self._applied_msg("Loaded", total, binary, sec), "ok")
+
+    @staticmethod
+    def _applied_msg(verb, total, binary, src):
+        """Status line for a secret applied to the editor (Loaded/Imported)."""
+        msg = f"{verb} {total} key(s) from {src}"
+        if binary:
+            msg += f" — {binary} binary value(s) kept as-is"
+        return msg
+
+    def _apply_secret_doc(self, doc, fb_name="my-secret", fb_ns="default"):
+        """Populate the KV editor and Secret name / Namespace / Type fields from
+        a parsed Secret doc (shared by Load Template and Import Secret…).
+        Returns (total_keys, binary_keys) for the caller's status line."""
+        if not isinstance(doc, dict):
+            doc = {}
         self._tpl_binary = {}
         text_pairs = []
         entries = secret_entries(doc)  # data + stringData, decoded
         for k, value, kind in entries:
-            if kind == "binary":
-                # Can't edit binary as text without corrupting it on re-encode:
-                # keep the original base64 and re-emit it verbatim at Generate
-                # (tracked in _tpl_binary). A marker row shows it in the editor.
-                self._tpl_binary[k] = value
-            else:
+            if kind == "text":
                 text_pairs.append((k, value))
+            else:
+                # binary (or invalid) can't be edited as text without
+                # corrupting it on re-encode: keep the original value and
+                # re-emit it verbatim at Generate (tracked in _tpl_binary).
+                # A marker row shows it in the editor.
+                self._tpl_binary[k] = value
         self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
 
         # Also populate the editable Secret name / Namespace fields from the
-        # fetched secret's metadata (falling back to the selected combo values),
-        # so they can be tweaked before Generate YAML.
-        meta = doc.get("metadata", {}) if isinstance(doc, dict) else {}
-        name = meta.get("name") or sec
-        nsv  = meta.get("namespace") or ns
+        # secret's metadata (falling back to the caller's values), so they can
+        # be tweaked before Generate YAML.
+        meta = doc.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        name = meta.get("name") or fb_name
+        nsv  = meta.get("namespace") or fb_ns
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
-        self._sec_type.set(
-            (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
-
-        binary = len(self._tpl_binary)
-        msg = f"Loaded {len(entries)} key(s) from {sec}"
-        if binary:
-            msg += f" — {binary} binary value(s) kept as-is"
-        self._status(msg, "ok")
+        self._sec_type.set(doc.get("type") or "Opaque")
+        # Any generated YAML matches the *previous* editor contents — clear it
+        # so the Seal tab can't quietly seal a stale secret.
+        self._set_text(self._yaml_out, "")
+        return len(entries), len(self._tpl_binary)
 
     # --------------------------------------------------------------- helpers
 
@@ -1368,6 +1435,37 @@ class App(tk.Tk):
             except (OSError, ValueError, subprocess.SubprocessError):
                 continue
         return False
+
+    def _read_file(self, path: str):
+        """Read a user-picked text file, reporting failure in the status bar.
+        Returns the content, or None on error. Explicit UTF-8: the locale
+        default (e.g. cp1252 on Windows) would reject or mojibake non-ASCII
+        secret values saved as UTF-8."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            self._status(f"Could not read file: {e}", "err")
+            return None
+
+    def _yaml_secret_doc(self, content: str, verb: str):
+        """Parse YAML text (multi-doc tolerant — manifests often bundle several
+        resources) and pick the Secret doc, reporting failures in the status
+        bar. `verb` names the caller's action for the SealedSecret hint.
+        Returns the doc, or None."""
+        try:
+            docs = [d for d in yaml.safe_load_all(content) if d is not None]
+        except yaml.YAMLError as e:
+            self._status(f"YAML parse error: {e}", "err")
+            return None
+        doc = select_secret_doc(docs)
+        if doc is None:
+            if has_sealed_secret(docs):
+                self._status(f"SealedSecret is encrypted — {verb} the plain "
+                             "Secret YAML it was sealed from", "err")
+            else:
+                self._status("No Secret data/stringData found in file", "err")
+        return doc
 
     def _write_file(self, path: str, content: str):
         try:

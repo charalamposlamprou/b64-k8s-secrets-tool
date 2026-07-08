@@ -260,6 +260,63 @@ def test_secret_entries_non_secret_returns_empty(doc):
     assert core.secret_entries(doc) == []
 
 
+def test_secret_entries_flags_invalid_base64_as_invalid():
+    # Plaintext mistakenly under `data`: k8s would reject these at apply time
+    # (bad padding / chars outside the base64 alphabet), so they must NOT pass
+    # as "binary" — that would round-trip the plaintext verbatim as base64.
+    for plain in ("hunter2", "my-password", "pass word"):
+        [(_k, value, kind)] = core.secret_entries({"data": {"P": plain}})
+        assert kind == "invalid", plain
+        assert value == plain  # original preserved for the error message
+
+    # Genuine binary stays "binary": valid base64, not UTF-8 once decoded.
+    b64 = base64.b64encode(b"\xff\xfe\x00raw").decode()
+    [(_k, _v, kind)] = core.secret_entries({"data": {"CERT": b64}})
+    assert kind == "binary"
+
+
+def test_b64_valid_for_k8s_matches_go_semantics():
+    ok = base64.b64encode(b"\xff\xfe\x00raw").decode()
+    assert core.b64_valid_for_k8s(ok)
+    # Go's decoder ignores \r and \n (long values are often wrapped) ...
+    assert core.b64_valid_for_k8s(ok[:4] + "\n" + ok[4:])
+    # ... but requires correct padding and rejects other characters.
+    assert not core.b64_valid_for_k8s("hunter2")      # bad padding
+    assert not core.b64_valid_for_k8s("my-password")  # '-' not in alphabet
+    assert not core.b64_valid_for_k8s("ab cd")        # spaces not ignored
+
+
+# --------------------------------------------------------------------------
+# select_secret_doc / has_sealed_secret — pick the Secret out of a manifest
+# --------------------------------------------------------------------------
+
+def test_select_secret_doc_prefers_explicit_kind():
+    # A kind-less data-bearing fragment must never shadow a real Secret that
+    # appears later in the same multi-doc file.
+    snippet = {"data": {"KEY": "bm90LXRoaXM="}}
+    secret = {"kind": "Secret", "data": {"token": core.b64_encode("s")}}
+    assert core.select_secret_doc([snippet, secret]) is secret
+
+
+def test_select_secret_doc_accepts_kindless_snippet():
+    snippet = {"stringData": {"USER": "alice"}}
+    assert core.select_secret_doc([{"kind": "ConfigMap", "data": {"K": "v"}},
+                                   snippet]) is snippet
+
+
+def test_select_secret_doc_rejects_other_kinds_and_junk():
+    # A ConfigMap's `data` is Secret-shaped but must not be picked.
+    assert core.select_secret_doc([{"kind": "ConfigMap", "data": {"K": "v"}}]) is None
+    assert core.select_secret_doc([None, "text", 42, {"spec": {}}]) is None
+    assert core.select_secret_doc([]) is None
+
+
+def test_has_sealed_secret():
+    sealed = {"kind": "SealedSecret", "spec": {"encryptedData": {"p": "AgA="}}}
+    assert core.has_sealed_secret([{"kind": "ConfigMap"}, sealed])
+    assert not core.has_sealed_secret([{"kind": "Secret"}, None, "junk"])
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
 def test_write_secret_file_is_owner_only_on_create(tmp_path):
     p = tmp_path / "secret.yaml"
