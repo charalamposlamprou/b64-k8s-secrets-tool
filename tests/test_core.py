@@ -337,11 +337,28 @@ def test_has_sealed_secret_sees_inside_kind_list():
 
 def test_select_secret_doc_unwraps_nested_lists():
     # No real tool emits nested Lists, but a Secret must not be able to hide
-    # inside one either — flattening recurses.
+    # inside one either.
     secret = {"kind": "Secret", "data": {"t": core.b64_encode("v")}}
     nested = {"kind": "List",
               "items": [{"kind": "List", "items": [secret]}]}
     assert core.select_secret_doc([nested]) is secret
+
+
+def test_flatten_survives_cyclic_and_deep_lists():
+    # YAML anchors/aliases can make a List contain itself — safe_load builds
+    # the cycle happily — and hand-crafted files can nest Lists absurdly deep.
+    # Neither may crash the picker (a RecursionError would escape the import
+    # callback as an unhandled traceback).
+    cyclic = yaml.safe_load("&a\nkind: List\nitems:\n  - *a\n")
+    assert cyclic["items"][0] is cyclic  # PyYAML really builds the cycle
+    assert core.select_secret_doc([cyclic]) is None
+    assert not core.has_sealed_secret([cyclic])
+
+    secret = {"kind": "Secret", "data": {"t": core.b64_encode("v")}}
+    deep = secret
+    for _ in range(5000):  # far beyond the default recursion limit
+        deep = {"kind": "List", "items": [deep]}
+    assert core.select_secret_doc([deep]) is secret
 
 
 def test_first_invalid_key():

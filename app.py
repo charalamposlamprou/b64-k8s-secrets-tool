@@ -765,7 +765,7 @@ class App(tk.Tk):
         if doc is None:
             return
         entries = secret_entries(doc)
-        err = self._check_entries(entries, verb="import")
+        err = self._check_entries(entries)
         if err:
             self._status(err, "err")
             return
@@ -775,12 +775,14 @@ class App(tk.Tk):
                                        os.path.basename(path)), "ok")
 
     @staticmethod
-    def _check_entries(entries, verb):
+    def _check_entries(entries):
         """Guards shared by Import and Load Template, run BEFORE the editor is
         touched so a rejected secret can't destroy in-progress rows. Returns
-        an error message, or None if the entries are safe to apply."""
+        an error message, or None if the entries are safe to apply. (The empty
+        case is Import-only — Load Template turns an empty secret into an
+        identity-only load before calling this.)"""
         if not entries:
-            return f"Secret has no data/stringData — nothing to {verb}"
+            return "Secret has no data/stringData — nothing to import"
         # "invalid" means Kubernetes itself would reject the value at apply
         # time. Applying it would silently round-trip the raw string as if it
         # were base64 (garbage on deploy). Two causes, two remedies: plaintext
@@ -1119,10 +1121,29 @@ class App(tk.Tk):
         self._sealing = True
         self._refresh_action_buttons()
         self._status("Sealing…", "dim")
-        gen = self._out_gen  # the editor generation this seal belongs to
+        self._dispatch_gen(cmd, self._on_sealed, yaml_text)
+
+    def _dispatch_gen(self, cmd, handler, stdin_data):
+        """Dispatch a background op whose result feeds the output panes:
+        captures the current editor generation and hands it to `handler`
+        (o, e, rc, gen) so the landing callback can discard a result made
+        stale by a repopulation while it ran. Every output-producing run_bg
+        must go through here — a copy that forgets the capture reopens the
+        stale-resurrection race."""
+        gen = self._out_gen
         run_bg(cmd,
-               lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r, gen)),
-               stdin_data=yaml_text)
+               lambda o, e, r: self.after(0, lambda: handler(o, e, r, gen)),
+               stdin_data=stdin_data)
+
+    def _discard_stale(self, gen, verb):
+        """True (with an explanatory status) when a background result was made
+        stale by an editor repopulation while it ran — the shared guard for
+        every _dispatch_gen handler."""
+        if gen == self._out_gen:
+            return False
+        self._status(f"Editor changed during {verb} — stale result discarded",
+                     "err")
+        return True
 
     @staticmethod
     def _kubeseal_rc_error(rc):
@@ -1135,14 +1156,11 @@ class App(tk.Tk):
 
     def _on_sealed(self, stdout, stderr, rc, gen):
         self._sealing = False
-        # The editor was repopulated while kubeseal ran: this result describes
-        # the previous secret. Drop it rather than resurrect the cleared pane
-        # (writing it would let Save/Validate act on a secret the editor no
-        # longer shows).
-        if gen != self._out_gen:
+        # A stale result describes the previous secret: drop it rather than
+        # resurrect the cleared pane (writing it would let Save/Validate act
+        # on a secret the editor no longer shows).
+        if self._discard_stale(gen, "sealing"):
             self._refresh_action_buttons()
-            self._status("Editor changed during sealing — stale result "
-                         "discarded; seal again", "err")
             return
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
@@ -1195,20 +1213,14 @@ class App(tk.Tk):
         self._validating = True
         self._refresh_action_buttons()
         self._status("Validating…", "dim")
-        gen = self._out_gen  # the editor generation this validate belongs to
-        run_bg(cmd,
-               lambda o, e, r: self.after(0, lambda: self._on_validated(o, e, r, gen)),
-               stdin_data=sealed)
+        self._dispatch_gen(cmd, self._on_validated, sealed)
 
     def _on_validated(self, stdout, stderr, rc, gen):
         self._validating = False
         self._refresh_action_buttons()
-        # Editor repopulated mid-validate: the verdict is about the previous
-        # secret's sealed output (since cleared) — reporting "Valid" now would
-        # mislead. Drop it.
-        if gen != self._out_gen:
-            self._status("Editor changed during validation — stale result "
-                         "discarded", "err")
+        # A stale verdict is about the previous secret's sealed output (since
+        # cleared) — reporting "Valid" now would mislead. Drop it.
+        if self._discard_stale(gen, "validation"):
             return
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
@@ -1381,13 +1393,25 @@ class App(tk.Tk):
         entries = secret_entries(doc)
         if not entries:
             # An empty cluster Secret still carries a usable identity: inherit
-            # its name/namespace/type as scaffolding, but leave the KV rows
-            # alone — wiping in-progress edits for zero keys helps nobody.
+            # its name/namespace/type as scaffolding. Editable text rows stay
+            # (wiping in-progress edits for zero keys helps nobody), but binary
+            # passthrough rows are bound to the *previous* secret — invisible
+            # values that would be re-emitted verbatim under the new identity —
+            # so they are dropped rather than silently migrated.
+            dropped = [rd for rd in self._kv_rows if rd["binary"]]
+            for rd in dropped:
+                self._kv_del_row(rd)  # also pops its _tpl_binary passthrough
             self._set_secret_identity(doc, fb_name=sec, fb_ns=ns)
-            self._status(f"{sec} has no data/stringData — loaded "
-                         "name/namespace/type only", "ok")
+            # The identity changed, so any generated/sealed output describes
+            # the old identity — same staleness as a row replacement.
+            self._invalidate_outputs()
+            msg = f"{sec} has no data/stringData — loaded name/namespace/type only"
+            if dropped:
+                msg += (f"; dropped {len(dropped)} binary value(s) from the "
+                        "previous secret")
+            self._status(msg, "ok")
             return
-        err = self._check_entries(entries, verb="load")
+        err = self._check_entries(entries)
         if err:
             self._status(err, "err")
             return
@@ -1409,9 +1433,8 @@ class App(tk.Tk):
         from a parsed Secret doc (shared by Load Template and Import Secret…).
         `entries` is the caller's secret_entries(doc) — already computed for
         the _check_entries guard, so the base64 decode pass runs only once.
-        Returns (total_keys, binary_keys) for the caller's status line."""
-        if not isinstance(doc, dict):
-            doc = {}
+        (doc normalization lives in _set_secret_identity, the only place doc
+        is read.) Returns (total_keys, binary_keys) for the status line."""
         self._tpl_binary = {}
         text_pairs = []
         for k, value, kind in entries:

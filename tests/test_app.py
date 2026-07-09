@@ -389,6 +389,36 @@ def test_load_template_empty_secret_loads_identity_only():
         win.destroy()
 
 
+def test_identity_only_load_invalidates_and_drops_binary():
+    """The identity-only path changes what the outputs describe, so it must
+    invalidate them like any repopulation — and it must not carry the previous
+    secret's binary passthrough (invisible values that Generate would re-emit
+    verbatim) into the new identity."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        # State from a previously loaded secret A: a text row, a binary
+        # passthrough, generated + sealed output, and an in-flight seal.
+        win._tpl_binary = {"tls.key": "QUJD"}
+        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._set_text(win._yaml_out,   "kind: Secret  # A\n")
+        win._set_text(win._sealed_out, "kind: SealedSecret  # A\n")
+        gen = win._out_gen  # a seal dispatched under the old identity
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+
+        win._got_template("c", "n", "s",
+                          "kind: Secret\nmetadata:\n  name: hollow\n", "", 0)
+
+        assert win._kv_get_pairs() == {"KEEP": "me"}   # text rows kept
+        assert win._tpl_binary == {}                   # binary NOT migrated
+        assert "dropped 1 binary value(s)" in win._status_var.get()
+        assert win._yaml_out.get("1.0", "end").strip() == ""    # invalidated
+        assert win._sealed_out.get("1.0", "end").strip() == ""
+        assert win._out_gen != gen  # in-flight results are now stale
+    finally:
+        win.destroy()
+
+
 def test_stale_seal_result_is_discarded_after_repopulation():
     """A background seal that lands after the editor was repopulated must not
     resurrect the cleared sealed pane with the previous secret's manifest."""

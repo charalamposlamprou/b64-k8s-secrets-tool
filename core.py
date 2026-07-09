@@ -211,14 +211,21 @@ def first_invalid_key(entries):
 
 def _flatten_list_docs(docs) -> list:
     """Expand `kind: List` wrappers (what `kubectl get -o yaml` and helm/argo
-    renders emit) into their .items — recursively, so even a nested List
-    can't hide a Secret. Non-dict docs are dropped."""
-    flat = []
-    for d in docs:
+    renders emit) into their .items, however deeply nested, so a nested List
+    can't hide a Secret. Non-dict docs are dropped.
+
+    Iterative, with each wrapper expanded at most once: YAML anchors/aliases
+    let a hand-crafted List nest arbitrarily deep or even contain itself, and
+    recursion would die with RecursionError on such a file."""
+    flat, queue, expanded = [], list(docs), set()
+    while queue:
+        d = queue.pop(0)
         if not isinstance(d, dict):
             continue
         if d.get("kind") == "List" and isinstance(d.get("items"), list):
-            flat.extend(_flatten_list_docs(d["items"]))
+            if id(d) not in expanded:  # skip an anchor/alias cycle
+                expanded.add(id(d))
+                queue[:0] = d["items"]  # expand in place, keeping doc order
         else:
             flat.append(d)
     return flat
