@@ -335,6 +335,23 @@ def test_has_sealed_secret_sees_inside_kind_list():
     assert core.has_sealed_secret([{"kind": "List", "items": [sealed]}])
 
 
+def test_select_secret_doc_unwraps_nested_lists():
+    # No real tool emits nested Lists, but a Secret must not be able to hide
+    # inside one either — flattening recurses.
+    secret = {"kind": "Secret", "data": {"t": core.b64_encode("v")}}
+    nested = {"kind": "List",
+              "items": [{"kind": "List", "items": [secret]}]}
+    assert core.select_secret_doc([nested]) is secret
+
+
+def test_first_invalid_key():
+    entries = core.secret_entries(
+        {"data": {"OK": core.b64_encode("fine"), "BAD": "hunter2"}})
+    assert core.first_invalid_key(entries) == "BAD"
+    assert core.first_invalid_key(
+        core.secret_entries({"stringData": {"A": "x"}})) is None
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
 def test_write_secret_file_is_owner_only_on_create(tmp_path):
     p = tmp_path / "secret.yaml"

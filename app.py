@@ -87,6 +87,7 @@ from core import (  # noqa: E402
     b64_decode,
     b64_encode,
     build_secret_yaml,
+    first_invalid_key,
     has_sealed_secret,
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
@@ -142,6 +143,11 @@ class App(tk.Tk):
         # lookup landing mid-operation can't re-enable a button under it.
         self._sealing = False
         self._validating = False
+        # Editor generation, bumped by _invalidate_outputs. A seal/validate
+        # captures it at dispatch; a result landing after the editor was
+        # repopulated is stale (it describes the previous secret) and is
+        # discarded instead of resurrecting the just-cleared output pane.
+        self._out_gen = 0
 
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
@@ -667,6 +673,7 @@ class App(tk.Tk):
         here, in the row-replacement choke points' shared tail, means no
         repopulating path (Browse .env / Import / Load Template / Clear) can
         forget it and let the Seal tab seal or validate a stale secret."""
+        self._out_gen += 1  # in-flight seal/validate results are now stale
         self._set_text(self._yaml_out, "")
         self._set_text(self._sealed_out, "")
         self._refresh_action_buttons()
@@ -778,7 +785,7 @@ class App(tk.Tk):
         # time. Applying it would silently round-trip the raw string as if it
         # were base64 (garbage on deploy). Two causes, two remedies: plaintext
         # mistakenly under `data`, or binary base64 with broken padding.
-        bad = next((k for k, _v, kind in entries if kind == "invalid"), None)
+        bad = first_invalid_key(entries)
         if bad is not None:
             return (f"data.{bad} is not valid base64 for Kubernetes — "
                     "plaintext belongs under stringData; binary needs exact "
@@ -1112,7 +1119,9 @@ class App(tk.Tk):
         self._sealing = True
         self._refresh_action_buttons()
         self._status("Sealing…", "dim")
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r)),
+        gen = self._out_gen  # the editor generation this seal belongs to
+        run_bg(cmd,
+               lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r, gen)),
                stdin_data=yaml_text)
 
     @staticmethod
@@ -1124,8 +1133,17 @@ class App(tk.Tk):
             return "kubeseal timed out"
         return None
 
-    def _on_sealed(self, stdout, stderr, rc):
+    def _on_sealed(self, stdout, stderr, rc, gen):
         self._sealing = False
+        # The editor was repopulated while kubeseal ran: this result describes
+        # the previous secret. Drop it rather than resurrect the cleared pane
+        # (writing it would let Save/Validate act on a secret the editor no
+        # longer shows).
+        if gen != self._out_gen:
+            self._refresh_action_buttons()
+            self._status("Editor changed during sealing — stale result "
+                         "discarded; seal again", "err")
+            return
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
             self._refresh_action_buttons()
@@ -1177,12 +1195,21 @@ class App(tk.Tk):
         self._validating = True
         self._refresh_action_buttons()
         self._status("Validating…", "dim")
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_validated(o, e, r)),
+        gen = self._out_gen  # the editor generation this validate belongs to
+        run_bg(cmd,
+               lambda o, e, r: self.after(0, lambda: self._on_validated(o, e, r, gen)),
                stdin_data=sealed)
 
-    def _on_validated(self, stdout, stderr, rc):
+    def _on_validated(self, stdout, stderr, rc, gen):
         self._validating = False
         self._refresh_action_buttons()
+        # Editor repopulated mid-validate: the verdict is about the previous
+        # secret's sealed output (since cleared) — reporting "Valid" now would
+        # mislead. Drop it.
+        if gen != self._out_gen:
+            self._status("Editor changed during validation — stale result "
+                         "discarded", "err")
+            return
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
             self._status(sentinel, "err"); return
@@ -1352,6 +1379,14 @@ class App(tk.Tk):
             self._status(f"YAML parse error: {e}", "err"); return
 
         entries = secret_entries(doc)
+        if not entries:
+            # An empty cluster Secret still carries a usable identity: inherit
+            # its name/namespace/type as scaffolding, but leave the KV rows
+            # alone — wiping in-progress edits for zero keys helps nobody.
+            self._set_secret_identity(doc, fb_name=sec, fb_ns=ns)
+            self._status(f"{sec} has no data/stringData — loaded "
+                         "name/namespace/type only", "ok")
+            return
         err = self._check_entries(entries, verb="load")
         if err:
             self._status(err, "err")
@@ -1390,10 +1425,15 @@ class App(tk.Tk):
                 # run _check_entries first.)
                 self._tpl_binary[k] = value
         self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
+        self._set_secret_identity(doc, fb_name, fb_ns)
+        return len(entries), len(self._tpl_binary)
 
-        # Also populate the editable Secret name / Namespace fields from the
-        # secret's metadata (falling back to the caller's values), so they can
-        # be tweaked before Generate YAML.
+    def _set_secret_identity(self, doc, fb_name="my-secret", fb_ns="default"):
+        """Fill the editable Secret name / Namespace / Type fields from a
+        parsed Secret doc's metadata (falling back to the caller's values), so
+        they can be tweaked before Generate YAML."""
+        if not isinstance(doc, dict):
+            doc = {}
         meta = doc.get("metadata")
         if not isinstance(meta, dict):
             meta = {}
@@ -1402,7 +1442,6 @@ class App(tk.Tk):
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
         self._sec_type.set(doc.get("type") or "Opaque")
-        return len(entries), len(self._tpl_binary)
 
     # --------------------------------------------------------------- helpers
 

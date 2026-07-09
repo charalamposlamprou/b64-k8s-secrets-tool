@@ -365,9 +365,9 @@ def test_yaml_secret_doc_selects_from_multidoc_and_hints_sealed():
         win.destroy()
 
 
-def test_load_template_rejects_secret_without_data():
-    """Load Template shares Import's pre-apply guard: an empty cluster Secret
-    must not wipe in-progress editor rows."""
+def test_load_template_empty_secret_loads_identity_only():
+    """An empty cluster Secret is scaffolding: Load Template inherits its
+    name/namespace/type but must not wipe in-progress editor rows."""
     pytest.importorskip("yaml")
     win = _make_win()
     try:
@@ -375,11 +375,57 @@ def test_load_template_rejects_secret_without_data():
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
         win._got_template("c", "n", "s",
-                          "apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n",
+                          "apiVersion: v1\nkind: Secret\nmetadata:\n"
+                          "  name: hollow\n  namespace: prod\n"
+                          "type: kubernetes.io/tls\n",
                           "", 0)
 
-        assert "nothing to load" in win._status_var.get()
-        assert win._kv_get_pairs() == {"KEEP": "me"}  # editor untouched
+        assert "name/namespace/type only" in win._status_var.get()
+        assert win._kv_get_pairs() == {"KEEP": "me"}  # rows untouched
+        assert win._sec_name.get() == "hollow"        # identity inherited
+        assert win._sec_ns_e.get() == "prod"
+        assert win._sec_type.get() == "kubernetes.io/tls"
+    finally:
+        win.destroy()
+
+
+def test_stale_seal_result_is_discarded_after_repopulation():
+    """A background seal that lands after the editor was repopulated must not
+    resurrect the cleared sealed pane with the previous secret's manifest."""
+    win = _make_win()
+    try:
+        gen = win._out_gen          # generation the seal was dispatched under
+        win._sealing = True
+        win._kv_set_pairs([("NEW", "b")])  # repopulation bumps the generation
+
+        win._on_sealed("kind: SealedSecret  # secret A\n", "", 0, gen)
+
+        assert win._sealed_out.get("1.0", "end").strip() == ""  # not resurrected
+        assert "stale result discarded" in win._status_var.get()
+        assert win._sealing is False
+        # A seal dispatched under the CURRENT generation still lands normally.
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret  # secret B\n", "", 0, win._out_gen)
+        assert "secret B" in win._sealed_out.get("1.0", "end")
+        assert "Sealed successfully" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_stale_validate_result_is_discarded_after_repopulation():
+    """A background validate landing after repopulation must not report
+    'Valid' for the previous secret's sealed output."""
+    win = _make_win()
+    try:
+        gen = win._out_gen
+        win._validating = True
+        win._kv_set_pairs([("NEW", "b")])  # bumps the generation
+
+        win._on_validated("", "", 0, gen)
+
+        assert "Valid" not in win._status_var.get()
+        assert "stale result discarded" in win._status_var.get()
+        assert win._validating is False
     finally:
         win.destroy()
 

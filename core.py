@@ -201,16 +201,24 @@ def secret_entries(doc) -> list:
     return out
 
 
+def first_invalid_key(entries):
+    """The first key whose value Kubernetes would reject (kind "invalid"), or
+    None. Lives beside the kind taxonomy secret_entries defines, so the safety
+    gate that stops such values from round-tripping as garbage can't silently
+    drift from it."""
+    return next((k for k, _v, kind in entries if kind == "invalid"), None)
+
+
 def _flatten_list_docs(docs) -> list:
     """Expand `kind: List` wrappers (what `kubectl get -o yaml` and helm/argo
-    renders emit) into their .items, so the resources inside are visible to
-    the pickers below. Non-dict docs are dropped."""
+    renders emit) into their .items — recursively, so even a nested List
+    can't hide a Secret. Non-dict docs are dropped."""
     flat = []
     for d in docs:
         if not isinstance(d, dict):
             continue
         if d.get("kind") == "List" and isinstance(d.get("items"), list):
-            flat.extend(i for i in d["items"] if isinstance(i, dict))
+            flat.extend(_flatten_list_docs(d["items"]))
         else:
             flat.append(d)
     return flat
