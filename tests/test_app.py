@@ -363,3 +363,86 @@ def test_yaml_secret_doc_selects_from_multidoc_and_hints_sealed():
         assert win._tbl_rows == rows_before  # error path leaves the table alone
     finally:
         win.destroy()
+
+
+def test_load_template_rejects_secret_without_data():
+    """Load Template shares Import's pre-apply guard: an empty cluster Secret
+    must not wipe in-progress editor rows."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("KEEP", "me")])
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+
+        win._got_template("c", "n", "s",
+                          "apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n",
+                          "", 0)
+
+        assert "nothing to load" in win._status_var.get()
+        assert win._kv_get_pairs() == {"KEEP": "me"}  # editor untouched
+    finally:
+        win.destroy()
+
+
+def test_import_invalidates_stale_sealed_output(monkeypatch, tmp_path):
+    """Repopulating the editor must clear BOTH output panes: leaving the old
+    sealed manifest around lets the user validate/save secret A while the
+    editor shows secret B."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._set_text(win._yaml_out,   "kind: Secret  # stale A\n")
+        win._set_text(win._sealed_out, "kind: SealedSecret  # stale sealed A\n")
+        win._validate_btn.configure(state="normal")
+
+        _import_file(win, monkeypatch, tmp_path,
+                     "kind: Secret\ndata:\n  token: c2VjcmV0\n")
+
+        assert win._yaml_out.get("1.0", "end").strip() == ""
+        assert win._sealed_out.get("1.0", "end").strip() == ""
+        assert str(win._validate_btn.cget("state")) == "disabled"
+    finally:
+        win.destroy()
+
+
+def test_import_unwraps_kind_list(monkeypatch, tmp_path):
+    """A saved `kubectl get secrets -o yaml` (kind: List) imports the Secret
+    inside .items instead of failing with 'no Secret found'."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: from-list
+  data:
+    token: c2VjcmV0
+""")
+        assert win._kv_get_pairs() == {"token": "secret"}
+        assert win._sec_name.get() == "from-list"
+    finally:
+        win.destroy()
+
+
+def test_browse_yaml_keeps_label_on_failed_decode(monkeypatch, tmp_path):
+    """When decode bails (e.g. a SealedSecret), the previous file's rows stay
+    on screen — so the File label must keep naming them, not the failed file."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._dec_lbl.configure(text="previous.yaml")
+        path = tmp_path / "sealed.yaml"
+        path.write_text("kind: SealedSecret\nspec:\n  encryptedData:\n    p: AgA=\n")
+        monkeypatch.setattr(app.filedialog, "askopenfilename",
+                            lambda **k: str(path))
+
+        win._browse_yaml()
+
+        assert "SealedSecret is encrypted" in win._status_var.get()
+        assert win._dec_lbl.cget("text") == "previous.yaml"
+    finally:
+        win.destroy()

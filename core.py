@@ -201,14 +201,30 @@ def secret_entries(doc) -> list:
     return out
 
 
+def _flatten_list_docs(docs) -> list:
+    """Expand `kind: List` wrappers (what `kubectl get -o yaml` and helm/argo
+    renders emit) into their .items, so the resources inside are visible to
+    the pickers below. Non-dict docs are dropped."""
+    flat = []
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        if d.get("kind") == "List" and isinstance(d.get("items"), list):
+            flat.extend(i for i in d["items"] if isinstance(i, dict))
+        else:
+            flat.append(d)
+    return flat
+
+
 def select_secret_doc(docs):
     """Pick the Secret to work on from parsed YAML docs (a multi-doc manifest
-    may bundle several resources). An explicit `kind: Secret` always wins over
-    a kind-less mapping carrying data/stringData (a bare snippet) — a kind-less
-    fragment must never shadow a real Secret later in the file. Docs with any
-    other kind (ConfigMap, ...) are never picked even though their `data` is
-    Secret-shaped. Returns None if nothing qualifies."""
-    docs = [d for d in docs if isinstance(d, dict)]
+    may bundle several resources; a `kind: List` wrapper is unwrapped). An
+    explicit `kind: Secret` always wins over a kind-less mapping carrying
+    data/stringData (a bare snippet) — a kind-less fragment must never shadow
+    a real Secret later in the file. Docs with any other kind (ConfigMap, ...)
+    are never picked even though their `data` is Secret-shaped. Returns None
+    if nothing qualifies."""
+    docs = _flatten_list_docs(docs)
     for d in docs:
         if d.get("kind") == "Secret":
             return d
@@ -220,10 +236,11 @@ def select_secret_doc(docs):
 
 
 def has_sealed_secret(docs) -> bool:
-    """Whether any parsed doc is a SealedSecret — its values are encrypted for
-    the cluster controller, so there is nothing to decode/import locally."""
-    return any(isinstance(d, dict) and d.get("kind") == "SealedSecret"
-               for d in docs)
+    """Whether any parsed doc (List wrappers unwrapped) is a SealedSecret —
+    its values are encrypted for the cluster controller, so there is nothing
+    to decode/import locally."""
+    return any(d.get("kind") == "SealedSecret"
+               for d in _flatten_list_docs(docs))
 
 
 # ---------------------------------------------------------------------------

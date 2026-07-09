@@ -317,6 +317,24 @@ def test_has_sealed_secret():
     assert not core.has_sealed_secret([{"kind": "Secret"}, None, "junk"])
 
 
+def test_select_secret_doc_unwraps_kind_list():
+    # `kubectl get secrets -o yaml` (and helm/argo renders) wrap resources in
+    # a kind: List with the actual Secrets under .items.
+    secret = {"kind": "Secret", "metadata": {"name": "from-list"},
+              "data": {"t": core.b64_encode("v")}}
+    wrapper = {"apiVersion": "v1", "kind": "List",
+               "items": [{"kind": "ConfigMap", "data": {"K": "v"}}, secret]}
+    assert core.select_secret_doc([wrapper]) is secret
+    # Junk items inside the List don't break the scan.
+    assert core.select_secret_doc(
+        [{"kind": "List", "items": [None, "junk", 42]}]) is None
+
+
+def test_has_sealed_secret_sees_inside_kind_list():
+    sealed = {"kind": "SealedSecret", "spec": {"encryptedData": {"p": "AgA="}}}
+    assert core.has_sealed_secret([{"kind": "List", "items": [sealed]}])
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
 def test_write_secret_file_is_owner_only_on_create(tmp_path):
     p = tmp_path / "secret.yaml"
