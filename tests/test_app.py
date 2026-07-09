@@ -172,3 +172,374 @@ def test_controller_landing_mid_seal_keeps_buttons_disabled():
         assert str(win._validate_btn.cget("state")) == "disabled"
     finally:
         win.destroy()
+
+
+def _import_file(win, monkeypatch, tmp_path, content):
+    """Drive Import Secret… against a temp YAML file, bypassing the dialog."""
+    path = tmp_path / "secret.yaml"
+    path.write_text(content)
+    monkeypatch.setattr(app.filedialog, "askopenfilename",
+                        lambda **k: str(path))
+    win._import_secret()
+    return path
+
+
+def test_import_secret_populates_editor(monkeypatch, tmp_path):
+    """Importing a Secret YAML from disk decodes data/stringData into the KV
+    editor and pre-fills the name / namespace / type fields."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-creds
+  namespace: prod
+type: kubernetes.io/basic-auth
+data:
+  username: YWRtaW4=
+stringData:
+  password: hunter2
+""")
+        assert win._kv_get_pairs() == {"username": "admin", "password": "hunter2"}
+        assert win._sec_name.get() == "app-creds"
+        assert win._sec_ns_e.get() == "prod"
+        assert win._sec_type.get() == "kubernetes.io/basic-auth"
+        assert "Imported 2 key(s)" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_import_secret_skips_non_secret_docs(monkeypatch, tmp_path):
+    """A multi-doc manifest imports the Secret, not the resources around it."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cfg
+data:
+  KEY: not-a-secret
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: from-bundle
+data:
+  token: c2VjcmV0
+""")
+        assert win._kv_get_pairs() == {"token": "secret"}
+        assert win._sec_name.get() == "from-bundle"
+    finally:
+        win.destroy()
+
+
+def test_import_sealed_secret_is_rejected_with_hint(monkeypatch, tmp_path):
+    """A SealedSecret can't be decoded locally — the status must say to import
+    the plain Secret instead, and the editor must stay untouched."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("KEEP", "me")])
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: app-creds
+spec:
+  encryptedData:
+    password: AgB0zXyEncrypted==
+""")
+        assert "SealedSecret is encrypted" in win._status_var.get()
+        assert win._kv_get_pairs() == {"KEEP": "me"}  # nothing imported
+    finally:
+        win.destroy()
+
+
+def test_import_prefers_real_secret_over_kindless_fragment(monkeypatch, tmp_path):
+    """A kind-less data-bearing fragment must not shadow the real kind: Secret
+    that follows it in the same file."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+data:
+  DECOY: bm90LXRoaXM=
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: the-real-one
+data:
+  token: c2VjcmV0
+""")
+        assert win._kv_get_pairs() == {"token": "secret"}
+        assert win._sec_name.get() == "the-real-one"
+    finally:
+        win.destroy()
+
+
+def test_import_rejects_plaintext_under_data(monkeypatch, tmp_path):
+    """Plaintext mistakenly under `data:` (k8s would reject it at apply time)
+    must fail the import loudly instead of silently round-tripping the
+    plaintext as if it were base64 — and must not touch the editor."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("KEEP", "me")])
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oops
+data:
+  password: hunter2
+""")
+        assert "not valid base64" in win._status_var.get()
+        assert "stringData" in win._status_var.get()
+        assert win._kv_get_pairs() == {"KEEP": "me"}  # nothing imported
+    finally:
+        win.destroy()
+
+
+def test_import_rejects_secret_without_data(monkeypatch, tmp_path):
+    """An empty Secret has nothing to import — the editor must survive."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("KEEP", "me")])
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hollow
+""")
+        assert "nothing to import" in win._status_var.get()
+        assert win._kv_get_pairs() == {"KEEP": "me"}
+    finally:
+        win.destroy()
+
+
+def test_import_clears_stale_generated_yaml(monkeypatch, tmp_path):
+    """Importing a new secret must clear the YAML pane, or the Seal tab would
+    quietly seal the previously generated secret."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._set_text(win._yaml_out, "kind: Secret  # stale, from secret A\n")
+        _import_file(win, monkeypatch, tmp_path, """\
+kind: Secret
+data:
+  token: c2VjcmV0
+""")
+        assert win._kv_get_pairs() == {"token": "secret"}
+        assert win._yaml_out.get("1.0", "end").strip() == ""
+    finally:
+        win.destroy()
+
+
+def test_yaml_secret_doc_selects_from_multidoc_and_hints_sealed():
+    """The Decode tab and Import share _yaml_secret_doc: multi-doc bundles
+    yield the Secret (not the ConfigMap around it), and a SealedSecret gets
+    the explanatory hint. (Driven directly rather than via _populate_table —
+    building the decoded table calls update_idletasks, which macOS Tk can't
+    survive outside a running mainloop.)"""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        doc = win._yaml_secret_doc(
+            "kind: ConfigMap\ndata:\n  K: not-a-secret\n---\n"
+            "kind: Secret\ndata:\n  token: c2VjcmV0\n", verb="decode")
+        assert doc == {"kind": "Secret", "data": {"token": "c2VjcmV0"}}
+
+        rows_before = list(win._tbl_rows)
+        win._populate_table(
+            "kind: SealedSecret\nspec:\n  encryptedData:\n    p: AgA=\n")
+        assert "SealedSecret is encrypted" in win._status_var.get()
+        assert win._tbl_rows == rows_before  # error path leaves the table alone
+    finally:
+        win.destroy()
+
+
+def test_load_template_empty_secret_loads_identity_only():
+    """An empty cluster Secret is scaffolding: Load Template inherits its
+    name/namespace/type but must not wipe in-progress editor rows."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("KEEP", "me")])
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+
+        win._got_template("c", "n", "s",
+                          "apiVersion: v1\nkind: Secret\nmetadata:\n"
+                          "  name: hollow\n  namespace: prod\n"
+                          "type: kubernetes.io/tls\n",
+                          "", 0, win._out_gen)
+
+        assert "name/namespace/type only" in win._status_var.get()
+        assert win._kv_get_pairs() == {"KEEP": "me"}  # rows untouched
+        assert win._sec_name.get() == "hollow"        # identity inherited
+        assert win._sec_ns_e.get() == "prod"
+        assert win._sec_type.get() == "kubernetes.io/tls"
+    finally:
+        win.destroy()
+
+
+def test_identity_only_load_invalidates_and_drops_binary():
+    """The identity-only path changes what the outputs describe, so it must
+    invalidate them like any repopulation — and it must not carry the previous
+    secret's binary passthrough (invisible values that Generate would re-emit
+    verbatim) into the new identity."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        # State from a previously loaded secret A: a text row, a binary
+        # passthrough, generated + sealed output, and an in-flight seal.
+        win._tpl_binary = {"tls.key": "QUJD"}
+        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._set_text(win._yaml_out,   "kind: Secret  # A\n")
+        win._set_text(win._sealed_out, "kind: SealedSecret  # A\n")
+        gen = win._out_gen  # a seal dispatched under the old identity
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+
+        win._got_template("c", "n", "s",
+                          "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
+                          win._out_gen)
+
+        assert win._kv_get_pairs() == {"KEEP": "me"}   # text rows kept
+        assert win._tpl_binary == {}                   # binary NOT migrated
+        assert "dropped 1 binary value(s)" in win._status_var.get()
+        assert win._yaml_out.get("1.0", "end").strip() == ""    # invalidated
+        assert win._sealed_out.get("1.0", "end").strip() == ""
+        assert win._out_gen != gen  # in-flight results are now stale
+    finally:
+        win.destroy()
+
+
+def test_stale_seal_result_is_discarded_after_repopulation():
+    """A background seal that lands after the editor was repopulated must not
+    resurrect the cleared sealed pane with the previous secret's manifest."""
+    win = _make_win()
+    try:
+        gen = win._out_gen          # generation the seal was dispatched under
+        win._sealing = True
+        win._kv_set_pairs([("NEW", "b")])  # repopulation bumps the generation
+
+        win._on_sealed("kind: SealedSecret  # secret A\n", "", 0, gen)
+
+        assert win._sealed_out.get("1.0", "end").strip() == ""  # not resurrected
+        assert "stale result discarded" in win._status_var.get()
+        assert win._sealing is False
+        # A seal dispatched under the CURRENT generation still lands normally.
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret  # secret B\n", "", 0, win._out_gen)
+        assert "secret B" in win._sealed_out.get("1.0", "end")
+        assert "Sealed successfully" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_stale_validate_result_is_discarded_after_repopulation():
+    """A background validate landing after repopulation must not report
+    'Valid' for the previous secret's sealed output."""
+    win = _make_win()
+    try:
+        gen = win._out_gen
+        win._validating = True
+        win._kv_set_pairs([("NEW", "b")])  # bumps the generation
+
+        win._on_validated("", "", 0, gen)
+
+        assert "Valid" not in win._status_var.get()
+        assert "stale result discarded" in win._status_var.get()
+        assert win._validating is False
+    finally:
+        win.destroy()
+
+
+def test_import_invalidates_stale_sealed_output(monkeypatch, tmp_path):
+    """Repopulating the editor must clear BOTH output panes: leaving the old
+    sealed manifest around lets the user validate/save secret A while the
+    editor shows secret B."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._set_text(win._yaml_out,   "kind: Secret  # stale A\n")
+        win._set_text(win._sealed_out, "kind: SealedSecret  # stale sealed A\n")
+        win._validate_btn.configure(state="normal")
+
+        _import_file(win, monkeypatch, tmp_path,
+                     "kind: Secret\ndata:\n  token: c2VjcmV0\n")
+
+        assert win._yaml_out.get("1.0", "end").strip() == ""
+        assert win._sealed_out.get("1.0", "end").strip() == ""
+        assert str(win._validate_btn.cget("state")) == "disabled"
+    finally:
+        win.destroy()
+
+
+def test_import_unwraps_kind_list(monkeypatch, tmp_path):
+    """A saved `kubectl get secrets -o yaml` (kind: List) imports the Secret
+    inside .items instead of failing with 'no Secret found'."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: from-list
+  data:
+    token: c2VjcmV0
+""")
+        assert win._kv_get_pairs() == {"token": "secret"}
+        assert win._sec_name.get() == "from-list"
+    finally:
+        win.destroy()
+
+
+def test_browse_yaml_keeps_label_on_failed_decode(monkeypatch, tmp_path):
+    """When decode bails (e.g. a SealedSecret), the previous file's rows stay
+    on screen — so the File label must keep naming them, not the failed file."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._dec_lbl.configure(text="previous.yaml")
+        path = tmp_path / "sealed.yaml"
+        path.write_text("kind: SealedSecret\nspec:\n  encryptedData:\n    p: AgA=\n")
+        monkeypatch.setattr(app.filedialog, "askopenfilename",
+                            lambda **k: str(path))
+
+        win._browse_yaml()
+
+        assert "SealedSecret is encrypted" in win._status_var.get()
+        assert win._dec_lbl.cget("text") == "previous.yaml"
+    finally:
+        win.destroy()
+
+
+def test_stale_template_result_is_discarded_after_repopulation():
+    """A Load Template fetch landing after the editor was repopulated (e.g. by
+    Import, which bumps the generation without touching the selectors) must
+    not clobber the fresh rows."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+        gen = win._out_gen  # generation the fetch was dispatched under
+        win._kv_set_pairs([("FRESH", "import")])  # repopulation bumps it
+
+        win._got_template("c", "n", "s",
+                          "kind: Secret\ndata:\n  old: c3RhbGU=\n", "", 0, gen)
+
+        assert win._kv_get_pairs() == {"FRESH": "import"}  # not clobbered
+        assert "stale result discarded" in win._status_var.get()
+    finally:
+        win.destroy()

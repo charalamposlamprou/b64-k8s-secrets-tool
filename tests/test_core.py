@@ -260,6 +260,115 @@ def test_secret_entries_non_secret_returns_empty(doc):
     assert core.secret_entries(doc) == []
 
 
+def test_secret_entries_flags_invalid_base64_as_invalid():
+    # Plaintext mistakenly under `data`: k8s would reject these at apply time
+    # (bad padding / chars outside the base64 alphabet), so they must NOT pass
+    # as "binary" — that would round-trip the plaintext verbatim as base64.
+    for plain in ("hunter2", "my-password", "pass word"):
+        [(_k, value, kind)] = core.secret_entries({"data": {"P": plain}})
+        assert kind == "invalid", plain
+        assert value == plain  # original preserved for the error message
+
+    # Genuine binary stays "binary": valid base64, not UTF-8 once decoded.
+    b64 = base64.b64encode(b"\xff\xfe\x00raw").decode()
+    [(_k, _v, kind)] = core.secret_entries({"data": {"CERT": b64}})
+    assert kind == "binary"
+
+
+def test_b64_valid_for_k8s_matches_go_semantics():
+    ok = base64.b64encode(b"\xff\xfe\x00raw").decode()
+    assert core.b64_valid_for_k8s(ok)
+    # Go's decoder ignores \r and \n (long values are often wrapped) ...
+    assert core.b64_valid_for_k8s(ok[:4] + "\n" + ok[4:])
+    # ... but requires correct padding and rejects other characters.
+    assert not core.b64_valid_for_k8s("hunter2")      # bad padding
+    assert not core.b64_valid_for_k8s("my-password")  # '-' not in alphabet
+    assert not core.b64_valid_for_k8s("ab cd")        # spaces not ignored
+
+
+# --------------------------------------------------------------------------
+# select_secret_doc / has_sealed_secret — pick the Secret out of a manifest
+# --------------------------------------------------------------------------
+
+def test_select_secret_doc_prefers_explicit_kind():
+    # A kind-less data-bearing fragment must never shadow a real Secret that
+    # appears later in the same multi-doc file.
+    snippet = {"data": {"KEY": "bm90LXRoaXM="}}
+    secret = {"kind": "Secret", "data": {"token": core.b64_encode("s")}}
+    assert core.select_secret_doc([snippet, secret]) is secret
+
+
+def test_select_secret_doc_accepts_kindless_snippet():
+    snippet = {"stringData": {"USER": "alice"}}
+    assert core.select_secret_doc([{"kind": "ConfigMap", "data": {"K": "v"}},
+                                   snippet]) is snippet
+
+
+def test_select_secret_doc_rejects_other_kinds_and_junk():
+    # A ConfigMap's `data` is Secret-shaped but must not be picked.
+    assert core.select_secret_doc([{"kind": "ConfigMap", "data": {"K": "v"}}]) is None
+    assert core.select_secret_doc([None, "text", 42, {"spec": {}}]) is None
+    assert core.select_secret_doc([]) is None
+
+
+def test_has_sealed_secret():
+    sealed = {"kind": "SealedSecret", "spec": {"encryptedData": {"p": "AgA="}}}
+    assert core.has_sealed_secret([{"kind": "ConfigMap"}, sealed])
+    assert not core.has_sealed_secret([{"kind": "Secret"}, None, "junk"])
+
+
+def test_select_secret_doc_unwraps_kind_list():
+    # `kubectl get secrets -o yaml` (and helm/argo renders) wrap resources in
+    # a kind: List with the actual Secrets under .items.
+    secret = {"kind": "Secret", "metadata": {"name": "from-list"},
+              "data": {"t": core.b64_encode("v")}}
+    wrapper = {"apiVersion": "v1", "kind": "List",
+               "items": [{"kind": "ConfigMap", "data": {"K": "v"}}, secret]}
+    assert core.select_secret_doc([wrapper]) is secret
+    # Junk items inside the List don't break the scan.
+    assert core.select_secret_doc(
+        [{"kind": "List", "items": [None, "junk", 42]}]) is None
+
+
+def test_has_sealed_secret_sees_inside_kind_list():
+    sealed = {"kind": "SealedSecret", "spec": {"encryptedData": {"p": "AgA="}}}
+    assert core.has_sealed_secret([{"kind": "List", "items": [sealed]}])
+
+
+def test_select_secret_doc_unwraps_nested_lists():
+    # No real tool emits nested Lists, but a Secret must not be able to hide
+    # inside one either.
+    secret = {"kind": "Secret", "data": {"t": core.b64_encode("v")}}
+    nested = {"kind": "List",
+              "items": [{"kind": "List", "items": [secret]}]}
+    assert core.select_secret_doc([nested]) is secret
+
+
+def test_flatten_survives_cyclic_and_deep_lists():
+    # YAML anchors/aliases can make a List contain itself — safe_load builds
+    # the cycle happily — and hand-crafted files can nest Lists absurdly deep.
+    # Neither may crash the picker (a RecursionError would escape the import
+    # callback as an unhandled traceback).
+    cyclic = yaml.safe_load("&a\nkind: List\nitems:\n  - *a\n")
+    assert cyclic["items"][0] is cyclic  # PyYAML really builds the cycle
+    assert core.select_secret_doc([cyclic]) is None
+    assert not core.has_sealed_secret([cyclic])
+
+    secret = {"kind": "Secret", "data": {"t": core.b64_encode("v")}}
+    deep = secret
+    for _ in range(5000):  # far beyond the default recursion limit
+        deep = {"kind": "List", "items": [deep]}
+    assert core.select_secret_doc([deep]) is secret
+
+
+def test_first_invalid_key():
+    entries = core.secret_entries(
+        {"data": {"OK": core.b64_encode("fine"), "BAD": "hunter2"}})
+    assert core.first_invalid_key(entries) == "BAD"
+    assert core.first_invalid_key(
+        core.secret_entries({"stringData": {"A": "x"}})) is None
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes not applicable on Windows")
 def test_write_secret_file_is_owner_only_on_create(tmp_path):
     p = tmp_path / "secret.yaml"

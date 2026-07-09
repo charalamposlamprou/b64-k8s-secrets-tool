@@ -28,9 +28,17 @@ cluster (read-only), and seal them with `kubeseal`.
     (e.g. `tls.crt` + `tls.key` → `kubernetes.io/tls`)
   - **Load Template** pulls a secret from the cluster and decodes it into the
     editor — also pre-filling the editable Secret name / Namespace / Type fields
+  - **Import Secret…** loads a Secret YAML file from disk into the same editor —
+    for fixing a secret that never deployed (e.g. a mis-sealed one), where
+    there is no cluster copy to fetch. Multi-doc manifests are handled (an
+    explicit `kind: Secret` wins), and plaintext mistakenly under `data:`
+    is rejected with a pointer to `stringData` instead of being silently
+    re-encoded as garbage
 - **Decode tab**
   - Single-value base64 decoder with masked output + Show/Hide
-  - Secret YAML → decoded table: per-row Show/Hide and Copy, plus Show All / Hide All
+  - Secret YAML → decoded table: per-row Show/Hide and Copy, plus Show All / Hide All;
+    multi-doc manifests are handled, and a SealedSecret file gets an
+    explanatory hint (its values only decrypt in the cluster)
 - **Seal tab**
   - Seals the YAML from the Encode tab with `kubeseal`
   - Context + scope (`strict` / `namespace-wide` / `cluster-wide`) and an

@@ -87,10 +87,13 @@ from core import (  # noqa: E402
     b64_decode,
     b64_encode,
     build_secret_yaml,
+    first_invalid_key,
+    has_sealed_secret,
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
     parse_dotenv,
     secret_entries,
+    select_secret_doc,
     write_secret_file,
 )
 
@@ -140,6 +143,11 @@ class App(tk.Tk):
         # lookup landing mid-operation can't re-enable a button under it.
         self._sealing = False
         self._validating = False
+        # Editor generation, bumped by _invalidate_outputs. A seal/validate
+        # captures it at dispatch; a result landing after the editor was
+        # repopulated is stale (it describes the previous secret) and is
+        # discarded instead of resurrecting the just-cleared output pane.
+        self._out_gen = 0
 
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
@@ -429,6 +437,13 @@ class App(tk.Tk):
         ttk.Label(fp, text="File:").pack(side="left")
         env_btns = ttk.Frame(fp); env_btns.pack(side="right")
         ttk.Button(env_btns, text="Browse…", command=self._browse_env).pack(side="left")
+        # Import an existing Secret YAML from disk (e.g. one that never made it
+        # into the cluster, so Load Template can't fetch it) to edit and re-emit.
+        imp_btn = ttk.Button(env_btns, text="Import Secret…",
+                             command=self._import_secret)
+        if not PYYAML_OK:
+            imp_btn.configure(state="disabled")
+        imp_btn.pack(side="left", padx=(6, 0))
         ttk.Button(env_btns, text="Clear", command=self._clear_env) \
             .pack(side="left", padx=(6, 0))
         self._env_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel", anchor="w")
@@ -635,6 +650,18 @@ class App(tk.Tk):
             rd["frame"].destroy()
         self._kv_rows.clear()
         self._kv_add_row()
+        self._invalidate_outputs()
+
+    def _kv_drop_binary(self):
+        """Delete every binary marker row along with its _tpl_binary
+        passthrough. The explicit reset keeps the drop correct even if a
+        passthrough key ever lacked a matching marker row. Returns how many
+        rows were dropped."""
+        dropped = [rd for rd in self._kv_rows if rd["binary"]]
+        for rd in dropped:
+            self._kv_del_row(rd)
+        self._tpl_binary = {}
+        return len(dropped)
 
     def _kv_set_pairs(self, pairs, binary_keys=None):
         """Replace all rows with `pairs` (key, value) plus a read-only marker row
@@ -648,6 +675,22 @@ class App(tk.Tk):
             self._kv_add_row(k, binary=True)
         if not self._kv_rows:
             self._kv_add_row()
+        self._invalidate_outputs()
+
+    def _invalidate_outputs(self):
+        """The secret in the editor changed — any generated YAML and any
+        sealed output describe the *previous* one, so clear both, advance the
+        generation (in-flight seal/validate results become stale), and re-gate
+        the Seal-tab buttons. The row-replacement choke points (_kv_set_pairs
+        / _kv_clear) call this from their shared tail, which covers every
+        row-replacing path (Browse .env / Import / full Load Template /
+        Clear); a repopulation that does NOT replace rows must call it
+        explicitly — currently only the identity-only load in
+        _apply_identity_only."""
+        self._out_gen += 1  # in-flight seal/validate results are now stale
+        self._set_text(self._yaml_out, "")
+        self._set_text(self._sealed_out, "")
+        self._refresh_action_buttons()
 
     def _kv_get_pairs(self):
         """Editable rows as {key: value}, reading values from the StringVars.
@@ -709,22 +752,66 @@ class App(tk.Tk):
             filetypes=[(".env files", "*.env"), ("All files", "*.*")])
         if not path:
             return
-        try:
-            with open(path) as f:
-                text = f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            self._status(f"Could not read file: {e}", "err"); return
+        text = self._read_file(path)
+        if text is None:
+            return
         self._env_lbl.configure(text=path)
         self._tpl_binary = {}  # a plain .env carries no binary passthrough
-        self._kv_set_pairs(parse_dotenv(text).items())
+        self._kv_set_pairs(parse_dotenv(text).items())  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
+
+    def _import_secret(self):
+        """Import a Kubernetes Secret YAML from disk into the KV editor — for
+        editing a secret that never reached the cluster (a mis-sealed deploy,
+        say), where Load Template has nothing to fetch. Decodes data /
+        stringData into editable rows and fills name / namespace / type."""
+        if not PYYAML_OK:
+            self._status("PyYAML not installed", "err"); return
+        path = filedialog.askopenfilename(
+            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")])
+        if not path:
+            return
+        content = self._read_file(path)
+        if content is None:
+            return
+        doc = self._yaml_secret_doc(content, verb="import")
+        if doc is None:
+            return
+        entries = secret_entries(doc)
+        err = self._check_entries(entries)
+        if err:
+            self._status(err, "err")
+            return
+        self._env_lbl.configure(text=path)
+        total, binary = self._apply_secret_doc(doc, entries)
+        self._status(self._applied_msg("Imported", total, binary,
+                                       os.path.basename(path)), "ok")
+
+    @staticmethod
+    def _check_entries(entries):
+        """Guards shared by Import and Load Template, run BEFORE the editor is
+        touched so a rejected secret can't destroy in-progress rows. Returns
+        an error message, or None if the entries are safe to apply. (The empty
+        case is Import-only — Load Template turns an empty secret into an
+        identity-only load before calling this.)"""
+        if not entries:
+            return "Secret has no data/stringData — nothing to import"
+        # "invalid" means Kubernetes itself would reject the value at apply
+        # time. Applying it would silently round-trip the raw string as if it
+        # were base64 (garbage on deploy). Two causes, two remedies: plaintext
+        # mistakenly under `data`, or binary base64 with broken padding.
+        bad = first_invalid_key(entries)
+        if bad is not None:
+            return (f"data.{bad} is not valid base64 for Kubernetes — "
+                    "plaintext belongs under stringData; binary needs exact "
+                    "'=' padding")
+        return None
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
         self._tpl_binary = {}
-        self._kv_clear()
-        self._set_text(self._yaml_out, "")
+        self._kv_clear()  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
 
@@ -860,19 +947,21 @@ class App(tk.Tk):
             filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")])
         if not path:
             return
-        try:
-            with open(path) as f:
-                content = f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            self._status(f"Could not read file: {e}", "err"); return
-        self._dec_lbl.configure(text=path)
-        self._populate_table(content)
+        content = self._read_file(path)
+        if content is None:
+            return
+        # Label only on success: on a bail (SealedSecret / no Secret / parse
+        # error) the previous file's rows stay on screen, and the label must
+        # keep naming *them*, not the file that failed to decode.
+        if self._populate_table(content):
+            self._dec_lbl.configure(text=path)
 
-    def _populate_table(self, content: str):
-        try:
-            doc = yaml.safe_load(content)
-        except yaml.YAMLError as e:
-            self._status(f"YAML parse error: {e}", "err"); return
+    def _populate_table(self, content: str) -> bool:
+        """Decode a Secret YAML into the table. Returns True when the table
+        was (re)populated, False when it bailed leaving the table untouched."""
+        doc = self._yaml_secret_doc(content, verb="decode")
+        if doc is None:
+            return False
 
         entries = secret_entries(doc)  # data + stringData, decoded
 
@@ -881,10 +970,15 @@ class App(tk.Tk):
         self._tbl_rows.clear()
 
         for i, (key, value, kind) in enumerate(entries):
-            binary = kind == "binary"
-            # Binary values can't be shown as text; display a marker and let
-            # Copy hand back the raw base64 instead of rendering mojibake.
-            shown = "⟨binary — Copy gives base64⟩" if binary else value
+            binary = kind != "text"
+            # Non-text values can't be shown as plaintext; display a marker and
+            # let Copy hand back the original value instead of mojibake.
+            if kind == "binary":
+                shown = "⟨binary — Copy gives base64⟩"
+            elif kind == "invalid":
+                shown = "⟨not valid base64 — Copy gives raw value⟩"
+            else:
+                shown = value
             masked = shown if binary else "•" * min(len(shown), 32)
             bg = ROW_A if i % 2 == 0 else ROW_B
             row = tk.Frame(self._tbl_body, bg=bg)
@@ -920,6 +1014,7 @@ class App(tk.Tk):
         self._tbl_body.update_idletasks()
         self._tbl_cv.configure(scrollregion=self._tbl_cv.bbox("all"))
         self._status(f"Loaded {len(entries)} key(s)", "ok")
+        return True
 
     @staticmethod
     def _set_row_visible(shown, masked, sv, vl, tb, show):
@@ -1040,8 +1135,29 @@ class App(tk.Tk):
         self._sealing = True
         self._refresh_action_buttons()
         self._status("Sealing…", "dim")
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_sealed(o, e, r)),
-               stdin_data=yaml_text)
+        self._dispatch_gen(cmd, self._on_sealed, yaml_text)
+
+    def _dispatch_gen(self, cmd, handler, stdin_data):
+        """Dispatch a background op whose result feeds the output panes:
+        captures the current editor generation and hands it to `handler`
+        (o, e, rc, gen) so the landing callback can discard a result made
+        stale by a repopulation while it ran. Every output-producing run_bg
+        must go through here — a copy that forgets the capture reopens the
+        stale-resurrection race."""
+        gen = self._out_gen
+        run_bg(cmd,
+               lambda o, e, r: self.after(0, lambda: handler(o, e, r, gen)),
+               stdin_data=stdin_data)
+
+    def _discard_stale(self, gen, verb, hint=""):
+        """True (with an explanatory status) when a background result was made
+        stale by an editor repopulation while it ran — the shared guard for
+        every _dispatch_gen handler. `hint` appends a recovery cue."""
+        if gen == self._out_gen:
+            return False
+        self._status(f"Editor changed during {verb} — stale result discarded"
+                     f"{hint}", "err")
+        return True
 
     @staticmethod
     def _kubeseal_rc_error(rc):
@@ -1052,8 +1168,14 @@ class App(tk.Tk):
             return "kubeseal timed out"
         return None
 
-    def _on_sealed(self, stdout, stderr, rc):
+    def _on_sealed(self, stdout, stderr, rc, gen):
         self._sealing = False
+        # A stale result describes the previous secret: drop it rather than
+        # resurrect the cleared pane (writing it would let Save/Validate act
+        # on a secret the editor no longer shows).
+        if self._discard_stale(gen, "sealing", hint="; seal again"):
+            self._refresh_action_buttons()
+            return
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
             self._refresh_action_buttons()
@@ -1105,12 +1227,15 @@ class App(tk.Tk):
         self._validating = True
         self._refresh_action_buttons()
         self._status("Validating…", "dim")
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._on_validated(o, e, r)),
-               stdin_data=sealed)
+        self._dispatch_gen(cmd, self._on_validated, sealed)
 
-    def _on_validated(self, stdout, stderr, rc):
+    def _on_validated(self, stdout, stderr, rc, gen):
         self._validating = False
         self._refresh_action_buttons()
+        # A stale verdict is about the previous secret's sealed output (since
+        # cleared) — reporting "Valid" now would mislead. Drop it.
+        if self._discard_stale(gen, "validation"):
+            return
         sentinel = self._kubeseal_rc_error(rc)
         if sentinel:
             self._status(sentinel, "err"); return
@@ -1260,17 +1385,27 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "secret", sec,
                f"--context={ctx}", f"--namespace={ns}", "-o", "yaml"]
         self._load_btn.configure(state="disabled")
-        run_bg(cmd, lambda o, e, r: self.after(0,
-               lambda: self._got_template(ctx, ns, sec, o, e, r)))
+        # Via _dispatch_gen: the template write must also be discarded if the
+        # editor is repopulated (Import / Browse / Clear) while kubectl runs —
+        # the (ctx, ns, sec) check below only catches *selection* changes.
+        self._dispatch_gen(cmd,
+                           lambda o, e, r, gen: self._got_template(
+                               ctx, ns, sec, o, e, r, gen),
+                           None)
 
-    def _got_template(self, ctx, ns, sec, stdout, stderr, rc):
+    def _got_template(self, ctx, ns, sec, stdout, stderr, rc, gen):
         # Re-enable the button regardless — the load attempt is done — *before*
-        # the stale check, or a discarded result would leave it stuck disabled.
+        # the stale checks, or a discarded result would leave it stuck disabled.
         self._load_btn.configure(state="normal" if PYYAML_OK else "disabled")
         # Guard against a stale load: the user may have changed the context /
-        # namespace / secret while this kubectl fetch was in flight.
+        # namespace / secret while this kubectl fetch was in flight...
         if (ctx, ns, sec) != (self._enc_ctx.get(), self._enc_ns.get(),
                               self._enc_sec.get()):
+            return
+        # ...or repopulated the editor (Import / Browse / Clear) without
+        # touching the selectors — applying this template would silently
+        # clobber those fresh rows.
+        if self._discard_stale(gen, "the template load"):
             return
         if rc != 0:
             self._status(f"kubectl error: {stderr.strip()[:80]}", "err"); return
@@ -1279,35 +1414,83 @@ class App(tk.Tk):
         except yaml.YAMLError as e:
             self._status(f"YAML parse error: {e}", "err"); return
 
-        self._tpl_binary = {}
-        text_pairs = []
-        entries = secret_entries(doc)  # data + stringData, decoded
-        for k, value, kind in entries:
-            if kind == "binary":
-                # Can't edit binary as text without corrupting it on re-encode:
-                # keep the original base64 and re-emit it verbatim at Generate
-                # (tracked in _tpl_binary). A marker row shows it in the editor.
-                self._tpl_binary[k] = value
-            else:
-                text_pairs.append((k, value))
-        self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
+        entries = secret_entries(doc)
+        if not entries:
+            dropped = self._apply_identity_only(doc, fb_name=sec, fb_ns=ns)
+            msg = f"{sec} has no data/stringData — loaded name/namespace/type only"
+            if dropped:
+                msg += (f"; dropped {dropped} binary value(s) from the "
+                        "previous secret")
+            self._status(msg, "ok")
+            return
+        err = self._check_entries(entries)
+        if err:
+            self._status(err, "err")
+            return
+        total, binary = self._apply_secret_doc(doc, entries, fb_name=sec,
+                                               fb_ns=ns)
+        self._status(self._applied_msg("Loaded", total, binary, sec), "ok")
 
-        # Also populate the editable Secret name / Namespace fields from the
-        # fetched secret's metadata (falling back to the selected combo values),
-        # so they can be tweaked before Generate YAML.
-        meta = doc.get("metadata", {}) if isinstance(doc, dict) else {}
-        name = meta.get("name") or sec
-        nsv  = meta.get("namespace") or ns
-        self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
-        self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
-        self._sec_type.set(
-            (doc.get("type") if isinstance(doc, dict) else None) or "Opaque")
-
-        binary = len(self._tpl_binary)
-        msg = f"Loaded {len(entries)} key(s) from {sec}"
+    @staticmethod
+    def _applied_msg(verb, total, binary, src):
+        """Status line for a secret applied to the editor (Loaded/Imported)."""
+        msg = f"{verb} {total} key(s) from {src}"
         if binary:
             msg += f" — {binary} binary value(s) kept as-is"
-        self._status(msg, "ok")
+        return msg
+
+    def _apply_secret_doc(self, doc, entries, fb_name="my-secret",
+                          fb_ns="default"):
+        """Populate the KV editor and Secret name / Namespace / Type fields
+        from a parsed Secret doc (shared by Load Template and Import Secret…).
+        `entries` is the caller's secret_entries(doc) — already computed for
+        the _check_entries guard, so the base64 decode pass runs only once.
+        (doc normalization lives in _set_secret_identity, the only place doc
+        is read.) Returns (total_keys, binary_keys) for the status line."""
+        self._tpl_binary = {}
+        text_pairs = []
+        for k, value, kind in entries:
+            if kind == "text":
+                text_pairs.append((k, value))
+            else:
+                # binary can't be edited as text without corrupting it on
+                # re-encode: keep the original base64 and re-emit it verbatim
+                # at Generate (tracked in _tpl_binary). A marker row shows it
+                # in the editor. ("invalid" never reaches here — both callers
+                # run _check_entries first.)
+                self._tpl_binary[k] = value
+        self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
+        self._set_secret_identity(doc, fb_name, fb_ns)
+        return len(entries), len(self._tpl_binary)
+
+    def _apply_identity_only(self, doc, fb_name, fb_ns):
+        """Apply an entry-less Secret to the editor — _apply_secret_doc's
+        counterpart for empty docs. Inherits name/namespace/type as
+        scaffolding and keeps editable text rows, but drops binary passthrough
+        rows: those are invisible values bound to the *previous* secret, and
+        re-emitting them verbatim under the new identity would silently leak
+        them. Invalidates the outputs like any repopulation (this path never
+        reaches the _kv_set_pairs/_kv_clear choke points, so it must do so
+        itself). Returns the dropped-binary count for the status line."""
+        dropped = self._kv_drop_binary()
+        self._set_secret_identity(doc, fb_name, fb_ns)
+        self._invalidate_outputs()
+        return dropped
+
+    def _set_secret_identity(self, doc, fb_name="my-secret", fb_ns="default"):
+        """Fill the editable Secret name / Namespace / Type fields from a
+        parsed Secret doc's metadata (falling back to the caller's values), so
+        they can be tweaked before Generate YAML."""
+        if not isinstance(doc, dict):
+            doc = {}
+        meta = doc.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        name = meta.get("name") or fb_name
+        nsv  = meta.get("namespace") or fb_ns
+        self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
+        self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
+        self._sec_type.set(doc.get("type") or "Opaque")
 
     # --------------------------------------------------------------- helpers
 
@@ -1368,6 +1551,37 @@ class App(tk.Tk):
             except (OSError, ValueError, subprocess.SubprocessError):
                 continue
         return False
+
+    def _read_file(self, path: str):
+        """Read a user-picked text file, reporting failure in the status bar.
+        Returns the content, or None on error. Explicit UTF-8: the locale
+        default (e.g. cp1252 on Windows) would reject or mojibake non-ASCII
+        secret values saved as UTF-8."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            self._status(f"Could not read file: {e}", "err")
+            return None
+
+    def _yaml_secret_doc(self, content: str, verb: str):
+        """Parse YAML text (multi-doc tolerant — manifests often bundle several
+        resources) and pick the Secret doc, reporting failures in the status
+        bar. `verb` names the caller's action for the SealedSecret hint.
+        Returns the doc, or None."""
+        try:
+            docs = [d for d in yaml.safe_load_all(content) if d is not None]
+        except yaml.YAMLError as e:
+            self._status(f"YAML parse error: {e}", "err")
+            return None
+        doc = select_secret_doc(docs)
+        if doc is None:
+            if has_sealed_secret(docs):
+                self._status(f"SealedSecret is encrypted — {verb} the plain "
+                             "Secret YAML it was sealed from", "err")
+            else:
+                self._status("No Secret data/stringData found in file", "err")
+        return doc
 
     def _write_file(self, path: str, content: str):
         try:

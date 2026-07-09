@@ -8,6 +8,7 @@ a display.
 import base64
 import os
 import re
+from collections import deque
 
 # ---------------------------------------------------------------------------
 # base64
@@ -24,6 +25,21 @@ def b64_decode(s: str, errors: str = "replace") -> str:
     if rem:
         s += "=" * (4 - rem)
     return base64.b64decode(s, validate=True).decode("utf-8", errors=errors)
+
+
+def b64_valid_for_k8s(s: str) -> bool:
+    """Whether Kubernetes itself would accept `s` as a base64 `data` value.
+
+    Stricter than b64_decode, which pads and strips all whitespace to be
+    forgiving about copy-paste: Go's base64 decoder (behind the API server)
+    ignores only \\r and \\n and requires correct padding, so plaintext that
+    merely *resembles* base64 (e.g. "hunter2") is rejected at apply time."""
+    s = s.replace("\r", "").replace("\n", "")
+    try:
+        base64.b64decode(s, validate=True)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -144,9 +160,12 @@ def secret_entries(doc) -> list:
     """Flatten a Secret's `data` and `stringData` into an ordered list of
     (key, value, kind) tuples:
 
-      - kind "text":   value is the decoded/plaintext string
-      - kind "binary": value couldn't be decoded as UTF-8; value is the
-                       ORIGINAL base64 (so callers can still copy/round-trip it)
+      - kind "text":    value is the decoded/plaintext string
+      - kind "binary":  valid base64 that isn't UTF-8 text; value is the
+                        ORIGINAL base64 (so callers can still copy/round-trip it)
+      - kind "invalid": not base64 Kubernetes would accept (plaintext mistakenly
+                        under `data` instead of `stringData`, typically); value
+                        is the original string
 
     `data` is base64 (decoded here, strictly); `stringData` is already plaintext
     and overrides `data` on a key conflict, matching how Kubernetes merges them.
@@ -172,7 +191,8 @@ def secret_entries(doc) -> list:
             try:
                 put(k, (k, b64_decode(str(v), errors="strict"), "text"))
             except Exception:
-                put(k, (k, str(v), "binary"))
+                kind = "binary" if b64_valid_for_k8s(str(v)) else "invalid"
+                put(k, (k, str(v), kind))
 
     sdata = doc.get("stringData")
     if isinstance(sdata, dict):
@@ -180,6 +200,65 @@ def secret_entries(doc) -> list:
             put(k, (k, "" if v is None else str(v), "text"))
 
     return out
+
+
+def first_invalid_key(entries):
+    """The first key whose value Kubernetes would reject (kind "invalid"), or
+    None. Lives beside the kind taxonomy secret_entries defines, so the safety
+    gate that stops such values from round-tripping as garbage can't silently
+    drift from it."""
+    return next((k for k, _v, kind in entries if kind == "invalid"), None)
+
+
+def _flatten_list_docs(docs) -> list:
+    """Expand `kind: List` wrappers (what `kubectl get -o yaml` and helm/argo
+    renders emit) into their .items, however deeply nested, so a nested List
+    can't hide a Secret. Non-dict docs are dropped.
+
+    Iterative over a deque, with each wrapper expanded at most once: YAML
+    anchors/aliases let a hand-crafted List nest arbitrarily deep, contain
+    itself (recursion would die with RecursionError), or fan out to a huge
+    flat width (a plain list's pop(0)/prepend would go quadratic and hang)."""
+    flat, queue, expanded = [], deque(docs), set()
+    while queue:
+        d = queue.popleft()
+        if not isinstance(d, dict):
+            continue
+        if d.get("kind") == "List" and isinstance(d.get("items"), list):
+            if id(d) not in expanded:  # skip an anchor/alias cycle
+                expanded.add(id(d))
+                # Expand in place, keeping document order.
+                queue.extendleft(reversed(d["items"]))
+        else:
+            flat.append(d)
+    return flat
+
+
+def select_secret_doc(docs):
+    """Pick the Secret to work on from parsed YAML docs (a multi-doc manifest
+    may bundle several resources; a `kind: List` wrapper is unwrapped). An
+    explicit `kind: Secret` always wins over a kind-less mapping carrying
+    data/stringData (a bare snippet) — a kind-less fragment must never shadow
+    a real Secret later in the file. Docs with any other kind (ConfigMap, ...)
+    are never picked even though their `data` is Secret-shaped. Returns None
+    if nothing qualifies."""
+    docs = _flatten_list_docs(docs)
+    for d in docs:
+        if d.get("kind") == "Secret":
+            return d
+    for d in docs:
+        if d.get("kind") is None and (isinstance(d.get("data"), dict)
+                                      or isinstance(d.get("stringData"), dict)):
+            return d
+    return None
+
+
+def has_sealed_secret(docs) -> bool:
+    """Whether any parsed doc (List wrappers unwrapped) is a SealedSecret —
+    its values are encrypted for the cluster controller, so there is nothing
+    to decode/import locally."""
+    return any(d.get("kind") == "SealedSecret"
+               for d in _flatten_list_docs(docs))
 
 
 # ---------------------------------------------------------------------------
