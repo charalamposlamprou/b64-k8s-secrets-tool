@@ -378,7 +378,7 @@ def test_load_template_empty_secret_loads_identity_only():
                           "apiVersion: v1\nkind: Secret\nmetadata:\n"
                           "  name: hollow\n  namespace: prod\n"
                           "type: kubernetes.io/tls\n",
-                          "", 0)
+                          "", 0, win._out_gen)
 
         assert "name/namespace/type only" in win._status_var.get()
         assert win._kv_get_pairs() == {"KEEP": "me"}  # rows untouched
@@ -407,7 +407,8 @@ def test_identity_only_load_invalidates_and_drops_binary():
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
         win._got_template("c", "n", "s",
-                          "kind: Secret\nmetadata:\n  name: hollow\n", "", 0)
+                          "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
+                          win._out_gen)
 
         assert win._kv_get_pairs() == {"KEEP": "me"}   # text rows kept
         assert win._tpl_binary == {}                   # binary NOT migrated
@@ -520,5 +521,25 @@ def test_browse_yaml_keeps_label_on_failed_decode(monkeypatch, tmp_path):
 
         assert "SealedSecret is encrypted" in win._status_var.get()
         assert win._dec_lbl.cget("text") == "previous.yaml"
+    finally:
+        win.destroy()
+
+
+def test_stale_template_result_is_discarded_after_repopulation():
+    """A Load Template fetch landing after the editor was repopulated (e.g. by
+    Import, which bumps the generation without touching the selectors) must
+    not clobber the fresh rows."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+        gen = win._out_gen  # generation the fetch was dispatched under
+        win._kv_set_pairs([("FRESH", "import")])  # repopulation bumps it
+
+        win._got_template("c", "n", "s",
+                          "kind: Secret\ndata:\n  old: c3RhbGU=\n", "", 0, gen)
+
+        assert win._kv_get_pairs() == {"FRESH": "import"}  # not clobbered
+        assert "stale result discarded" in win._status_var.get()
     finally:
         win.destroy()

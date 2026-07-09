@@ -8,6 +8,7 @@ a display.
 import base64
 import os
 import re
+from collections import deque
 
 # ---------------------------------------------------------------------------
 # base64
@@ -214,18 +215,20 @@ def _flatten_list_docs(docs) -> list:
     renders emit) into their .items, however deeply nested, so a nested List
     can't hide a Secret. Non-dict docs are dropped.
 
-    Iterative, with each wrapper expanded at most once: YAML anchors/aliases
-    let a hand-crafted List nest arbitrarily deep or even contain itself, and
-    recursion would die with RecursionError on such a file."""
-    flat, queue, expanded = [], list(docs), set()
+    Iterative over a deque, with each wrapper expanded at most once: YAML
+    anchors/aliases let a hand-crafted List nest arbitrarily deep, contain
+    itself (recursion would die with RecursionError), or fan out to a huge
+    flat width (a plain list's pop(0)/prepend would go quadratic and hang)."""
+    flat, queue, expanded = [], deque(docs), set()
     while queue:
-        d = queue.pop(0)
+        d = queue.popleft()
         if not isinstance(d, dict):
             continue
         if d.get("kind") == "List" and isinstance(d.get("items"), list):
             if id(d) not in expanded:  # skip an anchor/alias cycle
                 expanded.add(id(d))
-                queue[:0] = d["items"]  # expand in place, keeping doc order
+                # Expand in place, keeping document order.
+                queue.extendleft(reversed(d["items"]))
         else:
             flat.append(d)
     return flat

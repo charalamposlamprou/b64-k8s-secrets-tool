@@ -652,6 +652,17 @@ class App(tk.Tk):
         self._kv_add_row()
         self._invalidate_outputs()
 
+    def _kv_drop_binary(self):
+        """Delete every binary marker row along with its _tpl_binary
+        passthrough. The explicit reset keeps the drop correct even if a
+        passthrough key ever lacked a matching marker row. Returns how many
+        rows were dropped."""
+        dropped = [rd for rd in self._kv_rows if rd["binary"]]
+        for rd in dropped:
+            self._kv_del_row(rd)
+        self._tpl_binary = {}
+        return len(dropped)
+
     def _kv_set_pairs(self, pairs, binary_keys=None):
         """Replace all rows with `pairs` (key, value) plus a read-only marker row
         for each key in `binary_keys`. Keeps one blank row if everything's empty."""
@@ -667,12 +678,15 @@ class App(tk.Tk):
         self._invalidate_outputs()
 
     def _invalidate_outputs(self):
-        """The editor rows were replaced wholesale — any generated YAML and
-        any sealed output describe the *previous* secret, so clear both and
-        re-gate the Seal-tab buttons (Validate needs sealed output). Living
-        here, in the row-replacement choke points' shared tail, means no
-        repopulating path (Browse .env / Import / Load Template / Clear) can
-        forget it and let the Seal tab seal or validate a stale secret."""
+        """The secret in the editor changed — any generated YAML and any
+        sealed output describe the *previous* one, so clear both, advance the
+        generation (in-flight seal/validate results become stale), and re-gate
+        the Seal-tab buttons. The row-replacement choke points (_kv_set_pairs
+        / _kv_clear) call this from their shared tail, which covers every
+        row-replacing path (Browse .env / Import / full Load Template /
+        Clear); a repopulation that does NOT replace rows must call it
+        explicitly — currently only the identity-only load in
+        _apply_identity_only."""
         self._out_gen += 1  # in-flight seal/validate results are now stale
         self._set_text(self._yaml_out, "")
         self._set_text(self._sealed_out, "")
@@ -1135,14 +1149,14 @@ class App(tk.Tk):
                lambda o, e, r: self.after(0, lambda: handler(o, e, r, gen)),
                stdin_data=stdin_data)
 
-    def _discard_stale(self, gen, verb):
+    def _discard_stale(self, gen, verb, hint=""):
         """True (with an explanatory status) when a background result was made
         stale by an editor repopulation while it ran — the shared guard for
-        every _dispatch_gen handler."""
+        every _dispatch_gen handler. `hint` appends a recovery cue."""
         if gen == self._out_gen:
             return False
-        self._status(f"Editor changed during {verb} — stale result discarded",
-                     "err")
+        self._status(f"Editor changed during {verb} — stale result discarded"
+                     f"{hint}", "err")
         return True
 
     @staticmethod
@@ -1159,7 +1173,7 @@ class App(tk.Tk):
         # A stale result describes the previous secret: drop it rather than
         # resurrect the cleared pane (writing it would let Save/Validate act
         # on a secret the editor no longer shows).
-        if self._discard_stale(gen, "sealing"):
+        if self._discard_stale(gen, "sealing", hint="; seal again"):
             self._refresh_action_buttons()
             return
         sentinel = self._kubeseal_rc_error(rc)
@@ -1371,17 +1385,27 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "secret", sec,
                f"--context={ctx}", f"--namespace={ns}", "-o", "yaml"]
         self._load_btn.configure(state="disabled")
-        run_bg(cmd, lambda o, e, r: self.after(0,
-               lambda: self._got_template(ctx, ns, sec, o, e, r)))
+        # Via _dispatch_gen: the template write must also be discarded if the
+        # editor is repopulated (Import / Browse / Clear) while kubectl runs —
+        # the (ctx, ns, sec) check below only catches *selection* changes.
+        self._dispatch_gen(cmd,
+                           lambda o, e, r, gen: self._got_template(
+                               ctx, ns, sec, o, e, r, gen),
+                           None)
 
-    def _got_template(self, ctx, ns, sec, stdout, stderr, rc):
+    def _got_template(self, ctx, ns, sec, stdout, stderr, rc, gen):
         # Re-enable the button regardless — the load attempt is done — *before*
-        # the stale check, or a discarded result would leave it stuck disabled.
+        # the stale checks, or a discarded result would leave it stuck disabled.
         self._load_btn.configure(state="normal" if PYYAML_OK else "disabled")
         # Guard against a stale load: the user may have changed the context /
-        # namespace / secret while this kubectl fetch was in flight.
+        # namespace / secret while this kubectl fetch was in flight...
         if (ctx, ns, sec) != (self._enc_ctx.get(), self._enc_ns.get(),
                               self._enc_sec.get()):
+            return
+        # ...or repopulated the editor (Import / Browse / Clear) without
+        # touching the selectors — applying this template would silently
+        # clobber those fresh rows.
+        if self._discard_stale(gen, "the template load"):
             return
         if rc != 0:
             self._status(f"kubectl error: {stderr.strip()[:80]}", "err"); return
@@ -1392,22 +1416,10 @@ class App(tk.Tk):
 
         entries = secret_entries(doc)
         if not entries:
-            # An empty cluster Secret still carries a usable identity: inherit
-            # its name/namespace/type as scaffolding. Editable text rows stay
-            # (wiping in-progress edits for zero keys helps nobody), but binary
-            # passthrough rows are bound to the *previous* secret — invisible
-            # values that would be re-emitted verbatim under the new identity —
-            # so they are dropped rather than silently migrated.
-            dropped = [rd for rd in self._kv_rows if rd["binary"]]
-            for rd in dropped:
-                self._kv_del_row(rd)  # also pops its _tpl_binary passthrough
-            self._set_secret_identity(doc, fb_name=sec, fb_ns=ns)
-            # The identity changed, so any generated/sealed output describes
-            # the old identity — same staleness as a row replacement.
-            self._invalidate_outputs()
+            dropped = self._apply_identity_only(doc, fb_name=sec, fb_ns=ns)
             msg = f"{sec} has no data/stringData — loaded name/namespace/type only"
             if dropped:
-                msg += (f"; dropped {len(dropped)} binary value(s) from the "
+                msg += (f"; dropped {dropped} binary value(s) from the "
                         "previous secret")
             self._status(msg, "ok")
             return
@@ -1450,6 +1462,20 @@ class App(tk.Tk):
         self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
         self._set_secret_identity(doc, fb_name, fb_ns)
         return len(entries), len(self._tpl_binary)
+
+    def _apply_identity_only(self, doc, fb_name, fb_ns):
+        """Apply an entry-less Secret to the editor — _apply_secret_doc's
+        counterpart for empty docs. Inherits name/namespace/type as
+        scaffolding and keeps editable text rows, but drops binary passthrough
+        rows: those are invisible values bound to the *previous* secret, and
+        re-emitting them verbatim under the new identity would silently leak
+        them. Invalidates the outputs like any repopulation (this path never
+        reaches the _kv_set_pairs/_kv_clear choke points, so it must do so
+        itself). Returns the dropped-binary count for the status line."""
+        dropped = self._kv_drop_binary()
+        self._set_secret_identity(doc, fb_name, fb_ns)
+        self._invalidate_outputs()
+        return dropped
 
     def _set_secret_identity(self, doc, fb_name="my-secret", fb_ns="default"):
         """Fill the editable Secret name / Namespace / Type fields from a
