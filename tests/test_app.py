@@ -642,6 +642,41 @@ data:
         status = win._status_var.get()
         assert "carried over" in status        # the label did survive...
         assert "1 invalid metadata field(s) skipped" in status  # ...immutable didn't
+        # A lossy result outranks the otherwise-successful generation: it must
+        # use the warning color (not a reassuring green "ok") and stay on
+        # screen well past the default 4s so a glance-away doesn't miss it.
+        assert win._status_lbl.cget("fg") == app.ERR_C
+        assert win._status_job is not None
+    finally:
+        win.destroy()
+
+
+def test_import_flags_skipped_malformed_section(monkeypatch, tmp_path):
+    """A section that's present but the wrong shape (e.g. `labels: null`) must
+    be flagged too, not just individual bad values within an otherwise-valid
+    mapping — previously this silently dropped the whole section uncounted."""
+    pytest.importorskip("yaml")
+    import yaml as _yaml
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: partial
+  labels:
+  annotations:
+    a.io/id: kept
+data:
+  token: c2VjcmV0
+""")
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert doc["metadata"]["annotations"] == {"a.io/id": "kept"}
+        assert "labels" not in doc["metadata"]
+        status = win._status_var.get()
+        assert "carried over" in status                        # annotations survived
+        assert "1 invalid metadata field(s) skipped" in status  # labels: null didn't
     finally:
         win.destroy()
 

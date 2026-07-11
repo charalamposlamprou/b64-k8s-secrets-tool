@@ -169,17 +169,27 @@ def secret_carryover(doc):
     non-string value (e.g. a null annotation, which would otherwise be str()'d
     into the literal "None") or a non-bool ``immutable`` (e.g. the string
     "true") is malformed — dropped and counted, never silently rewritten into
-    a wrong value. Returns ``({}, 0)`` for anything that isn't Secret-shaped."""
+    a wrong value. A present-but-wrong-shaped `metadata`, `labels`, or
+    `annotations` (e.g. `labels: null`, a list instead of a mapping) is
+    likewise malformed and counted — an absent key is normal (most secrets
+    carry no labels), but a key that *is* there and unusable is a real,
+    countable loss, not a silent no-op. Returns ``({}, 0)`` for anything that
+    isn't Secret-shaped."""
     if not isinstance(doc, dict):
         return {}, 0
+    carry = {}
+    skipped = 0
+    if "metadata" in doc and not isinstance(doc["metadata"], dict):
+        skipped += 1  # present but unusable — whatever it held is unrecoverable
     meta = doc.get("metadata")
     if not isinstance(meta, dict):
         meta = {}
-    carry = {}
-    skipped = 0
     for section in _CARRY_SECTIONS:
-        src = meta.get(section)
+        if section not in meta:
+            continue  # absent — nothing to carry, nothing lost
+        src = meta[section]
         if not isinstance(src, dict):
+            skipped += 1  # present but not a mapping — can't inspect its entries
             continue
         kept = {}
         for k, v in src.items():

@@ -438,9 +438,9 @@ def test_secret_carryover_extracts_user_owned_fields():
     assert carry["immutable"] is True
     assert skipped == 0                             # all fields valid
     assert "uid" not in str(carry) and "resourceVersion" not in str(carry)
-    # Junk-safe.
+    # Doc-level junk is safe and, since there's no structure to speak of at
+    # all, nothing is countable as a specific lost field.
     assert core.secret_carryover(None) == ({}, 0)
-    assert core.secret_carryover({"metadata": "junk"}) == ({}, 0)
 
 
 def test_secret_carryover_immutable_only_true():
@@ -465,8 +465,36 @@ def test_secret_carryover_drops_and_counts_non_string_values():
     assert carry["annotations"] == {"keep": "yes"}  # null note dropped
     assert skipped == 3                             # num, flag, note
     assert "None" not in str(carry) and "True" not in str(carry)
-    # An all-non-string section drops out entirely but is still counted.
+
+
+def test_secret_carryover_counts_malformed_sections_not_just_values():
+    # A section that's PRESENT but the wrong shape (null, a string, a list —
+    # not a mapping) must be counted too, not just individual bad k/v pairs
+    # within an otherwise-valid mapping. An ABSENT section (the common case —
+    # most secrets carry no labels/annotations) must NOT be counted.
     assert core.secret_carryover({"metadata": {"labels": {"n": 1}}}) == ({}, 1)
+    assert core.secret_carryover({"metadata": {"labels": None}}) == ({}, 1)
+    assert core.secret_carryover({"metadata": {"labels": "oops"}}) == ({}, 1)
+    assert core.secret_carryover({"metadata": {}}) == ({}, 0)  # absent: no loss
+
+    # A malformed `labels` alongside a VALID `annotations` must still carry
+    # the good section while counting the bad one — previously this returned
+    # ({"annotations": {...}}, 0), silently hiding the dropped labels entirely.
+    doc = {"metadata": {"labels": None,
+                        "annotations": {"a": "b"}}}
+    assert core.secret_carryover(doc) == ({"annotations": {"a": "b"}}, 1)
+
+
+def test_secret_carryover_counts_malformed_metadata_block():
+    # `metadata` itself present but not a mapping (null, a string, ...) is
+    # unrecoverable — whatever it held (if anything) can't be inspected, so
+    # it must be counted rather than silently treated as "nothing to carry".
+    assert core.secret_carryover({"metadata": "junk"}) == ({}, 1)
+    assert core.secret_carryover({"metadata": None, "immutable": True}) == (
+        {"immutable": True}, 1)
+    # `metadata` key entirely absent (not merely null) is the normal shape of
+    # a doc secret_carryover is never handed in practice — not a loss.
+    assert core.secret_carryover({"kind": "Secret"}) == ({}, 0)
 
 
 def test_build_secret_yaml_emits_carryover():

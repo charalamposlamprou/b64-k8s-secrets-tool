@@ -321,7 +321,7 @@ class App(tk.Tk):
             bg=BG, fg=FGDIM, anchor="w", padx=10, font=(SANS, SZ - 1))
         self._status_lbl.pack(side="left", fill="both", expand=True)
 
-    def _status(self, msg: str, kind: str = "dim"):
+    def _status(self, msg: str, kind: str = "dim", duration_ms: int = 4000):
         color = {"ok": OK_C, "err": ERR_C, "dim": FGDIM}.get(kind, FGDIM)
         self._status_var.set(msg)
         self._status_lbl.configure(fg=color)
@@ -331,7 +331,7 @@ class App(tk.Tk):
             self._status_var.set("Ready")
             self._status_lbl.configure(fg=FGDIM)
             self._status_job = None
-        self._status_job = self.after(4000, _reset)
+        self._status_job = self.after(duration_ms, _reset)
 
     # ---------------------------------------------------------------- top-level
 
@@ -862,7 +862,15 @@ class App(tk.Tk):
             notes.append(f"{self._tpl_skipped} invalid metadata field(s) skipped")
         if notes:
             msg += " — " + "; ".join(notes)
-        self._status(msg, "ok")
+        # A skipped field means the manifest is lossy — that outranks the
+        # otherwise-successful generation: use the warning color (matching
+        # Warn.TLabel elsewhere) instead of a reassuring green "ok", and keep
+        # it on screen well past the default 4s so it survives a glance away
+        # before Save/Seal.
+        if self._tpl_skipped:
+            self._status(msg, "err", duration_ms=10000)
+        else:
+            self._status(msg, "ok")
 
     def _save_yaml(self):
         name = self._sec_name.get().strip() or DEF_NAME
