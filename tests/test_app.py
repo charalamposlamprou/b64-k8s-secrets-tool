@@ -609,7 +609,74 @@ data:
         win._gen_yaml()
         doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
         assert "immutable" not in doc          # false == default, omitted
-        assert "carried over" not in win._status_var.get()
+        status = win._status_var.get()
+        assert "carried over" not in status    # nothing carried...
+        assert "skipped" not in status         # ...and nothing malformed
+    finally:
+        win.destroy()
+
+
+def test_import_flags_skipped_malformed_metadata(monkeypatch, tmp_path):
+    """When some metadata carries but a malformed field is dropped, Generate's
+    status must flag the drop instead of an unqualified 'carried over' that
+    hides the loss — e.g. a string `immutable: "true"` alongside a valid label."""
+    pytest.importorskip("yaml")
+    import yaml as _yaml
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mixed
+  labels:
+    app.kubernetes.io/name: web
+immutable: "true"
+data:
+  token: c2VjcmV0
+""")
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert doc["metadata"]["labels"] == {"app.kubernetes.io/name": "web"}
+        assert "immutable" not in doc          # the string spelling was dropped
+        status = win._status_var.get()
+        assert "carried over" in status        # the label did survive...
+        assert "1 invalid metadata field(s) skipped" in status  # ...immutable didn't
+        # A lossy result outranks the otherwise-successful generation: it must
+        # use the warning color (not a reassuring green "ok") and stay on
+        # screen well past the default 4s so a glance-away doesn't miss it.
+        assert win._status_lbl.cget("fg") == app.ERR_C
+        assert win._status_job is not None
+    finally:
+        win.destroy()
+
+
+def test_import_flags_skipped_malformed_section(monkeypatch, tmp_path):
+    """A section that's present but the wrong shape (e.g. `labels: null`) must
+    be flagged too, not just individual bad values within an otherwise-valid
+    mapping — previously this silently dropped the whole section uncounted."""
+    pytest.importorskip("yaml")
+    import yaml as _yaml
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: partial
+  labels:
+  annotations:
+    a.io/id: kept
+data:
+  token: c2VjcmV0
+""")
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert doc["metadata"]["annotations"] == {"a.io/id": "kept"}
+        assert "labels" not in doc["metadata"]
+        status = win._status_var.get()
+        assert "carried over" in status                        # annotations survived
+        assert "1 invalid metadata field(s) skipped" in status  # labels: null didn't
     finally:
         win.destroy()
 
@@ -661,5 +728,94 @@ def test_load_template_repoints_file_label_to_cluster():
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)  # identity-only branch
         assert win._env_lbl.cget("text") == "(cluster: prod/s)"
+    finally:
+        win.destroy()
+
+
+def test_skip_warning_survives_save_and_seal_statuses(monkeypatch, tmp_path):
+    """The lossy-carryover warning must be durable: visible from the moment of
+    import (before Generate is ever clicked), qualified in the Save and Seal
+    success messages instead of being erased by them, and persistent on the
+    Encode tab throughout."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lossy
+  labels:
+immutable: "true"
+data:
+  token: c2VjcmV0
+""")
+        # Visible at import time — no Generate needed to learn of the loss.
+        assert win._skip_lbl.winfo_manager() == "pack"
+        assert "2 invalid metadata field(s)" in win._skip_lbl.cget("text")
+
+        win._gen_yaml()
+        assert "2 invalid metadata field(s) skipped" in win._status_var.get()
+
+        # Save must not flash an unqualified green over the warning...
+        win._write_file(str(tmp_path / "out.yaml"), win._yaml_out.get("1.0", "end"))
+        status = win._status_var.get()
+        assert "Saved out.yaml" in status and "skipped" in status
+        assert win._status_lbl.cget("fg") == app.ERR_C
+
+        # ...and neither must a successful seal.
+        win._on_sealed("kind: SealedSecret\n", "", 0, win._out_gen)
+        status = win._status_var.get()
+        assert "Sealed successfully" in status and "skipped" in status
+        assert win._status_lbl.cget("fg") == app.ERR_C
+        assert win._skip_lbl.winfo_manager() == "pack"  # label still up
+
+        # Clearing the editor resolves the lossy state — warning goes away
+        # and output statuses return to plain green.
+        win._clear_env()
+        assert win._skip_lbl.winfo_manager() == ""
+    finally:
+        win.destroy()
+
+
+def test_skip_warning_hidden_after_clean_reload(monkeypatch, tmp_path):
+    """Loading a clean secret (or a .env) over a lossy one retires the
+    warning — it reflects the CURRENT editor contents, not history."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path,
+                     "kind: Secret\nmetadata:\n  labels:\ndata:\n  t: c2VjcmV0\n")
+        assert win._skip_lbl.winfo_manager() == "pack"
+
+        _import_file(win, monkeypatch, tmp_path,
+                     "kind: Secret\ndata:\n  t: c2VjcmV0\n")  # clean import
+        assert win._skip_lbl.winfo_manager() == ""
+
+        win._gen_yaml()
+        win._write_file(str(tmp_path / "clean.yaml"), "x")
+        status = win._status_var.get()
+        assert "Saved" in status and "skipped" not in status
+        assert win._status_lbl.cget("fg") == app.OK_C
+    finally:
+        win.destroy()
+
+
+def test_identity_only_binary_drop_uses_warning_severity():
+    """Dropping binary passthrough on an identity-only load is a real data
+    loss — it must use the warning color, not a green 'ok' flash."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._tpl_binary = {"tls.key": "QUJD"}
+        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+
+        win._got_template("c", "n", "s",
+                          "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
+                          win._out_gen)
+
+        assert "dropped 1 binary value(s)" in win._status_var.get()
+        assert win._status_lbl.cget("fg") == app.ERR_C
     finally:
         win.destroy()

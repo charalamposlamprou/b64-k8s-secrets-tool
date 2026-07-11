@@ -167,7 +167,10 @@ class App(tk.Tk):
         # Carry-over metadata (labels / annotations / immutable) from a loaded
         # or imported Secret doc, re-emitted by Generate so a fix-and-reapply
         # round-trip doesn't strip GitOps ownership or the immutability flag.
+        # _tpl_skipped counts fields dropped as malformed, so Generate's status
+        # can flag a lossy round-trip instead of claiming full fidelity.
         self._tpl_carry = {}
+        self._tpl_skipped = 0
 
         self._apply_style()
         self._fix_x11_paste()
@@ -318,7 +321,7 @@ class App(tk.Tk):
             bg=BG, fg=FGDIM, anchor="w", padx=10, font=(SANS, SZ - 1))
         self._status_lbl.pack(side="left", fill="both", expand=True)
 
-    def _status(self, msg: str, kind: str = "dim"):
+    def _status(self, msg: str, kind: str = "dim", duration_ms: int = 4000):
         color = {"ok": OK_C, "err": ERR_C, "dim": FGDIM}.get(kind, FGDIM)
         self._status_var.set(msg)
         self._status_lbl.configure(fg=color)
@@ -328,7 +331,7 @@ class App(tk.Tk):
             self._status_var.set("Ready")
             self._status_lbl.configure(fg=FGDIM)
             self._status_job = None
-        self._status_job = self.after(4000, _reset)
+        self._status_job = self.after(duration_ms, _reset)
 
     # ---------------------------------------------------------------- top-level
 
@@ -492,12 +495,21 @@ class App(tk.Tk):
         # rightmost visual position rather than its creation order.
         self._load_btn.lift()
 
+        # Persistent malformed-metadata warning. A transient status line is
+        # the wrong home for "your generated YAML will be lossy": it auto-
+        # clears, and any later Save/Seal success message overwrites it. This
+        # label stays on screen for as long as the loaded secret carries
+        # skipped fields (shown/hidden by _refresh_skip_warning, driven from
+        # the _invalidate_outputs choke point so it can never go stale).
+        self._skip_lbl = ttk.Label(p, style="Warn.TLabel", anchor="w")
+
         # Row-based KV editor — one row per key/value, with a multiline popup
         # (Edit…) for long values like PEM certs or JSON.
         # Column header bar, mirroring the Decode tab's decoded-table header so
         # the editor reads as a table (Key | Value | Actions) instead of rows
         # joined by "=".
         kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
+        self._skip_anchor = kv_hdr  # the warning re-packs just above the editor
         tk.Label(kv_hdr, text="Key", bg=BG3, fg=ACCENT, width=22, anchor="w",
                  padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
         tk.Label(kv_hdr, text="Actions", bg=BG3, fg=ACCENT, anchor="e",
@@ -702,6 +714,36 @@ class App(tk.Tk):
         self._set_text(self._yaml_out, "")
         self._set_text(self._sealed_out, "")
         self._refresh_action_buttons()
+        # Every path that changes _tpl_skipped (Browse .env / Clear reset it,
+        # _set_secret_identity assigns it) flows through here afterwards, so
+        # refreshing at this choke point keeps the on-screen warning in
+        # lockstep with the state instead of relying on each caller.
+        self._refresh_skip_warning()
+
+    def _refresh_skip_warning(self):
+        """Show/hide the persistent Encode-tab warning to match _tpl_skipped.
+        Persistent because the loss stays relevant for as long as the loaded
+        secret is being edited — unlike the status bar, it survives the
+        Save/Seal success messages and needs no lucky glance within 10s."""
+        if self._tpl_skipped:
+            self._skip_lbl.configure(text=(
+                f"⚠  {self._tpl_skipped} invalid metadata field(s) in the "
+                "loaded secret — they will be missing from generated YAML"))
+            self._skip_lbl.pack(fill="x", pady=(8, 0),
+                                before=self._skip_anchor)
+        else:
+            self._skip_lbl.pack_forget()
+
+    def _status_output(self, msg):
+        """Status for an operation whose result derives from the generated
+        YAML (Generate / Save / Seal). While the carryover skipped fields,
+        an unqualified green success would contradict the pending loss — so
+        the message carries the skip count and warning severity instead."""
+        if self._tpl_skipped:
+            self._status(f"{msg} — {self._tpl_skipped} invalid metadata "
+                         "field(s) skipped", "err", duration_ms=10000)
+        else:
+            self._status(msg, "ok")
 
     def _kv_get_pairs(self):
         """Editable rows as {key: value}, reading values from the StringVars.
@@ -769,6 +811,7 @@ class App(tk.Tk):
         self._env_lbl.configure(text=path)
         self._tpl_binary = {}  # a plain .env carries no binary passthrough...
         self._tpl_carry = {}   # ...and no metadata to carry over
+        self._tpl_skipped = 0
         self._kv_set_pairs(parse_dotenv(text).items())  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
@@ -824,6 +867,7 @@ class App(tk.Tk):
         self._env_lbl.configure(text="(no file)")
         self._tpl_binary = {}
         self._tpl_carry = {}
+        self._tpl_skipped = 0
         self._kv_clear()  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
@@ -849,7 +893,9 @@ class App(tk.Tk):
             msg += f" ({len(raw)} binary kept as-is)"
         if self._tpl_carry:
             msg += " — labels/annotations/immutable carried over"
-        self._status(msg, "ok")
+        # _status_output appends the skip count and warning severity when the
+        # carryover was lossy, so 'carried over' can't imply full fidelity.
+        self._status_output(msg)
 
     def _save_yaml(self):
         name = self._sec_name.get().strip() or DEF_NAME
@@ -1210,7 +1256,9 @@ class App(tk.Tk):
             return
         self._set_text(self._sealed_out, stdout)
         self._refresh_action_buttons()
-        self._status("Sealed successfully", "ok")
+        # Via _status_output: a seal of lossy-carryover YAML must not read as
+        # an unqualified success right as the manifest becomes applyable.
+        self._status_output("Sealed successfully")
 
     def _sealed_output(self) -> str:
         """The sealed YAML in the output pane, or '' when empty / an error."""
@@ -1450,9 +1498,14 @@ class App(tk.Tk):
             self._env_lbl.configure(text=f"(cluster: {ns}/{sec})")
             msg = f"{sec} has no data/stringData — loaded name/namespace/type only"
             if dropped:
+                # Real data left the editor — same lossy-result severity and
+                # staying power as _status_output's skipped-metadata warning,
+                # not a green flash a glance-away would miss.
                 msg += (f"; dropped {dropped} binary value(s) from the "
                         "previous secret")
-            self._status(msg, "ok")
+                self._status(msg, "err", duration_ms=10000)
+            else:
+                self._status(msg, "ok")
             return
         err = self._check_entries(entries)
         if err:
@@ -1528,7 +1581,7 @@ class App(tk.Tk):
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
         self._sec_type.set(doc.get("type") or "Opaque")
-        self._tpl_carry = secret_carryover(doc)
+        self._tpl_carry, self._tpl_skipped = secret_carryover(doc)
         self._invalidate_outputs()
 
     # --------------------------------------------------------------- helpers
@@ -1625,7 +1678,10 @@ class App(tk.Tk):
     def _write_file(self, path: str, content: str):
         try:
             write_secret_file(path, content)  # owner-only (0o600) — holds secrets
-            self._status(f"Saved {os.path.basename(path)}", "ok")
+            # Via _status_output: a plain green "Saved" would erase the lossy-
+            # carryover warning at the exact moment the incomplete file lands
+            # on disk (both save paths hold YAML derived from the generation).
+            self._status_output(f"Saved {os.path.basename(path)}")
         except OSError as e:
             self._status(f"Save failed: {e}", "err")
 

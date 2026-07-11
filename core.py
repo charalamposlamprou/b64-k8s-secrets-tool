@@ -143,42 +143,75 @@ def yaml_scalar(v: str) -> str:
 # would both leak the old values into the new manifest and mislead kubectl.
 _LAST_APPLIED = "kubectl.kubernetes.io/last-applied-configuration"
 
+# Metadata sections carried through an import → Generate round-trip. Shared by
+# secret_carryover (capture) and build_secret_yaml (emit) so the two can't
+# drift — a section captured but never emitted would silently lie about
+# round-trip fidelity, the exact bug class secret_carryover exists to avoid.
+_CARRY_SECTIONS = ("labels", "annotations")
 
-def secret_carryover(doc) -> dict:
+
+def secret_carryover(doc):
     """The user-owned fields of a Secret doc that must survive an import →
     Generate round-trip but aren't editable in the UI: metadata.labels,
     metadata.annotations (minus kubectl's last-applied snapshot) and
     `immutable`. Server-managed metadata (uid, resourceVersion,
     creationTimestamp, managedFields, ...) is deliberately NOT carried — the
     emitted manifest is for (re-)applying, where those are rejected or
-    regenerated. Returns {} for anything that isn't Secret-shaped.
+    regenerated.
 
-    Only str→str label/annotation pairs are carried, and only a canonical
-    `immutable: true`. Kubernetes requires labels/annotations to be strings
-    and immutable to be a bool, so real cluster secrets always qualify; a
-    hand-authored file with a non-string value (e.g. a null annotation, which
-    would otherwise be str()'d into the literal "None") or a non-bool
-    `immutable` is malformed, and those fields are dropped rather than
-    silently rewritten into a wrong value or mis-reported as carried over."""
+    Returns ``(carry, skipped)``: ``carry`` is the mapping to re-emit, and
+    ``skipped`` counts candidate metadata fields DROPPED for being malformed
+    so the caller can warn the user their round-trip was lossy instead of
+    claiming full fidelity. Only str→str label/annotation pairs are carried,
+    and only a canonical ``immutable: true``. Kubernetes requires
+    labels/annotations to be strings and immutable to be a bool, so real
+    cluster secrets always qualify and skip 0; a hand-authored file with a
+    non-string value (e.g. a null annotation, which would otherwise be str()'d
+    into the literal "None") or a non-bool ``immutable`` (e.g. the string
+    "true") is malformed — dropped and counted, never silently rewritten into
+    a wrong value. A present-but-wrong-shaped `metadata`, `labels`, or
+    `annotations` (e.g. `labels: null`, a list instead of a mapping) is
+    likewise malformed and counted — an absent key is normal (most secrets
+    carry no labels), but a key that *is* there and unusable is a real,
+    countable loss, not a silent no-op. Returns ``({}, 0)`` for anything that
+    isn't Secret-shaped."""
     if not isinstance(doc, dict):
-        return {}
+        return {}, 0
+    carry = {}
+    skipped = 0
     meta = doc.get("metadata")
     if not isinstance(meta, dict):
+        # Present but unusable counts as a loss (whatever it held is
+        # unrecoverable); merely absent does not — one check both counts
+        # and normalizes so the two can't drift apart.
+        if "metadata" in doc:
+            skipped += 1
         meta = {}
-    carry = {}
-    for section in ("labels", "annotations"):
-        src = meta.get(section)
+    for section in _CARRY_SECTIONS:
+        if section not in meta:
+            continue  # absent — nothing to carry, nothing lost
+        src = meta[section]
         if not isinstance(src, dict):
+            skipped += 1  # present but not a mapping — can't inspect its entries
             continue
-        kept = {k: v for k, v in src.items()
-                if isinstance(k, str) and isinstance(v, str)
-                and not (section == "annotations" and k == _LAST_APPLIED)}
+        kept = {}
+        for k, v in src.items():
+            if section == "annotations" and k == _LAST_APPLIED:
+                continue  # deliberately stripped — not a loss, not counted
+            if isinstance(k, str) and isinstance(v, str):
+                kept[k] = v
+            else:
+                skipped += 1
         if kept:
             carry[section] = kept
-    # `immutable: false` == the default (omit it); only true is worth carrying.
-    if doc.get("immutable") is True:
+    imm = doc.get("immutable")
+    if imm is True:
         carry["immutable"] = True
-    return carry
+    elif imm is not None and not isinstance(imm, bool):
+        # A non-bool immutable (e.g. "true") is malformed and dropped. A real
+        # `immutable: false` is the k8s default (no loss), so it isn't counted.
+        skipped += 1
+    return carry, skipped
 
 
 def build_secret_yaml(name: str, namespace: str, data: dict,
@@ -198,7 +231,7 @@ def build_secret_yaml(name: str, namespace: str, data: dict,
         f"  name: {yaml_scalar(name)}",
         f"  namespace: {yaml_scalar(namespace)}",
     ]
-    for section in ("labels", "annotations"):
+    for section in _CARRY_SECTIONS:
         if carry.get(section):
             lines.append(f"  {section}:")
             for k, v in carry[section].items():
