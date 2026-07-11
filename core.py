@@ -151,24 +151,33 @@ def secret_carryover(doc) -> dict:
     `immutable`. Server-managed metadata (uid, resourceVersion,
     creationTimestamp, managedFields, ...) is deliberately NOT carried — the
     emitted manifest is for (re-)applying, where those are rejected or
-    regenerated. Returns {} for anything that isn't Secret-shaped."""
+    regenerated. Returns {} for anything that isn't Secret-shaped.
+
+    Only str→str label/annotation pairs are carried, and only a canonical
+    `immutable: true`. Kubernetes requires labels/annotations to be strings
+    and immutable to be a bool, so real cluster secrets always qualify; a
+    hand-authored file with a non-string value (e.g. a null annotation, which
+    would otherwise be str()'d into the literal "None") or a non-bool
+    `immutable` is malformed, and those fields are dropped rather than
+    silently rewritten into a wrong value or mis-reported as carried over."""
     if not isinstance(doc, dict):
         return {}
     meta = doc.get("metadata")
     if not isinstance(meta, dict):
         meta = {}
     carry = {}
-    labels = meta.get("labels")
-    if isinstance(labels, dict) and labels:
-        carry["labels"] = {str(k): str(v) for k, v in labels.items()}
-    annotations = meta.get("annotations")
-    if isinstance(annotations, dict):
-        kept = {str(k): str(v) for k, v in annotations.items()
-                if k != _LAST_APPLIED}
+    for section in ("labels", "annotations"):
+        src = meta.get(section)
+        if not isinstance(src, dict):
+            continue
+        kept = {k: v for k, v in src.items()
+                if isinstance(k, str) and isinstance(v, str)
+                and not (section == "annotations" and k == _LAST_APPLIED)}
         if kept:
-            carry["annotations"] = kept
-    if isinstance(doc.get("immutable"), bool):
-        carry["immutable"] = doc["immutable"]
+            carry[section] = kept
+    # `immutable: false` == the default (omit it); only true is worth carrying.
+    if doc.get("immutable") is True:
+        carry["immutable"] = True
     return carry
 
 

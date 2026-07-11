@@ -441,6 +441,31 @@ def test_secret_carryover_extracts_user_owned_fields():
     assert core.secret_carryover({"metadata": "junk"}) == {}
 
 
+def test_secret_carryover_immutable_only_true():
+    # `immutable: true` is carried; `false` (== the k8s default) and a
+    # non-canonical string spelling are NOT — so the carry dict is empty and
+    # nothing later reports a phantom "carried over".
+    assert core.secret_carryover({"immutable": True}) == {"immutable": True}
+    assert core.secret_carryover({"immutable": False}) == {}
+    assert core.secret_carryover({"immutable": "true"}) == {}
+
+
+def test_secret_carryover_drops_non_string_label_values():
+    # Real cluster secrets are always string-valued; a hand-authored file with
+    # a null / int / bool value must be dropped, never str()'d into a wrong
+    # literal like "None" / "3" / "True".
+    doc = {"metadata": {
+        "labels": {"good": "web", "num": 3, "flag": True},
+        "annotations": {"note": None, "keep": "yes"},
+    }}
+    carry = core.secret_carryover(doc)
+    assert carry["labels"] == {"good": "web"}       # num/flag dropped
+    assert carry["annotations"] == {"keep": "yes"}  # null note dropped
+    assert "None" not in str(carry) and "True" not in str(carry)
+    # All-non-string sections drop out entirely rather than emitting {}.
+    assert core.secret_carryover({"metadata": {"labels": {"n": 1}}}) == {}
+
+
 def test_build_secret_yaml_emits_carryover():
     carry = {"labels": {"app": "web"},
              "annotations": {"a.io/id": "x y"},  # needs quoting
