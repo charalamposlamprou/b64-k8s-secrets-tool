@@ -179,10 +179,13 @@ def secret_carryover(doc):
         return {}, 0
     carry = {}
     skipped = 0
-    if "metadata" in doc and not isinstance(doc["metadata"], dict):
-        skipped += 1  # present but unusable — whatever it held is unrecoverable
     meta = doc.get("metadata")
     if not isinstance(meta, dict):
+        # Present but unusable counts as a loss (whatever it held is
+        # unrecoverable); merely absent does not — one check both counts
+        # and normalizes so the two can't drift apart.
+        if "metadata" in doc:
+            skipped += 1
         meta = {}
     for section in _CARRY_SECTIONS:
         if section not in meta:
