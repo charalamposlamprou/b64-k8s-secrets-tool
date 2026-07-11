@@ -590,6 +590,30 @@ data:
         win.destroy()
 
 
+def test_import_immutable_false_does_not_claim_carryover(monkeypatch, tmp_path):
+    """An `immutable: false` secret with no labels/annotations carries nothing,
+    so Generate must not append the misleading 'carried over' note."""
+    pytest.importorskip("yaml")
+    import yaml as _yaml
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: plain
+immutable: false
+data:
+  token: c2VjcmV0
+""")
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert "immutable" not in doc          # false == default, omitted
+        assert "carried over" not in win._status_var.get()
+    finally:
+        win.destroy()
+
+
 def test_seal_gating_cert_and_validate():
     """A loaded cert lifts the detection-in-flight block on Seal (matching
     _do_seal's guard), and a validate in flight blocks Seal (re-sealing would
