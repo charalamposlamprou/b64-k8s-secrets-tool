@@ -385,3 +385,72 @@ def test_write_secret_file_tightens_existing_world_readable_file(tmp_path):
     core.write_secret_file(str(p), "new")
     assert p.read_text() == "new"
     assert stat.S_IMODE(p.stat().st_mode) == 0o600   # must be tightened, not left 0o644
+
+
+# --------------------------------------------------------------------------
+# yaml_scalar newline safety + carry-over metadata round-trip
+# --------------------------------------------------------------------------
+
+def test_yaml_scalar_escapes_newlines():
+    # A double-quoted scalar spanning physical lines gets its breaks folded
+    # to spaces on reparse — newlines must be escaped, not emitted raw.
+    assert core.yaml_scalar("a\nb") == '"a\\nb"'
+    assert core.yaml_scalar("a\r\nb") == '"a\\r\\nb"'
+    # $ would let a trailing-newline token pass as a bare scalar; \Z must not.
+    assert core.yaml_scalar("abc\n") == '"abc\\n"'
+    assert yaml.safe_load(core.yaml_scalar("a\nb")) == "a\nb"
+
+
+def test_multiline_binary_base64_roundtrips_intact():
+    """A wrapped (multi-line) base64 binary value must survive Generate →
+    reparse byte-for-byte and stay valid for Kubernetes (previously the
+    embedded newline was emitted raw and folded to a space, corrupting it)."""
+    wrapped = "+vv8/f7/+vv8/f7/\n+vv8/f7/+vv8/f7/"
+    [(_k, value, kind)] = core.secret_entries({"data": {"blob": wrapped}})
+    assert kind == "binary" and value == wrapped
+    out = core.build_secret_yaml("n", "ns", {}, "Opaque",
+                                 raw_data={"blob": value})
+    rt = yaml.safe_load(out)["data"]["blob"]
+    assert rt == wrapped                      # byte-exact round-trip
+    assert core.b64_valid_for_k8s(rt)         # still deployable
+
+
+def test_secret_carryover_extracts_user_owned_fields():
+    doc = {
+        "kind": "Secret",
+        "metadata": {
+            "name": "s", "uid": "server-set", "resourceVersion": "42",
+            "labels": {"app": "web", "team": "sre"},
+            "annotations": {
+                "argocd.argoproj.io/tracking-id": "web:Secret:prod/s",
+                "kubectl.kubernetes.io/last-applied-configuration":
+                    '{"data":{"old":"c2VjcmV0"}}',
+            },
+        },
+        "immutable": True,
+    }
+    carry = core.secret_carryover(doc)
+    assert carry["labels"] == {"app": "web", "team": "sre"}
+    # kubectl's last-applied snapshot embeds the OLD secret — never carried.
+    assert carry["annotations"] == {
+        "argocd.argoproj.io/tracking-id": "web:Secret:prod/s"}
+    assert carry["immutable"] is True
+    assert "uid" not in str(carry) and "resourceVersion" not in str(carry)
+    # Junk-safe.
+    assert core.secret_carryover(None) == {}
+    assert core.secret_carryover({"metadata": "junk"}) == {}
+
+
+def test_build_secret_yaml_emits_carryover():
+    carry = {"labels": {"app": "web"},
+             "annotations": {"a.io/id": "x y"},  # needs quoting
+             "immutable": True}
+    doc = yaml.safe_load(core.build_secret_yaml(
+        "s", "prod", {"K": "v"}, "Opaque", carryover=carry))
+    assert doc["metadata"]["labels"] == {"app": "web"}
+    assert doc["metadata"]["annotations"] == {"a.io/id": "x y"}
+    assert doc["immutable"] is True
+    # Without carryover the sections are absent, matching the old output.
+    doc = yaml.safe_load(core.build_secret_yaml("s", "prod", {"K": "v"}))
+    assert "labels" not in doc["metadata"]
+    assert "immutable" not in doc

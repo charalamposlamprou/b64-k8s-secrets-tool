@@ -92,10 +92,17 @@ from core import (  # noqa: E402
     kubeseal_seal_cmd,
     kubeseal_validate_cmd,
     parse_dotenv,
+    secret_carryover,
     secret_entries,
     select_secret_doc,
     write_secret_file,
 )
+
+# Fallback Secret identity when the fields are blank / nothing was loaded.
+# Single source of truth — the same pair feeds the widget defaults, Generate,
+# and the save-dialog filenames.
+DEF_NAME = "my-secret"
+DEF_NS = "default"
 
 # ---------------------------------------------------------------------------
 # Background command runner — never blocks the UI
@@ -157,6 +164,10 @@ class App(tk.Tk):
         # original base64 so Generate YAML can re-emit them verbatim instead of
         # silently dropping them (they can't be edited as plaintext .env).
         self._tpl_binary = {}
+        # Carry-over metadata (labels / annotations / immutable) from a loaded
+        # or imported Secret doc, re-emitted by Generate so a fix-and-reapply
+        # round-trip doesn't strip GitOps ownership or the immutability flag.
+        self._tpl_carry = {}
 
         self._apply_style()
         self._fix_x11_paste()
@@ -518,11 +529,11 @@ class App(tk.Tk):
         gen_btn.pack(side="right", padx=(12, 0))
         ttk.Label(form, text="Secret name:").pack(side="left")
         self._sec_name = ttk.Entry(form, width=16, font=(MONO, SZ))
-        self._sec_name.insert(0, "my-secret")
+        self._sec_name.insert(0, DEF_NAME)
         self._sec_name.pack(side="left", padx=(6, 12))
         ttk.Label(form, text="Namespace:").pack(side="left")
         self._sec_ns_e = ttk.Entry(form, width=10, font=(MONO, SZ))
-        self._sec_ns_e.insert(0, "default")
+        self._sec_ns_e.insert(0, DEF_NS)
         self._sec_ns_e.pack(side="left", padx=(6, 12))
         ttk.Label(form, text="Type:").pack(side="left")
         self._sec_type = ttk.Combobox(form, width=18, font=(MONO, SZ),
@@ -681,12 +692,12 @@ class App(tk.Tk):
         """The secret in the editor changed — any generated YAML and any
         sealed output describe the *previous* one, so clear both, advance the
         generation (in-flight seal/validate results become stale), and re-gate
-        the Seal-tab buttons. The row-replacement choke points (_kv_set_pairs
-        / _kv_clear) call this from their shared tail, which covers every
-        row-replacing path (Browse .env / Import / full Load Template /
-        Clear); a repopulation that does NOT replace rows must call it
-        explicitly — currently only the identity-only load in
-        _apply_identity_only."""
+        the Seal-tab buttons. Called structurally from two tails: the
+        row-replacement choke points (_kv_set_pairs / _kv_clear — Browse .env
+        / Import / full Load Template / Clear) and _set_secret_identity (every
+        doc-driven identity change, including the identity-only load, which
+        replaces no rows). A future repopulation path that neither replaces
+        rows nor sets a doc identity must call it itself."""
         self._out_gen += 1  # in-flight seal/validate results are now stale
         self._set_text(self._yaml_out, "")
         self._set_text(self._sealed_out, "")
@@ -756,7 +767,8 @@ class App(tk.Tk):
         if text is None:
             return
         self._env_lbl.configure(text=path)
-        self._tpl_binary = {}  # a plain .env carries no binary passthrough
+        self._tpl_binary = {}  # a plain .env carries no binary passthrough...
+        self._tpl_carry = {}   # ...and no metadata to carry over
         self._kv_set_pairs(parse_dotenv(text).items())  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
@@ -811,6 +823,7 @@ class App(tk.Tk):
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
         self._tpl_binary = {}
+        self._tpl_carry = {}
         self._kv_clear()  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
@@ -822,21 +835,24 @@ class App(tk.Tk):
         raw = {k: v for k, v in self._tpl_binary.items() if k not in data}
         if not data and not raw:
             self._status("No KEY=VALUE pairs found", "err"); return
-        name  = self._sec_name.get().strip() or "my-secret"
-        ns    = self._sec_ns_e.get().strip()  or "default"
+        name  = self._sec_name.get().strip() or DEF_NAME
+        ns    = self._sec_ns_e.get().strip()  or DEF_NS
         type_ = self._sec_type.get().strip()
         if not type_:
             type_ = "Opaque"
             self._sec_type.set(type_)
         self._set_text(self._yaml_out,
-                       build_secret_yaml(name, ns, data, type_, raw_data=raw))
+                       build_secret_yaml(name, ns, data, type_, raw_data=raw,
+                                         carryover=self._tpl_carry))
         msg = f"Generated YAML with {len(data) + len(raw)} key(s)"
         if raw:
             msg += f" ({len(raw)} binary kept as-is)"
+        if self._tpl_carry:
+            msg += " — labels/annotations/immutable carried over"
         self._status(msg, "ok")
 
     def _save_yaml(self):
-        name = self._sec_name.get().strip() or "my-secret"
+        name = self._sec_name.get().strip() or DEF_NAME
         path = filedialog.asksaveasfilename(
             defaultextension=".yaml", initialfile=f"{name}.yaml",
             filetypes=[("YAML", "*.yaml"), ("All", "*.*")])
@@ -1110,10 +1126,14 @@ class App(tk.Tk):
         if path:
             self._cert = path
             self._cert_lbl.configure(text=path)
+            # Seal's gating depends on the cert (a cert lifts the
+            # detection-in-flight block) — re-evaluate it.
+            self._refresh_action_buttons()
 
     def _clear_cert(self):
         self._cert = ""
         self._cert_lbl.configure(text="(none)")
+        self._refresh_action_buttons()
 
     def _do_seal(self):
         yaml_text = self._yaml_out.get("1.0", "end").strip()
@@ -1198,12 +1218,19 @@ class App(tk.Tk):
         return "" if not sealed or sealed.startswith("# kubeseal error") else sealed
 
     def _refresh_action_buttons(self):
-        """Single source of truth for the Seal / Validate button states. Seal is
-        live unless a controller lookup or a seal is in flight; Validate also
-        needs sealed output and no validate already running."""
+        """Single source of truth for the Seal / Validate button states.
+
+        Seal is blocked by: a seal in flight; a VALIDATE in flight (re-sealing
+        would swap the pane out from under the pending verdict, which would
+        then read 'Valid' about the previous sealed output); or a controller
+        lookup in flight WITHOUT a cert (with a cert the controller is
+        irrelevant to sealing — mirrors _do_seal's own guard). Validate also
+        needs sealed output, and always needs the controller resolved."""
         detecting = self._ctl_pending == self._seal_ctx.get()
+        seal_blocked = (self._sealing or self._validating
+                        or (detecting and not self._cert))
         self._seal_btn.configure(
-            state="disabled" if (detecting or self._sealing) else "normal")
+            state="disabled" if seal_blocked else "normal")
         can_validate = (bool(self._sealed_output())
                         and not detecting and not self._sealing
                         and not self._validating)
@@ -1246,7 +1273,7 @@ class App(tk.Tk):
         self._status("Valid — the controller can decrypt this", "ok")
 
     def _save_sealed(self):
-        name = self._sec_name.get().strip() or "my-secret"
+        name = self._sec_name.get().strip() or DEF_NAME
         path = filedialog.asksaveasfilename(
             defaultextension=".yaml", initialfile=f"sealed-{name}.yaml",
             filetypes=[("YAML", "*.yaml"), ("All", "*.*")])
@@ -1417,6 +1444,10 @@ class App(tk.Tk):
         entries = secret_entries(doc)
         if not entries:
             dropped = self._apply_identity_only(doc, fb_name=sec, fb_ns=ns)
+            # The File label is the editor's provenance — Import points it at
+            # a path, so a cluster load must repoint it or it keeps naming a
+            # file whose contents the editor no longer shows.
+            self._env_lbl.configure(text=f"(cluster: {ns}/{sec})")
             msg = f"{sec} has no data/stringData — loaded name/namespace/type only"
             if dropped:
                 msg += (f"; dropped {dropped} binary value(s) from the "
@@ -1429,6 +1460,7 @@ class App(tk.Tk):
             return
         total, binary = self._apply_secret_doc(doc, entries, fb_name=sec,
                                                fb_ns=ns)
+        self._env_lbl.configure(text=f"(cluster: {ns}/{sec})")  # provenance
         self._status(self._applied_msg("Loaded", total, binary, sec), "ok")
 
     @staticmethod
@@ -1439,8 +1471,8 @@ class App(tk.Tk):
             msg += f" — {binary} binary value(s) kept as-is"
         return msg
 
-    def _apply_secret_doc(self, doc, entries, fb_name="my-secret",
-                          fb_ns="default"):
+    def _apply_secret_doc(self, doc, entries, fb_name=DEF_NAME,
+                          fb_ns=DEF_NS):
         """Populate the KV editor and Secret name / Namespace / Type fields
         from a parsed Secret doc (shared by Load Template and Import Secret…).
         `entries` is the caller's secret_entries(doc) — already computed for
@@ -1469,18 +1501,23 @@ class App(tk.Tk):
         scaffolding and keeps editable text rows, but drops binary passthrough
         rows: those are invisible values bound to the *previous* secret, and
         re-emitting them verbatim under the new identity would silently leak
-        them. Invalidates the outputs like any repopulation (this path never
-        reaches the _kv_set_pairs/_kv_clear choke points, so it must do so
-        itself). Returns the dropped-binary count for the status line."""
+        them. (_set_secret_identity invalidates the outputs — this path never
+        reaches the _kv_set_pairs/_kv_clear choke points.) Returns the
+        dropped-binary count for the status line."""
         dropped = self._kv_drop_binary()
         self._set_secret_identity(doc, fb_name, fb_ns)
-        self._invalidate_outputs()
         return dropped
 
-    def _set_secret_identity(self, doc, fb_name="my-secret", fb_ns="default"):
+    def _set_secret_identity(self, doc, fb_name, fb_ns):
         """Fill the editable Secret name / Namespace / Type fields from a
         parsed Secret doc's metadata (falling back to the caller's values), so
-        they can be tweaked before Generate YAML."""
+        they can be tweaked before Generate YAML. Also captures the doc's
+        carry-over metadata (labels / annotations / immutable) for Generate,
+        and invalidates the output panes: a doc-driven identity change stales
+        any generated/sealed output whether or not rows were replaced, so the
+        invalidation is coupled here structurally instead of being a step
+        each caller must remember (the round-4 bug was exactly a caller
+        forgetting it)."""
         if not isinstance(doc, dict):
             doc = {}
         meta = doc.get("metadata")
@@ -1491,6 +1528,8 @@ class App(tk.Tk):
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
         self._sec_type.set(doc.get("type") or "Opaque")
+        self._tpl_carry = secret_carryover(doc)
+        self._invalidate_outputs()
 
     # --------------------------------------------------------------- helpers
 

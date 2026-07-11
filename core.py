@@ -110,8 +110,10 @@ SECRET_TYPES = [
 
 # Plain (unquoted) YAML scalars. Letter-first so nothing digit-led can hit a
 # YAML 1.1 numeric form (1234, 0x1A, 1_000, 1.5, ...); digit-led names/keys
-# are rare and quoting them is always valid.
-_SAFE_YAML = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
+# are rare and quoting them is always valid. \Z, not $: $ also matches just
+# before a trailing newline, which would let "abc\n" through as a bare scalar
+# and break the document.
+_SAFE_YAML = re.compile(r"[A-Za-z][A-Za-z0-9._-]*\Z")
 
 # Words a YAML 1.1 parser (kubectl) reads as booleans/null even when they are
 # meant as strings — e.g. a key "NO" or a base64 value "True".
@@ -125,23 +127,76 @@ _YAML_AMBIG = {
 def yaml_scalar(v: str) -> str:
     """Return v as a YAML scalar, double-quoting (with escaping) if it isn't a
     plain DNS-safe token, so hand-edited names/keys can't break the document.
-    The empty string is quoted too — a bare empty scalar reads as null."""
+    The empty string is quoted too — a bare empty scalar reads as null.
+    Newlines/CRs are escaped, not emitted raw: a double-quoted scalar spanning
+    physical lines gets its line breaks FOLDED TO SPACES on reparse, which
+    corrupts values (e.g. multi-line base64 passthrough gains spaces that
+    Kubernetes' decoder rejects)."""
     if _SAFE_YAML.match(v) and v not in _YAML_AMBIG:
         return v
-    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + (v.replace("\\", "\\\\").replace('"', '\\"')
+                   .replace("\n", "\\n").replace("\r", "\\r")) + '"'
+
+
+# Annotation kubectl regenerates on apply; it embeds a JSON snapshot of the
+# PREVIOUS secret (including its data), so carrying it through a round-trip
+# would both leak the old values into the new manifest and mislead kubectl.
+_LAST_APPLIED = "kubectl.kubernetes.io/last-applied-configuration"
+
+
+def secret_carryover(doc) -> dict:
+    """The user-owned fields of a Secret doc that must survive an import →
+    Generate round-trip but aren't editable in the UI: metadata.labels,
+    metadata.annotations (minus kubectl's last-applied snapshot) and
+    `immutable`. Server-managed metadata (uid, resourceVersion,
+    creationTimestamp, managedFields, ...) is deliberately NOT carried — the
+    emitted manifest is for (re-)applying, where those are rejected or
+    regenerated. Returns {} for anything that isn't Secret-shaped."""
+    if not isinstance(doc, dict):
+        return {}
+    meta = doc.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    carry = {}
+    labels = meta.get("labels")
+    if isinstance(labels, dict) and labels:
+        carry["labels"] = {str(k): str(v) for k, v in labels.items()}
+    annotations = meta.get("annotations")
+    if isinstance(annotations, dict):
+        kept = {str(k): str(v) for k, v in annotations.items()
+                if k != _LAST_APPLIED}
+        if kept:
+            carry["annotations"] = kept
+    if isinstance(doc.get("immutable"), bool):
+        carry["immutable"] = doc["immutable"]
+    return carry
 
 
 def build_secret_yaml(name: str, namespace: str, data: dict,
-                      type_: str = "Opaque", raw_data: dict = None) -> str:
+                      type_: str = "Opaque", raw_data: dict = None,
+                      carryover: dict = None) -> str:
     """Build Secret YAML. `data` holds plaintext values (base64-encoded here);
     `raw_data` holds values that are ALREADY base64 and are emitted verbatim —
-    used for binary keys that can't survive a plaintext round-trip."""
+    used for binary keys that can't survive a plaintext round-trip.
+    `carryover` (see secret_carryover) re-emits an imported Secret's labels /
+    annotations / immutable so a fix-and-reapply round-trip doesn't silently
+    strip GitOps ownership metadata or the immutability flag."""
+    carry = carryover or {}
     lines = [
         "apiVersion: v1",
         "kind: Secret",
         "metadata:",
         f"  name: {yaml_scalar(name)}",
         f"  namespace: {yaml_scalar(namespace)}",
+    ]
+    for section in ("labels", "annotations"):
+        if carry.get(section):
+            lines.append(f"  {section}:")
+            for k, v in carry[section].items():
+                lines.append(f"    {yaml_scalar(k)}: {yaml_scalar(v)}")
+    if carry.get("immutable"):
+        lines.append("immutable: true")
+    lines += [
         f"type: {yaml_scalar(type_)}",
         "data:",
     ]
