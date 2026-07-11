@@ -609,7 +609,39 @@ data:
         win._gen_yaml()
         doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
         assert "immutable" not in doc          # false == default, omitted
-        assert "carried over" not in win._status_var.get()
+        status = win._status_var.get()
+        assert "carried over" not in status    # nothing carried...
+        assert "skipped" not in status         # ...and nothing malformed
+    finally:
+        win.destroy()
+
+
+def test_import_flags_skipped_malformed_metadata(monkeypatch, tmp_path):
+    """When some metadata carries but a malformed field is dropped, Generate's
+    status must flag the drop instead of an unqualified 'carried over' that
+    hides the loss — e.g. a string `immutable: "true"` alongside a valid label."""
+    pytest.importorskip("yaml")
+    import yaml as _yaml
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mixed
+  labels:
+    app.kubernetes.io/name: web
+immutable: "true"
+data:
+  token: c2VjcmV0
+""")
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert doc["metadata"]["labels"] == {"app.kubernetes.io/name": "web"}
+        assert "immutable" not in doc          # the string spelling was dropped
+        status = win._status_var.get()
+        assert "carried over" in status        # the label did survive...
+        assert "1 invalid metadata field(s) skipped" in status  # ...immutable didn't
     finally:
         win.destroy()
 

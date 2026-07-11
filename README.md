@@ -37,7 +37,10 @@ cluster (read-only), and seal them with `kubeseal`.
   - Imported/loaded secrets round-trip faithfully: `metadata.labels`,
     `metadata.annotations` (minus kubectl's last-applied snapshot) and
     `immutable` are carried through to the generated YAML, so re-applying
-    doesn't strip GitOps ownership metadata
+    doesn't strip GitOps ownership metadata. Malformed metadata (a non-string
+    label/annotation value, or a non-bool `immutable`) is dropped rather than
+    silently rewritten, and Generate's status reports how many fields were
+    skipped so a lossy round-trip is visible
 - **Decode tab**
   - Single-value base64 decoder with masked output + Show/Hide
   - Secret YAML → decoded table: per-row Show/Hide and Copy, plus Show All / Hide All;

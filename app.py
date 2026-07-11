@@ -167,7 +167,10 @@ class App(tk.Tk):
         # Carry-over metadata (labels / annotations / immutable) from a loaded
         # or imported Secret doc, re-emitted by Generate so a fix-and-reapply
         # round-trip doesn't strip GitOps ownership or the immutability flag.
+        # _tpl_skipped counts fields dropped as malformed, so Generate's status
+        # can flag a lossy round-trip instead of claiming full fidelity.
         self._tpl_carry = {}
+        self._tpl_skipped = 0
 
         self._apply_style()
         self._fix_x11_paste()
@@ -769,6 +772,7 @@ class App(tk.Tk):
         self._env_lbl.configure(text=path)
         self._tpl_binary = {}  # a plain .env carries no binary passthrough...
         self._tpl_carry = {}   # ...and no metadata to carry over
+        self._tpl_skipped = 0
         self._kv_set_pairs(parse_dotenv(text).items())  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
@@ -824,6 +828,7 @@ class App(tk.Tk):
         self._env_lbl.configure(text="(no file)")
         self._tpl_binary = {}
         self._tpl_carry = {}
+        self._tpl_skipped = 0
         self._kv_clear()  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
@@ -847,8 +852,16 @@ class App(tk.Tk):
         msg = f"Generated YAML with {len(data) + len(raw)} key(s)"
         if raw:
             msg += f" ({len(raw)} binary kept as-is)"
+        # Be honest about carryover: name what survived AND flag any fields
+        # dropped as malformed, so 'carried over' can't imply full fidelity
+        # when some metadata was silently skipped.
+        notes = []
         if self._tpl_carry:
-            msg += " — labels/annotations/immutable carried over"
+            notes.append("labels/annotations/immutable carried over")
+        if self._tpl_skipped:
+            notes.append(f"{self._tpl_skipped} invalid metadata field(s) skipped")
+        if notes:
+            msg += " — " + "; ".join(notes)
         self._status(msg, "ok")
 
     def _save_yaml(self):
@@ -1528,7 +1541,7 @@ class App(tk.Tk):
         self._sec_name.delete(0, "end"); self._sec_name.insert(0, name)
         self._sec_ns_e.delete(0, "end"); self._sec_ns_e.insert(0, nsv)
         self._sec_type.set(doc.get("type") or "Opaque")
-        self._tpl_carry = secret_carryover(doc)
+        self._tpl_carry, self._tpl_skipped = secret_carryover(doc)
         self._invalidate_outputs()
 
     # --------------------------------------------------------------- helpers

@@ -429,41 +429,44 @@ def test_secret_carryover_extracts_user_owned_fields():
         },
         "immutable": True,
     }
-    carry = core.secret_carryover(doc)
+    carry, skipped = core.secret_carryover(doc)
     assert carry["labels"] == {"app": "web", "team": "sre"}
-    # kubectl's last-applied snapshot embeds the OLD secret — never carried.
+    # kubectl's last-applied snapshot embeds the OLD secret — never carried,
+    # and its removal is deliberate, so it doesn't count as a skipped field.
     assert carry["annotations"] == {
         "argocd.argoproj.io/tracking-id": "web:Secret:prod/s"}
     assert carry["immutable"] is True
+    assert skipped == 0                             # all fields valid
     assert "uid" not in str(carry) and "resourceVersion" not in str(carry)
     # Junk-safe.
-    assert core.secret_carryover(None) == {}
-    assert core.secret_carryover({"metadata": "junk"}) == {}
+    assert core.secret_carryover(None) == ({}, 0)
+    assert core.secret_carryover({"metadata": "junk"}) == ({}, 0)
 
 
 def test_secret_carryover_immutable_only_true():
-    # `immutable: true` is carried; `false` (== the k8s default) and a
-    # non-canonical string spelling are NOT — so the carry dict is empty and
-    # nothing later reports a phantom "carried over".
-    assert core.secret_carryover({"immutable": True}) == {"immutable": True}
-    assert core.secret_carryover({"immutable": False}) == {}
-    assert core.secret_carryover({"immutable": "true"}) == {}
+    # `immutable: true` is carried (skip 0); a real `false` is the k8s default,
+    # carried as nothing and NOT counted as a loss; a non-canonical string
+    # spelling is malformed — dropped AND counted so Generate can flag it.
+    assert core.secret_carryover({"immutable": True}) == ({"immutable": True}, 0)
+    assert core.secret_carryover({"immutable": False}) == ({}, 0)
+    assert core.secret_carryover({"immutable": "true"}) == ({}, 1)
 
 
-def test_secret_carryover_drops_non_string_label_values():
+def test_secret_carryover_drops_and_counts_non_string_values():
     # Real cluster secrets are always string-valued; a hand-authored file with
-    # a null / int / bool value must be dropped, never str()'d into a wrong
-    # literal like "None" / "3" / "True".
+    # a null / int / bool value must be dropped (never str()'d into a wrong
+    # literal like "None" / "3" / "True") AND counted so the drop is visible.
     doc = {"metadata": {
         "labels": {"good": "web", "num": 3, "flag": True},
         "annotations": {"note": None, "keep": "yes"},
     }}
-    carry = core.secret_carryover(doc)
+    carry, skipped = core.secret_carryover(doc)
     assert carry["labels"] == {"good": "web"}       # num/flag dropped
     assert carry["annotations"] == {"keep": "yes"}  # null note dropped
+    assert skipped == 3                             # num, flag, note
     assert "None" not in str(carry) and "True" not in str(carry)
-    # All-non-string sections drop out entirely rather than emitting {}.
-    assert core.secret_carryover({"metadata": {"labels": {"n": 1}}}) == {}
+    # An all-non-string section drops out entirely but is still counted.
+    assert core.secret_carryover({"metadata": {"labels": {"n": 1}}}) == ({}, 1)
 
 
 def test_build_secret_yaml_emits_carryover():
