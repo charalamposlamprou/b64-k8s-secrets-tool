@@ -543,3 +543,99 @@ def test_stale_template_result_is_discarded_after_repopulation():
         assert "stale result discarded" in win._status_var.get()
     finally:
         win.destroy()
+
+
+def test_import_carries_labels_annotations_immutable(monkeypatch, tmp_path):
+    """Import → Generate must preserve GitOps ownership metadata and the
+    immutable flag (previously the round-trip silently stripped them)."""
+    pytest.importorskip("yaml")
+    import yaml as _yaml
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path, """\
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-creds
+  namespace: prod
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    argocd.argoproj.io/tracking-id: "web:Secret:prod/app-creds"
+    kubectl.kubernetes.io/last-applied-configuration: '{"data":{"old":"x"}}'
+immutable: true
+data:
+  token: c2VjcmV0
+""")
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert doc["metadata"]["labels"] == {
+            "app.kubernetes.io/managed-by": "Helm"}
+        assert doc["metadata"]["annotations"] == {
+            "argocd.argoproj.io/tracking-id": "web:Secret:prod/app-creds"}
+        assert doc["immutable"] is True
+        assert "carried over" in win._status_var.get()
+
+        # A subsequent .env load is a fresh secret — nothing carries over.
+        env = tmp_path / "fresh.env"
+        env.write_text("K=v\n")
+        monkeypatch.setattr(app.filedialog, "askopenfilename",
+                            lambda **k: str(env))
+        win._browse_env()
+        win._gen_yaml()
+        doc = _yaml.safe_load(win._yaml_out.get("1.0", "end"))
+        assert "labels" not in doc["metadata"]
+        assert "immutable" not in doc
+    finally:
+        win.destroy()
+
+
+def test_seal_gating_cert_and_validate():
+    """A loaded cert lifts the detection-in-flight block on Seal (matching
+    _do_seal's guard), and a validate in flight blocks Seal (re-sealing would
+    swap the pane out from under the pending verdict)."""
+    win = _make_win()
+    try:
+        win._seal_ctx.set("ctxA")
+        win._ctl_pending = "ctxA"     # controller detection in flight
+
+        win._cert = ""
+        win._refresh_action_buttons()
+        assert str(win._seal_btn.cget("state")) == "disabled"  # no cert: wait
+
+        win._cert = "/tmp/pub.pem"
+        win._refresh_action_buttons()
+        assert str(win._seal_btn.cget("state")) == "normal"    # cert: sealable
+
+        win._clear_cert()  # refreshes buttons itself
+        assert str(win._seal_btn.cget("state")) == "disabled"
+
+        win._ctl_pending = None
+        win._validating = True        # validate in flight blocks re-sealing
+        win._refresh_action_buttons()
+        assert str(win._seal_btn.cget("state")) == "disabled"
+    finally:
+        win.destroy()
+
+
+def test_load_template_repoints_file_label_to_cluster():
+    """The File label is the editor's provenance: after a cluster load it must
+    stop naming a previously imported/browsed file."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._env_lbl.configure(text="/tmp/imported.yaml")
+        win._enc_ctx.set("c"); win._enc_ns.set("prod"); win._enc_sec.set("s")
+
+        win._got_template("c", "prod", "s",
+                          "kind: Secret\ndata:\n  token: c2VjcmV0\n", "", 0,
+                          win._out_gen)
+        assert win._env_lbl.cget("text") == "(cluster: prod/s)"
+
+        win._env_lbl.configure(text="/tmp/imported.yaml")
+        win._got_template("c", "prod", "s",
+                          "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
+                          win._out_gen)  # identity-only branch
+        assert win._env_lbl.cget("text") == "(cluster: prod/s)"
+    finally:
+        win.destroy()

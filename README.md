@@ -34,6 +34,10 @@ cluster (read-only), and seal them with `kubeseal`.
     explicit `kind: Secret` wins), and plaintext mistakenly under `data:`
     is rejected with a pointer to `stringData` instead of being silently
     re-encoded as garbage
+  - Imported/loaded secrets round-trip faithfully: `metadata.labels`,
+    `metadata.annotations` (minus kubectl's last-applied snapshot) and
+    `immutable` are carried through to the generated YAML, so re-applying
+    doesn't strip GitOps ownership metadata
 - **Decode tab**
   - Single-value base64 decoder with masked output + Show/Hide
   - Secret YAML → decoded table: per-row Show/Hide and Copy, plus Show All / Hide All;
