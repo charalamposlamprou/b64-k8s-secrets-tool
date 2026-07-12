@@ -10,14 +10,14 @@ Secret YAML from a `.env` file or a live cluster, and seal with `kubeseal`.
 `patch`/`delete`, only reads (contexts, namespaces, secrets) and produces YAML
 locally. Preserve that invariant in any change that touches cluster calls.
 
-## Code review and fixes
+## Working in this repo
 
-When running `/code-review` (or applying its findings) in this repo, apply
-the `karpathy-guidelines` skill throughout: surface assumptions and tradeoffs
-before implementing, keep every fix minimal and surgical (touch only what
-the finding requires, don't drive-by refactor adjacent code), and verify
-each fix against an explicit, stated success criterion rather than "looks
-right" — e.g. actually run the install/test/lint, not just read the diff.
+Apply the `karpathy-guidelines` skill to all coding work in this repo, not
+just `/code-review`: surface assumptions and tradeoffs before implementing,
+keep every change minimal and surgical (touch only what the task requires,
+don't drive-by refactor adjacent code), and verify against an explicit,
+stated success criterion rather than "looks right" — e.g. actually run the
+install/test/lint, not just read the diff.
 
 ## Commands
 
