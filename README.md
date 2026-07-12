@@ -39,9 +39,10 @@ cluster (read-only), and seal them with `kubeseal`.
     `immutable` are carried through to the generated YAML, so re-applying
     doesn't strip GitOps ownership metadata. Malformed metadata (a non-string
     label/annotation value, or a non-bool `immutable`) is dropped rather than
-    silently rewritten — a persistent warning appears on the Encode tab the
-    moment it's detected, and the Generate/Save/Seal statuses carry the skip
-    count, so a lossy round-trip stays visible until the state is cleared
+    silently rewritten — a persistent warning appears in the window's status
+    area (visible on every tab, including Seal) the moment it's detected, and
+    the Generate/Save/Seal/Copy statuses carry the skip count, so a lossy
+    round-trip stays visible until the state is cleared
 - **Decode tab**
   - Single-value base64 decoder with masked output + Show/Hide
   - Secret YAML → decoded table: per-row Show/Hide and Copy, plus Show All / Hide All;

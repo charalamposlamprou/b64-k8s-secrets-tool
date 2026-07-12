@@ -104,6 +104,11 @@ from core import (  # noqa: E402
 DEF_NAME = "my-secret"
 DEF_NS = "default"
 
+# How long a lossy-result status (metadata skipped / binary dropped) lingers —
+# longer than the 4s default so it survives a glance away before the next
+# action. Shared so every lossy-result message stays in sync.
+WARN_DURATION_MS = 10000
+
 # ---------------------------------------------------------------------------
 # Background command runner — never blocks the UI
 # ---------------------------------------------------------------------------
@@ -312,7 +317,10 @@ class App(tk.Tk):
     def _build_status_bar(self):
         bar = tk.Frame(self, bg=BG, height=26)
         bar.pack(side="bottom", fill="x")
-        tk.Frame(self, bg=BORDER, height=1).pack(side="bottom", fill="x")
+        # Kept as an attribute so the warning bar can anchor its position to
+        # this separator (pack after=) rather than relying on packing order.
+        self._status_sep = tk.Frame(self, bg=BORDER, height=1)
+        self._status_sep.pack(side="bottom", fill="x")
         tk.Label(bar, text=f"v{__version__}", bg=BG, fg=FGDIM,
                  anchor="e", padx=10, font=(SANS, SZ - 1)).pack(side="right")
         self._status_var = tk.StringVar(value="Ready")
@@ -320,6 +328,15 @@ class App(tk.Tk):
             bar, textvariable=self._status_var,
             bg=BG, fg=FGDIM, anchor="w", padx=10, font=(SANS, SZ - 1))
         self._status_lbl.pack(side="left", fill="both", expand=True)
+
+        # Persistent lossy-metadata warning. It lives in the window chrome
+        # (outside the notebook) so it's visible on EVERY tab — including Seal,
+        # where the highest-stakes action happens — not just the Encode tab
+        # where the loss is detected. Created hidden; _refresh_skip_warning
+        # shows it (anchored just above the status separator) while
+        # _tpl_skipped is nonzero.
+        self._warn_lbl = tk.Label(self, bg=BG, fg=ERR_C, anchor="w",
+                                  padx=10, pady=2, font=(SANS, SZ - 1))
 
     def _status(self, msg: str, kind: str = "dim", duration_ms: int = 4000):
         color = {"ok": OK_C, "err": ERR_C, "dim": FGDIM}.get(kind, FGDIM)
@@ -495,21 +512,13 @@ class App(tk.Tk):
         # rightmost visual position rather than its creation order.
         self._load_btn.lift()
 
-        # Persistent malformed-metadata warning. A transient status line is
-        # the wrong home for "your generated YAML will be lossy": it auto-
-        # clears, and any later Save/Seal success message overwrites it. This
-        # label stays on screen for as long as the loaded secret carries
-        # skipped fields (shown/hidden by _refresh_skip_warning, driven from
-        # the _invalidate_outputs choke point so it can never go stale).
-        self._skip_lbl = ttk.Label(p, style="Warn.TLabel", anchor="w")
-
         # Row-based KV editor — one row per key/value, with a multiline popup
         # (Edit…) for long values like PEM certs or JSON.
         # Column header bar, mirroring the Decode tab's decoded-table header so
         # the editor reads as a table (Key | Value | Actions) instead of rows
-        # joined by "=".
+        # joined by "=". (The malformed-metadata warning lives in the shared
+        # window chrome — see _build_status_bar — so it shows on every tab.)
         kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
-        self._skip_anchor = kv_hdr  # the warning re-packs just above the editor
         tk.Label(kv_hdr, text="Key", bg=BG3, fg=ACCENT, width=22, anchor="w",
                  padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
         tk.Label(kv_hdr, text="Actions", bg=BG3, fg=ACCENT, anchor="e",
@@ -573,7 +582,8 @@ class App(tk.Tk):
         # Output actions sit below the pane now that the page scrolls.
         br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
         ttk.Button(br, text="Copy YAML",
-                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"))) \
+                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"),
+                                              qualify=True)) \
             .pack(side="left", padx=(0, 6))
         ttk.Button(br, text="Save YAML…", command=self._save_yaml).pack(side="left")
 
@@ -721,27 +731,35 @@ class App(tk.Tk):
         self._refresh_skip_warning()
 
     def _refresh_skip_warning(self):
-        """Show/hide the persistent Encode-tab warning to match _tpl_skipped.
-        Persistent because the loss stays relevant for as long as the loaded
-        secret is being edited — unlike the status bar, it survives the
-        Save/Seal success messages and needs no lucky glance within 10s."""
+        """Show/hide the persistent lossy-metadata warning to match
+        _tpl_skipped. Persistent (and in the tab-independent window chrome)
+        because the loss stays relevant for as long as the loaded secret is
+        being edited/sealed — unlike the status bar it survives the Save/Seal
+        success messages and is visible on every tab, needing no lucky glance
+        within the status-bar timeout."""
         if self._tpl_skipped:
-            self._skip_lbl.configure(text=(
+            self._warn_lbl.configure(text=(
                 f"⚠  {self._tpl_skipped} invalid metadata field(s) in the "
-                "loaded secret — they will be missing from generated YAML"))
-            self._skip_lbl.pack(fill="x", pady=(8, 0),
-                                before=self._skip_anchor)
+                "loaded secret — missing from generated / sealed YAML"))
+            # after= the separator pins the position (just above the status
+            # bar) structurally, so a later side="bottom" widget elsewhere
+            # can't silently reorder it.
+            self._warn_lbl.pack(side="bottom", fill="x", after=self._status_sep)
         else:
-            self._skip_lbl.pack_forget()
+            self._warn_lbl.pack_forget()
 
-    def _status_output(self, msg):
+    def _status_output(self, msg, skipped=None):
         """Status for an operation whose result derives from the generated
-        YAML (Generate / Save / Seal). While the carryover skipped fields,
-        an unqualified green success would contradict the pending loss — so
-        the message carries the skip count and warning severity instead."""
-        if self._tpl_skipped:
-            self._status(f"{msg} — {self._tpl_skipped} invalid metadata "
-                         "field(s) skipped", "err", duration_ms=10000)
+        YAML (Generate / Save / Seal / Copy). While the carryover skipped
+        fields, an unqualified green success would contradict the pending loss
+        — so the message carries the skip count and warning severity instead.
+        `skipped` defaults to the live count; callers whose result was captured
+        earlier (an async clipboard write) pass the count frozen at that time
+        so the confirmation describes the copied payload, not later state."""
+        n = self._tpl_skipped if skipped is None else skipped
+        if n:
+            self._status(f"{msg} — {n} invalid metadata field(s) skipped",
+                         "err", duration_ms=WARN_DURATION_MS)
         else:
             self._status(msg, "ok")
 
@@ -1162,7 +1180,8 @@ class App(tk.Tk):
         # Output actions sit below the pane now that the page scrolls.
         br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
         ttk.Button(br, text="Copy Sealed",
-                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"))) \
+                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"),
+                                              qualify=True)) \
             .pack(side="left", padx=(0, 6))
         ttk.Button(br, text="Save Sealed…", command=self._save_sealed).pack(side="left")
 
@@ -1503,7 +1522,7 @@ class App(tk.Tk):
                 # not a green flash a glance-away would miss.
                 msg += (f"; dropped {dropped} binary value(s) from the "
                         "previous secret")
-                self._status(msg, "err", duration_ms=10000)
+                self._status(msg, "err", duration_ms=WARN_DURATION_MS)
             else:
                 self._status(msg, "ok")
             return
@@ -1544,6 +1563,13 @@ class App(tk.Tk):
                 # in the editor. ("invalid" never reaches here — both callers
                 # run _check_entries first.)
                 self._tpl_binary[k] = value
+        # _kv_set_pairs and _set_secret_identity each invalidate outputs (and
+        # so refresh the skip warning); the first runs with the PREVIOUS
+        # secret's _tpl_skipped, the second with this doc's. Both are
+        # synchronous within this call with no event-loop turn between, so the
+        # transient intermediate never renders — but keep them in this order
+        # (rows, then identity+skip count) if a later change adds an async
+        # boundary here, or the stale count could briefly flash.
         self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
         self._set_secret_identity(doc, fb_name, fb_ns)
         return len(entries), len(self._tpl_binary)
@@ -1610,23 +1636,37 @@ class App(tk.Tk):
                 pass
         threading.Thread(target=worker, daemon=True).start()
 
-    def _clip(self, text: str):
+    def _clip(self, text: str, qualify: bool = False):
+        """Copy `text` to the clipboard. `qualify=True` for the generated /
+        sealed YAML, whose copy is another way the (possibly lossy) manifest
+        leaves the app — its confirmation carries the skip count like Save/Seal
+        rather than an unqualified 'Copied'."""
         payload = text.rstrip("\n")
+        # Freeze the skip count NOW: the clipboard write below is async on
+        # Linux, and _tpl_skipped can change (Clear / load another secret)
+        # before _clip_done fires — the confirmation must describe the payload
+        # actually copied, not whatever state the editor drifted to.
+        skipped = self._tpl_skipped if qualify else None
         # On X11 the Tk clipboard is lost when the app exits, so prefer a real
         # clipboard manager (xclip/xsel) that keeps the value after we quit. It
         # can block, so run it off the UI thread and fall back to the Tk
         # clipboard (handled on the main thread by _clip_done).
         if sys.platform.startswith("linux"):
             self._run_async(lambda: self._clip_external(payload),
-                            lambda ok: self._clip_done(ok, payload))
+                            lambda ok: self._clip_done(ok, payload, qualify,
+                                                       skipped))
         else:
-            self._clip_done(False, payload)
+            self._clip_done(False, payload, qualify, skipped)
 
-    def _clip_done(self, external_ok: bool, payload: str):
+    def _clip_done(self, external_ok: bool, payload: str, qualify: bool = False,
+                   skipped=None):
         if not external_ok:  # no external tool — Tk clipboard (lost on exit)
             self.clipboard_clear()
             self.clipboard_append(payload)
-        self._status("Copied to clipboard", "ok")
+        if qualify:
+            self._status_output("Copied to clipboard", skipped=skipped)
+        else:
+            self._status("Copied to clipboard", "ok")
 
     @staticmethod
     def _clip_external(text: str) -> bool:

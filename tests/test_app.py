@@ -734,9 +734,9 @@ def test_load_template_repoints_file_label_to_cluster():
 
 def test_skip_warning_survives_save_and_seal_statuses(monkeypatch, tmp_path):
     """The lossy-carryover warning must be durable: visible from the moment of
-    import (before Generate is ever clicked), qualified in the Save and Seal
-    success messages instead of being erased by them, and persistent on the
-    Encode tab throughout."""
+    import (before Generate is ever clicked), qualified in the Save/Seal/Copy
+    success messages instead of being erased by them, and persistent in the
+    tab-independent window chrome throughout."""
     pytest.importorskip("yaml")
     win = _make_win()
     try:
@@ -751,8 +751,8 @@ data:
   token: c2VjcmV0
 """)
         # Visible at import time — no Generate needed to learn of the loss.
-        assert win._skip_lbl.winfo_manager() == "pack"
-        assert "2 invalid metadata field(s)" in win._skip_lbl.cget("text")
+        assert win._warn_lbl.winfo_manager() == "pack"
+        assert "2 invalid metadata field(s)" in win._warn_lbl.cget("text")
 
         win._gen_yaml()
         assert "2 invalid metadata field(s) skipped" in win._status_var.get()
@@ -763,17 +763,23 @@ data:
         assert "Saved out.yaml" in status and "skipped" in status
         assert win._status_lbl.cget("fg") == app.ERR_C
 
-        # ...and neither must a successful seal.
+        # ...neither must a successful seal...
         win._on_sealed("kind: SealedSecret\n", "", 0, win._out_gen)
         status = win._status_var.get()
         assert "Sealed successfully" in status and "skipped" in status
         assert win._status_lbl.cget("fg") == app.ERR_C
-        assert win._skip_lbl.winfo_manager() == "pack"  # label still up
+
+        # ...nor a Copy of the (lossy) generated/sealed content.
+        win._clip_done(False, "payload", qualify=True)
+        status = win._status_var.get()
+        assert "Copied to clipboard" in status and "skipped" in status
+        assert win._status_lbl.cget("fg") == app.ERR_C
+        assert win._warn_lbl.winfo_manager() == "pack"  # banner still up
 
         # Clearing the editor resolves the lossy state — warning goes away
         # and output statuses return to plain green.
         win._clear_env()
-        assert win._skip_lbl.winfo_manager() == ""
+        assert win._warn_lbl.winfo_manager() == ""
     finally:
         win.destroy()
 
@@ -786,17 +792,84 @@ def test_skip_warning_hidden_after_clean_reload(monkeypatch, tmp_path):
     try:
         _import_file(win, monkeypatch, tmp_path,
                      "kind: Secret\nmetadata:\n  labels:\ndata:\n  t: c2VjcmV0\n")
-        assert win._skip_lbl.winfo_manager() == "pack"
+        assert win._warn_lbl.winfo_manager() == "pack"
 
         _import_file(win, monkeypatch, tmp_path,
                      "kind: Secret\ndata:\n  t: c2VjcmV0\n")  # clean import
-        assert win._skip_lbl.winfo_manager() == ""
+        assert win._warn_lbl.winfo_manager() == ""
 
         win._gen_yaml()
         win._write_file(str(tmp_path / "clean.yaml"), "x")
         status = win._status_var.get()
         assert "Saved" in status and "skipped" not in status
         assert win._status_lbl.cget("fg") == app.OK_C
+        # A plain (non-YAML) copy stays unqualified even mid-session.
+        win._clip_done(False, "x", qualify=False)
+        assert win._status_var.get() == "Copied to clipboard"
+    finally:
+        win.destroy()
+
+
+def test_copy_confirmation_uses_skip_count_frozen_at_copy_time(monkeypatch):
+    """The clipboard write is async on Linux; the confirmation must describe
+    the payload copied, not whatever _tpl_skipped drifted to before the write
+    landed. _clip freezes the count at click time; _clip_done honours it."""
+    win = _make_win()
+    try:
+        # _clip_done honours a frozen count over the live attribute: the
+        # payload was captured while 2 were skipped, even though state now
+        # reads clean.
+        win._tpl_skipped = 0
+        win._clip_done(False, "lossy yaml", qualify=True, skipped=2)
+        status = win._status_var.get()
+        assert "Copied to clipboard" in status
+        assert "2 invalid metadata field(s) skipped" in status  # frozen, not 0
+        assert win._status_lbl.cget("fg") == app.ERR_C
+
+        # ...and the reverse: a clean copy stays unqualified even if the editor
+        # has since become lossy.
+        win._tpl_skipped = 3
+        win._clip_done(False, "clean yaml", qualify=True, skipped=0)
+        assert win._status_var.get() == "Copied to clipboard"
+        assert win._status_lbl.cget("fg") == app.OK_C
+
+        # _clip itself captures the live count at call time. Force the
+        # synchronous (non-Linux) clip path so the callback runs inline.
+        monkeypatch.setattr(app.sys, "platform", "darwin")
+        seen = {}
+        real_done = win._clip_done
+
+        def spy(ok, payload, qualify=False, skipped=None):
+            seen["skipped"] = skipped
+            return real_done(ok, payload, qualify, skipped)
+
+        win._clip_done = spy
+        win._tpl_skipped = 5
+        win._clip("some yaml", qualify=True)   # must freeze 5 here...
+        win._tpl_skipped = 0                   # ...before this later change
+        assert seen["skipped"] == 5
+    finally:
+        win.destroy()
+
+
+def test_warning_bar_sits_above_status_bar(monkeypatch, tmp_path):
+    """The warning is anchored just above the status separator, not merely
+    'somewhere bottom' — a later side=bottom widget must not be able to slip
+    between them. Assert the actual pack order, which presence-only checks
+    (winfo_manager) never covered."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        _import_file(win, monkeypatch, tmp_path,
+                     "kind: Secret\nmetadata:\n  labels:\ndata:\n  t: c2VjcmV0\n")
+        # Among the root window's bottom-packed children, the warning label
+        # must be immediately above the status separator (adjacent in the
+        # pack list, warning after separator). pack_slaves() reflects the
+        # manager's list without needing an idle-tasks flush (which macOS Tk
+        # can't survive outside a running mainloop).
+        slaves = win.pack_slaves()
+        assert win._warn_lbl in slaves and win._status_sep in slaves
+        assert slaves.index(win._warn_lbl) == slaves.index(win._status_sep) + 1
     finally:
         win.destroy()
 
