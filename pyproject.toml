@@ -8,6 +8,7 @@ name = "b64-k8s-secrets-tool"
 # value is just a placeholder so the project is installable for dev/test.
 version = "0.0.0"
 description = "A dark-themed Tkinter GUI for working with Kubernetes secrets: encode/decode base64, build Secret YAML from a .env file, fetch existing secrets from a cluster (read-only), and seal them with kubeseal."
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml",
