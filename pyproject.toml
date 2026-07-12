@@ -1,9 +1,5 @@
 [build-system]
-# >=77: the `license = "MIT"` SPDX-string form (PEP 639) is only accepted from
-# setuptools 77.0.0; older versions require the `{text=...}` table and reject
-# the string with a schema error. Keeping the floor honest so `--no-build-
-# isolation` installs fail with a clear version message, not a cryptic one.
-requires = ["setuptools>=77"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,7 +8,7 @@ name = "b64-k8s-secrets-tool"
 # value is just a placeholder so the project is installable for dev/test.
 version = "0.0.0"
 description = "A dark-themed Tkinter GUI for working with Kubernetes secrets: encode/decode base64, build Secret YAML from a .env file, fetch existing secrets from a cluster (read-only), and seal them with kubeseal."
-license = "MIT"
+license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml",
