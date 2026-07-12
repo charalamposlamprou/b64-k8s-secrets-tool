@@ -1,5 +1,12 @@
 [build-system]
-requires = ["setuptools>=61"]
+# >=77: required by `license = "MIT"` below (PEP 639 SPDX-string form). The
+# older `license = {text = ...}` table form works on a lower floor, but
+# setuptools has announced its removal (2027-02-18) — the SPDX string is the
+# only currently non-deprecated option, so this floor isn't optional strictness.
+# It costs nothing here: every install path in this repo (make/CI/install.sh)
+# uses default build isolation, which always resolves current setuptools
+# regardless of the declared floor.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +15,7 @@ name = "b64-k8s-secrets-tool"
 # value is just a placeholder so the project is installable for dev/test.
 version = "0.0.0"
 description = "A dark-themed Tkinter GUI for working with Kubernetes secrets: encode/decode base64, build Secret YAML from a .env file, fetch existing secrets from a cluster (read-only), and seal them with kubeseal."
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml",
