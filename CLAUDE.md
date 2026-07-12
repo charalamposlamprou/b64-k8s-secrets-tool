@@ -87,21 +87,16 @@ Loading/importing a secret populates three parallel pieces of state:
 verbatim), `_tpl_carry` (labels/annotations/`immutable` carried through from
 the source doc, via `core.secret_carryover`), and `_tpl_skipped` (count of
 malformed metadata fields dropped rather than silently corrupted). They are
-reset on **different** paths, not one shared choke point — this split is the
-usual source of "a load path forgot to reset X" bugs, so trace it fully before
-adding a fourth:
-
-- `_tpl_binary` is reset wherever the KV rows are (re)populated: `_apply_secret_doc`
-  (full doc load), `_kv_drop_binary` (the identity-only load path,
-  `_apply_identity_only`), and directly in `_browse_env` / `_clear_env`.
-- `_tpl_carry` / `_tpl_skipped` are recomputed in `_set_secret_identity` (reached
-  by *both* doc-driven load paths) and reset directly in `_browse_env` / `_clear_env`.
-
-Note `_set_secret_identity` does **not** touch `_tpl_binary` (the row-population
-step already did). The invariant to preserve: every path that replaces the
-editor's secret must leave all three consistent with the newly-loaded (or
-empty) secret. When adding a fourth piece of per-secret state, decide which of
-those paths it belongs on and cover all of them.
+reset on different paths, not one shared choke point — the usual source of
+"a load path forgot to reset X" bugs. Before changing any code that replaces
+the editor's secret, grep for every `self._tpl_binary =` / `self._tpl_carry` /
+`self._tpl_skipped` assignment (the call sites shift as this area gets
+refactored — don't trust a stale list of function names) and confirm your
+change leaves all three consistent with the newly-loaded (or empty) secret.
+One sharp edge: the identity-population step does **not** touch `_tpl_binary`
+— that's reset separately wherever the KV rows themselves are (re)populated.
+When adding a fourth piece of per-secret state, trace where it belongs the
+same way.
 
 ### Status messaging
 
