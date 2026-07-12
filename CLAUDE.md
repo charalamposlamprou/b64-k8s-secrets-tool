@@ -57,10 +57,13 @@ mirrored by `tests/test_core.py` and `tests/test_app.py`.
 
 Every `kubectl`/`kubeseal` invocation goes through `run_bg()` (module-level
 helper): it runs the subprocess on a daemon thread and marshals the result
-back to the main thread via `self.after(0, callback)`. Never call `subprocess.run`
-directly from a UI callback. `_run_async` is the equivalent for non-subprocess
-background work (e.g. the clipboard write on Linux, which shells out to
-`xclip`/`xsel`).
+back to the main thread via `self.after(0, callback)` with a `(stdout, stderr,
+returncode)` callback contract (plus sentinel codes for not-found/timeout).
+Never call `subprocess.run` directly from a UI callback. `_run_async(work,
+done)` is the more general form — it runs any callable on a daemon thread and
+delivers its return value to `done(result)` — for background work whose result
+doesn't fit `run_bg`'s stdout/stderr/rc shape (e.g. the Linux clipboard write,
+which is itself a subprocess but returns a plain success bool).
 
 ### The staleness guard: `_out_gen` / `_dispatch_gen` / `_discard_stale`
 
@@ -77,16 +80,28 @@ flight, the result is stale and gets discarded rather than applied. `_do_seal`/
 it for any new background op that writes into those panes rather than
 inventing a one-off guard.
 
-### Per-secret state that must be reset together
+### Per-secret state that must stay consistent
 
-Loading/importing a secret populates three parallel pieces of state that all
-need to move in lockstep: `_tpl_binary` (base64 values that can't round-trip
-as plaintext — re-emitted verbatim), `_tpl_carry` (labels/annotations/
-`immutable` carried through from the source doc, via `core.secret_carryover`),
-and `_tpl_skipped` (count of malformed metadata fields dropped rather than
-silently corrupted). All three are reset together at every entry point that
-replaces the editor's secret (`_browse_env`, `_clear_env`, `_set_secret_identity`).
-If you add a fourth piece of per-secret state, reset it at all of those sites too.
+Loading/importing a secret populates three parallel pieces of state:
+`_tpl_binary` (base64 values that can't round-trip as plaintext — re-emitted
+verbatim), `_tpl_carry` (labels/annotations/`immutable` carried through from
+the source doc, via `core.secret_carryover`), and `_tpl_skipped` (count of
+malformed metadata fields dropped rather than silently corrupted). They are
+reset on **different** paths, not one shared choke point — this split is the
+usual source of "a load path forgot to reset X" bugs, so trace it fully before
+adding a fourth:
+
+- `_tpl_binary` is reset wherever the KV rows are (re)populated: `_apply_secret_doc`
+  (full doc load), `_kv_drop_binary` (the identity-only load path,
+  `_apply_identity_only`), and directly in `_browse_env` / `_clear_env`.
+- `_tpl_carry` / `_tpl_skipped` are recomputed in `_set_secret_identity` (reached
+  by *both* doc-driven load paths) and reset directly in `_browse_env` / `_clear_env`.
+
+Note `_set_secret_identity` does **not** touch `_tpl_binary` (the row-population
+step already did). The invariant to preserve: every path that replaces the
+editor's secret must leave all three consistent with the newly-loaded (or
+empty) secret. When adding a fourth piece of per-secret state, decide which of
+those paths it belongs on and cover all of them.
 
 ### Status messaging
 

@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=61"]
+# >=77: the `license = "MIT"` SPDX-string form (PEP 639) is only accepted from
+# setuptools 77.0.0; older versions require the `{text=...}` table and reject
+# the string with a schema error. Keeping the floor honest so `--no-build-
+# isolation` installs fail with a clear version message, not a cryptic one.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
