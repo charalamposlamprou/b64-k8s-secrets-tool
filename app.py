@@ -317,7 +317,10 @@ class App(tk.Tk):
     def _build_status_bar(self):
         bar = tk.Frame(self, bg=BG, height=26)
         bar.pack(side="bottom", fill="x")
-        tk.Frame(self, bg=BORDER, height=1).pack(side="bottom", fill="x")
+        # Kept as an attribute so the warning bar can anchor its position to
+        # this separator (pack after=) rather than relying on packing order.
+        self._status_sep = tk.Frame(self, bg=BORDER, height=1)
+        self._status_sep.pack(side="bottom", fill="x")
         tk.Label(bar, text=f"v{__version__}", bg=BG, fg=FGDIM,
                  anchor="e", padx=10, font=(SANS, SZ - 1)).pack(side="right")
         self._status_var = tk.StringVar(value="Ready")
@@ -330,12 +333,10 @@ class App(tk.Tk):
         # (outside the notebook) so it's visible on EVERY tab — including Seal,
         # where the highest-stakes action happens — not just the Encode tab
         # where the loss is detected. Created hidden; _refresh_skip_warning
-        # packs it (just above the status bar) while _tpl_skipped is nonzero.
-        self._warn_var = tk.StringVar(value="")
-        self._warn_bar = tk.Frame(self, bg=BG)
-        tk.Label(self._warn_bar, textvariable=self._warn_var, bg=BG, fg=ERR_C,
-                 anchor="w", padx=10, pady=2, font=(SANS, SZ - 1)) \
-            .pack(side="left", fill="x")
+        # shows it (anchored just above the status separator) while
+        # _tpl_skipped is nonzero.
+        self._warn_lbl = tk.Label(self, bg=BG, fg=ERR_C, anchor="w",
+                                  padx=10, pady=2, font=(SANS, SZ - 1))
 
     def _status(self, msg: str, kind: str = "dim", duration_ms: int = 4000):
         color = {"ok": OK_C, "err": ERR_C, "dim": FGDIM}.get(kind, FGDIM)
@@ -737,21 +738,28 @@ class App(tk.Tk):
         success messages and is visible on every tab, needing no lucky glance
         within the status-bar timeout."""
         if self._tpl_skipped:
-            self._warn_var.set(
+            self._warn_lbl.configure(text=(
                 f"⚠  {self._tpl_skipped} invalid metadata field(s) in the "
-                "loaded secret — missing from generated / sealed YAML")
-            self._warn_bar.pack(side="bottom", fill="x")
+                "loaded secret — missing from generated / sealed YAML"))
+            # after= the separator pins the position (just above the status
+            # bar) structurally, so a later side="bottom" widget elsewhere
+            # can't silently reorder it.
+            self._warn_lbl.pack(side="bottom", fill="x", after=self._status_sep)
         else:
-            self._warn_bar.pack_forget()
+            self._warn_lbl.pack_forget()
 
-    def _status_output(self, msg):
+    def _status_output(self, msg, skipped=None):
         """Status for an operation whose result derives from the generated
         YAML (Generate / Save / Seal / Copy). While the carryover skipped
         fields, an unqualified green success would contradict the pending loss
-        — so the message carries the skip count and warning severity instead."""
-        if self._tpl_skipped:
-            self._status(f"{msg} — {self._tpl_skipped} invalid metadata "
-                         "field(s) skipped", "err", duration_ms=WARN_DURATION_MS)
+        — so the message carries the skip count and warning severity instead.
+        `skipped` defaults to the live count; callers whose result was captured
+        earlier (an async clipboard write) pass the count frozen at that time
+        so the confirmation describes the copied payload, not later state."""
+        n = self._tpl_skipped if skipped is None else skipped
+        if n:
+            self._status(f"{msg} — {n} invalid metadata field(s) skipped",
+                         "err", duration_ms=WARN_DURATION_MS)
         else:
             self._status(msg, "ok")
 
@@ -1634,22 +1642,29 @@ class App(tk.Tk):
         leaves the app — its confirmation carries the skip count like Save/Seal
         rather than an unqualified 'Copied'."""
         payload = text.rstrip("\n")
+        # Freeze the skip count NOW: the clipboard write below is async on
+        # Linux, and _tpl_skipped can change (Clear / load another secret)
+        # before _clip_done fires — the confirmation must describe the payload
+        # actually copied, not whatever state the editor drifted to.
+        skipped = self._tpl_skipped if qualify else None
         # On X11 the Tk clipboard is lost when the app exits, so prefer a real
         # clipboard manager (xclip/xsel) that keeps the value after we quit. It
         # can block, so run it off the UI thread and fall back to the Tk
         # clipboard (handled on the main thread by _clip_done).
         if sys.platform.startswith("linux"):
             self._run_async(lambda: self._clip_external(payload),
-                            lambda ok: self._clip_done(ok, payload, qualify))
+                            lambda ok: self._clip_done(ok, payload, qualify,
+                                                       skipped))
         else:
-            self._clip_done(False, payload, qualify)
+            self._clip_done(False, payload, qualify, skipped)
 
-    def _clip_done(self, external_ok: bool, payload: str, qualify: bool = False):
+    def _clip_done(self, external_ok: bool, payload: str, qualify: bool = False,
+                   skipped=None):
         if not external_ok:  # no external tool — Tk clipboard (lost on exit)
             self.clipboard_clear()
             self.clipboard_append(payload)
         if qualify:
-            self._status_output("Copied to clipboard")
+            self._status_output("Copied to clipboard", skipped=skipped)
         else:
             self._status("Copied to clipboard", "ok")
 
