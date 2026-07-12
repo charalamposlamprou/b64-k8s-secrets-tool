@@ -39,5 +39,4 @@ certs/
 .DS_Store
 
 # Editor / tooling
-.claude/
 .vscode/
