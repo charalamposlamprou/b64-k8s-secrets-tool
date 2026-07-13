@@ -382,7 +382,7 @@ def test_load_template_empty_secret_loads_identity_only():
         win._kv_set_pairs([("KEEP", "me")])
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", win._kv_edit_gen,
                           "apiVersion: v1\nkind: Secret\nmetadata:\n"
                           "  name: hollow\n  namespace: prod\n"
                           "type: kubernetes.io/tls\n",
@@ -413,7 +413,7 @@ def test_identity_only_load_invalidates_and_drops_binary():
         gen = win._out_gen  # a seal dispatched under the old identity
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", win._kv_edit_gen,
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)
 
@@ -541,10 +541,11 @@ def test_stale_template_result_is_discarded_after_repopulation():
     win = _make_win()
     try:
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
-        gen = win._out_gen  # generation the fetch was dispatched under
-        win._kv_set_pairs([("FRESH", "import")])  # repopulation bumps it
+        gen = win._out_gen          # generation the fetch was dispatched under
+        kv_gen = win._kv_edit_gen   # ditto, row-edit generation
+        win._kv_set_pairs([("FRESH", "import")])  # repopulation bumps both
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", kv_gen,
                           "kind: Secret\ndata:\n  old: c3RhbGU=\n", "", 0, gen)
 
         assert win._kv_get_pairs() == {"FRESH": "import"}  # not clobbered
@@ -726,13 +727,13 @@ def test_load_template_repoints_file_label_to_cluster():
         win._env_lbl.configure(text="/tmp/imported.yaml")
         win._enc_ctx.set("c"); win._enc_ns.set("prod"); win._enc_sec.set("s")
 
-        win._got_template("c", "prod", "s",
+        win._got_template("c", "prod", "s", win._kv_edit_gen,
                           "kind: Secret\ndata:\n  token: c2VjcmV0\n", "", 0,
                           win._out_gen)
         assert win._env_lbl.cget("text") == "(cluster: prod/s)"
 
         win._env_lbl.configure(text="/tmp/imported.yaml")
-        win._got_template("c", "prod", "s",
+        win._got_template("c", "prod", "s", win._kv_edit_gen,
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)  # identity-only branch
         assert win._env_lbl.cget("text") == "(cluster: prod/s)"
@@ -891,7 +892,7 @@ def test_identity_only_binary_drop_uses_warning_severity():
         win._kv_set_pairs([("KEEP", "me")], binary={"tls.key": "QUJD"})
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", win._kv_edit_gen,
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)
 
@@ -969,5 +970,77 @@ def test_dispatch_latest_drops_superseded_result(monkeypatch):
         landings[0]("out1", "", 0)   # older lands last — must be dropped
 
         assert got == [("new", "out2")]
+    finally:
+        win.destroy()
+
+
+def test_browse_read_discards_result_after_concurrent_row_edit(monkeypatch, tmp_path):
+    """A Browse .env read is async (so the UI stays live while it runs); if
+    the user directly edits a KV row (add/type, no Generate, no selector
+    change) before the read lands, applying the read must not silently
+    overwrite that edit — the race the async-I/O fix itself opened."""
+    win = _make_win()
+    try:
+        path = tmp_path / "x.env"
+        path.write_text("NEW=1\n")
+        monkeypatch.setattr(app.filedialog, "askopenfilename",
+                            lambda **k: str(path))
+        captured = {}
+        monkeypatch.setattr(win, "_read_file_async",
+                            lambda path, key, done: captured.setdefault("done", done))
+        win._kv_set_pairs([("EXISTING", "value")])
+
+        win._browse_env()               # dispatches; read hasn't "landed" yet
+        win._kv_add_row("NEWKEY", "newval")  # user edits mid-read
+        captured["done"](str(path), "NEW=1\n")  # the read finally lands
+
+        assert win._kv_get_pairs() == {"EXISTING": "value", "NEWKEY": "newval"}
+        assert "KV rows changed" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_load_template_discards_result_after_concurrent_row_edit():
+    """Same race as above for the kubectl fetch path: a Load Template result
+    landing after a direct row edit (no selector change, so the (ctx,ns,sec)
+    guard alone wouldn't catch it) must be discarded, not silently applied."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("EXISTING", "value")])
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+        kv_gen = win._kv_edit_gen   # captured at dispatch time
+        gen = win._out_gen
+
+        win._kv_add_row("NEWKEY", "newval")  # user edits mid-fetch
+
+        win._got_template("c", "n", "s", kv_gen,
+                          "kind: Secret\ndata:\n  token: c2VjcmV0\n", "", 0, gen)
+
+        assert win._kv_get_pairs() == {"EXISTING": "value", "NEWKEY": "newval"}
+        assert "KV rows changed" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_kubectl_rc_error_consistent_across_call_sites():
+    """_got_contexts/_got_controller (and the other kubectl landing
+    callbacks) map run_bg's not-found sentinel through the same
+    _kubectl_rc_error helper, so a missing kubectl reads identically
+    everywhere instead of five near-but-not-quite-identical strings."""
+    win = _make_win()
+    try:
+        assert win._kubectl_rc_error(-1) == "kubectl not in PATH"
+        assert win._kubectl_rc_error(-2) == "kubectl timed out"
+        assert win._kubectl_rc_error(0) is None
+
+        win._got_contexts("", "Command not found: kubectl", -1)
+        ctx_msg = win._status_var.get()
+
+        win._seal_ctx.set("ctxA")
+        win._got_controller("ctxA", "", "Command not found: kubectl", -1)
+        controller_msg = win._status_var.get()
+
+        assert ctx_msg == controller_msg == "kubectl not in PATH"
     finally:
         win.destroy()

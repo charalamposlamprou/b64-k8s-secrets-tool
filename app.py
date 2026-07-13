@@ -172,6 +172,18 @@ class App(tk.Tk):
         # repopulated is stale (it describes the previous secret) and is
         # discarded instead of resurrecting the just-cleared output pane.
         self._out_gen = 0
+        # KV row generation, bumped by _kv_row_edited on every row add/
+        # remove/key-or-value edit — including internal rebuilds by
+        # _kv_set_pairs/_kv_clear, which is fine: a fresh rebuild while an
+        # older read is still in flight makes that read stale too. Separate
+        # from _out_gen (which only tracks the generated/sealed OUTPUT panes,
+        # not the raw row content) because bumping _out_gen on every
+        # keystroke would wrongly stale an in-flight seal of unchanged
+        # _yaml_out text. A background op that replaces rows on landing
+        # (_read_editor_file, _got_template) captures this at dispatch and
+        # discards via _discard_if_kv_edited if it moved — an in-place row
+        # edit isn't caught by _out_gen the way a full repopulation is.
+        self._kv_edit_gen = 0
 
         self._enc_ctx = tk.StringVar()
         self._enc_ns  = tk.StringVar()
@@ -665,6 +677,10 @@ class App(tk.Tk):
             val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ), show="•")
             rd["val_e"] = val_e
             rd["shown"] = False
+            # Typing a key or value (including via the Edit… popup, which
+            # writes through `var`) bumps _kv_edit_gen — see its docstring.
+            key_e.bind("<KeyRelease>", self._kv_row_edited)
+            var.trace_add("write", self._kv_row_edited)
             show_b = ttk.Button(row, text="Show", style="Icon.TButton",
                                 command=lambda: self._kv_toggle_show(rd))
             rd["show_b"] = show_b
@@ -678,9 +694,19 @@ class App(tk.Tk):
             val_e.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
         self._kv_rows.append(rd)
+        self._kv_row_edited()
         if focus:
             key_e.focus_set()
         return rd
+
+    def _kv_row_edited(self, *_args):
+        """A KV row was added, removed, or its key/value text changed —
+        including internal rebuilds by _kv_set_pairs/_kv_clear, where it's a
+        harmless extra bump. Bound to _kv_add_row/_kv_del_row and, for
+        editable rows, to the key Entry's <KeyRelease> and the value
+        StringVar's write trace (also covers the Edit… popup, which writes
+        through the same var). See self._kv_edit_gen for what reads this."""
+        self._kv_edit_gen += 1
 
     def _kv_del_row(self, rd):
         if rd in self._kv_rows:
@@ -688,6 +714,7 @@ class App(tk.Tk):
         if rd["binary"]:
             self._tpl_binary.pop(rd["key"], None)  # drop its passthrough value
         rd["frame"].destroy()
+        self._kv_row_edited()
         if not self._kv_rows:  # always keep at least one editable row
             self._kv_add_row()
 
@@ -709,16 +736,10 @@ class App(tk.Tk):
                 self._kv_set_row_visible(rd, show)
 
     def _kv_clear(self):
-        # Per-secret state is reset HERE, at the row-replacement choke point
-        # (see _kv_set_pairs) — not left to caller discipline.
-        self._tpl_binary = {}
-        self._tpl_carry = {}
-        self._tpl_skipped = 0
-        for rd in list(self._kv_rows):
-            rd["frame"].destroy()
-        self._kv_rows.clear()
-        self._kv_add_row()
-        self._invalidate_outputs()
+        # An empty _kv_set_pairs IS "clear": same reset, same destroy-all-rows
+        # loop, same single-blank-row fallback, same _invalidate_outputs() —
+        # no reason to re-implement the choke point instead of calling it.
+        self._kv_set_pairs([])
 
     def _kv_drop_binary(self):
         """Delete every binary marker row along with its _tpl_binary
@@ -1328,6 +1349,20 @@ class App(tk.Tk):
                      f"{hint}", "err")
         return True
 
+    def _discard_if_kv_edited(self, kv_gen, verb) -> bool:
+        """True (with an explanatory status) when the KV rows were added to,
+        removed from, or edited while `verb`'s background op was in flight —
+        applying the result now would silently overwrite that in-progress
+        edit. The row-level counterpart of _discard_stale: _out_gen doesn't
+        move on a plain row add/edit/delete (see self._kv_edit_gen), so a
+        background op that's about to replace all rows (_read_editor_file,
+        _got_template) must check this too, not _discard_stale alone."""
+        if kv_gen == self._kv_edit_gen:
+            return False
+        self._status(f"KV rows changed during {verb} — discarded to avoid "
+                     "overwriting your edit", "err")
+        return True
+
     @staticmethod
     def _kubeseal_rc_error(rc):
         """Map run_bg's sentinel return codes to a status message, or None."""
@@ -1335,6 +1370,19 @@ class App(tk.Tk):
             return "kubeseal not in PATH"
         if rc == -2:
             return "kubeseal timed out"
+        return None
+
+    @staticmethod
+    def _kubectl_rc_error(rc):
+        """The kubectl counterpart of _kubeseal_rc_error: every kubectl
+        landing callback (_got_contexts/_got_controller/_got_ns/_got_secrets/
+        _got_template) should check this before falling back to its own
+        descriptive message, so a missing/timed-out kubectl reads the same
+        way everywhere instead of five near-but-not-quite-identical strings."""
+        if rc == -1:
+            return "kubectl not in PATH"
+        if rc == -2:
+            return "kubectl timed out"
         return None
 
     def _on_sealed(self, stdout, stderr, rc, gen):
@@ -1440,10 +1488,10 @@ class App(tk.Tk):
                               self._got_contexts)
 
     def _got_contexts(self, stdout, stderr, rc):
-        if rc == -1:
-            self._status("kubectl not in PATH", "err"); return
         if rc != 0:
-            self._status(f"kubectl error: {stderr.strip()[:60]}", "err"); return
+            self._status(self._kubectl_rc_error(rc) or
+                         f"kubectl error: {stderr.strip()[:60]}", "err")
+            return
         ctxs = [c.strip() for c in stdout.splitlines() if c.strip()]
         self._ctx_cb["values"] = ctxs
         self._seal_ctx_cb["values"] = ctxs
@@ -1501,9 +1549,10 @@ class App(tk.Tk):
         self._refresh_action_buttons()
         if rc != 0:
             # Say so — a silent return leaves blank Controller fields with no
-            # explanation (run_bg substitutes clean text for its sentinels).
-            self._status("Controller detection failed: "
-                         f"{stderr.strip()[:60]}", "err")
+            # explanation.
+            self._status(self._kubectl_rc_error(rc) or
+                         f"Controller detection failed: {stderr.strip()[:60]}",
+                         "err")
             return
         svcs = []
         for line in stdout.splitlines():
@@ -1532,7 +1581,9 @@ class App(tk.Tk):
         if ctx != self._enc_ctx.get():
             return
         if rc != 0:
-            self._status(f"Namespace fetch failed: {stderr.strip()[:60]}", "err"); return
+            self._status(self._kubectl_rc_error(rc) or
+                         f"Namespace fetch failed: {stderr.strip()[:60]}", "err")
+            return
         nss = stdout.strip().split()
         self._ns_cb["values"] = nss
         if nss:
@@ -1556,7 +1607,8 @@ class App(tk.Tk):
         if rc != 0:
             # Say so — a silent return leaves an empty Secret combobox that
             # reads as "no secrets in this namespace".
-            self._status(f"Secret list fetch failed: {stderr.strip()[:60]}",
+            self._status(self._kubectl_rc_error(rc) or
+                         f"Secret list fetch failed: {stderr.strip()[:60]}",
                          "err")
             return
         secs = stdout.strip().split()
@@ -1571,15 +1623,16 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "secret", sec,
                f"--context={ctx}", f"--namespace={ns}", "-o", "yaml"]
         self._load_btn.configure(state="disabled")
+        kv_gen = self._kv_edit_gen
         # Via _dispatch_gen: the template write must also be discarded if the
         # editor is repopulated (Import / Browse / Clear) while kubectl runs —
         # the (ctx, ns, sec) check below only catches *selection* changes.
         self._dispatch_gen(cmd,
                            lambda o, e, r, gen: self._got_template(
-                               ctx, ns, sec, o, e, r, gen),
+                               ctx, ns, sec, kv_gen, o, e, r, gen),
                            None)
 
-    def _got_template(self, ctx, ns, sec, stdout, stderr, rc, gen):
+    def _got_template(self, ctx, ns, sec, kv_gen, stdout, stderr, rc, gen):
         # Re-enable the button regardless — the load attempt is done — *before*
         # the stale checks, or a discarded result would leave it stuck disabled.
         self._load_btn.configure(state="normal" if PYYAML_OK else "disabled")
@@ -1594,12 +1647,20 @@ class App(tk.Tk):
         if self._discard_stale(gen, "the template load"):
             return
         if rc != 0:
-            self._status(f"kubectl error: {stderr.strip()[:80]}", "err"); return
+            self._status(self._kubectl_rc_error(rc) or
+                         f"kubectl error: {stderr.strip()[:80]}", "err")
+            return
         try:
             doc = yaml.safe_load(stdout)
         except yaml.YAMLError as e:
             self._status(f"YAML parse error: {e}", "err"); return
 
+        # ...or the user directly edited a row (add/remove/retype) without
+        # touching the selectors either — same clobber risk as the repopulation
+        # case above, but _out_gen doesn't move on a plain row edit, so it
+        # needs its own check (see _kv_edit_gen).
+        if self._discard_if_kv_edited(kv_gen, "the template load"):
+            return
         entries = secret_entries(doc)
         if not entries:
             dropped = self._apply_identity_only(doc, fb_name=sec, fb_ns=ns)
@@ -1804,14 +1865,20 @@ class App(tk.Tk):
 
     def _read_editor_file(self, path: str, done):
         """_read_file_async for files headed into the KV editor (Browse .env /
-        Import Secret…): the two share one newest-wins key, plus the
-        generation guard — a Load Template / Clear that repopulated the
-        editor while the read ran makes this result stale (same rule as
-        _dispatch_gen results)."""
+        Import Secret…): the two share one newest-wins key, plus two
+        staleness checks on landing — _discard_stale for a Load Template /
+        Clear that repopulated the editor while the read ran (same rule as
+        _dispatch_gen results), and _discard_if_kv_edited for the read's own
+        rows being edited directly (add/remove/edit a row without
+        repopulating) — a plain row edit doesn't bump _out_gen, so only the
+        second check catches it."""
         gen = self._out_gen
+        kv_gen = self._kv_edit_gen
 
         def landed(p, text):
             if self._discard_stale(gen, "the file read"):
+                return
+            if self._discard_if_kv_edited(kv_gen, "the file read"):
                 return
             done(p, text)
         self._read_file_async(path, "editor-read", landed)

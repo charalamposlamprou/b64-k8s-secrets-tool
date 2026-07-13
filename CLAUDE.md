@@ -105,8 +105,21 @@ older prod result could land last, overwriting the newer one or clearing the
 `_ctl_pending` guard while the newer lookup still runs) — the token handles
 that ordering. `_read_file_async` reuses the same tokens so a newer file pick
 supersedes a hung read. New fetch call sites should come through
-`_dispatch_latest` — it is also the one place the `self.after` marshal to the
-UI thread is written.
+`_dispatch_latest` rather than hand-rolling the wrapper — it's not the *only*
+place a `self.after` marshal is written (`_dispatch_gen` and `_run_async`
+each write their own), but it's the one built for this per-key-supersession
+shape.
+
+A background op that's about to *replace all KV rows* (`_read_editor_file`,
+`_got_template`) needs a THIRD check beyond `_out_gen`: `_kv_edit_gen`, bumped
+by `_kv_row_edited` on every row add/remove/key-or-value edit. `_out_gen`
+only moves when the output panes' generation changes (a full repopulation, or
+`_gen_yaml`) — a plain in-place row edit (type a new value, click "+", click
+"✕") doesn't touch it, so a slow file read or template fetch landing after
+such an edit would sail past `_discard_stale` and silently clobber the edit.
+`_discard_if_kv_edited(kv_gen, verb)` is the row-level counterpart of
+`_discard_stale`; any op that replaces rows on landing should capture
+`self._kv_edit_gen` at dispatch and check both.
 
 ### Per-secret state that must stay consistent
 
@@ -116,8 +129,9 @@ verbatim), `_tpl_carry` (labels/annotations/`immutable` carried through from
 the source doc, via `core.secret_carryover`), and `_tpl_skipped` (count of
 malformed metadata fields dropped rather than silently corrupted). The
 row-replacement choke points own the reset: `_kv_set_pairs(pairs, binary=…)`
-installs the binary passthrough and zeroes carry/skipped, `_kv_clear` zeroes
-all three, and `_set_secret_identity` assigns the newly loaded doc's
+installs the binary passthrough and zeroes carry/skipped — `_kv_clear` is
+just `_kv_set_pairs([])`, not a separate reset — and `_set_secret_identity`
+assigns the newly loaded doc's
 carry/skipped right after (`_apply_secret_doc` relies on that ordering — rows
 first, then identity). Don't reset the trio caller-side; pass `binary=` to
 the choke point instead. One sharp edge remains: the identity-only load
