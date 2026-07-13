@@ -173,7 +173,10 @@ class App(tk.Tk):
         # discarded instead of resurrecting the just-cleared output pane.
         self._out_gen = 0
         # KV row generation, bumped by _kv_row_edited on every row add/
-        # remove/key-or-value edit — including internal rebuilds by
+        # remove, and on a key-or-value edit that actually changes the text
+        # (filtered through _kv_key_edited/_kv_value_edited, which ignore a
+        # same-value StringVar .set() so a false bump can't discard an
+        # unrelated in-flight read/fetch) — including internal rebuilds by
         # _kv_set_pairs/_kv_clear, which is fine: a fresh rebuild while an
         # older read is still in flight makes that read stale too. Separate
         # from _out_gen (which only tracks the generated/sealed OUTPUT panes,
@@ -654,12 +657,13 @@ class App(tk.Tk):
         Edit… popup for long values."""
         row = ttk.Frame(self._kv_frame); row.pack(fill="x", pady=1)
         var = tk.StringVar(value=value)
+        key_var = tk.StringVar(value=key)
         rd = {"frame": row, "binary": binary, "key": key, "var": var}
 
-        key_e = ttk.Entry(row, font=(MONO, SZ), width=22)
-        key_e.insert(0, key)
+        key_e = ttk.Entry(row, textvariable=key_var, font=(MONO, SZ), width=22)
         key_e.pack(side="left", padx=(0, 6))
         rd["key_e"] = key_e
+        rd["key_var"] = key_var  # kept alive on rd — see _kv_key_edited
         rd["key_text"] = key  # last-seen text, for _kv_key_edited's comparison
 
         if binary:
@@ -679,15 +683,17 @@ class App(tk.Tk):
             rd["val_e"] = val_e
             rd["shown"] = False
             rd["value_text"] = value  # last-seen text, for _kv_value_edited
-            # Typing a key or value (including via the Edit… popup, which
-            # writes through `var`) bumps _kv_edit_gen — see its docstring.
-            # Compare against the last-seen text rather than bumping
-            # unconditionally: <KeyRelease> also fires on pure cursor
-            # movement (arrows, Tab, Home/End) and the trace also fires on a
-            # same-value .set() (e.g. Edit… Save with no change), neither of
-            # which is a real edit — bumping on those would falsely discard
-            # an unrelated in-flight read/fetch that's actually still valid.
-            key_e.bind("<KeyRelease>", lambda _e: self._kv_key_edited(rd))
+            # A write trace on both fields' backing StringVars — rather than
+            # a <KeyRelease> bind on the key Entry — catches every way the
+            # text can change: typing, any paste method (including X11
+            # middle-click, which fires no keyboard event at all and so
+            # would be invisible to a <KeyRelease> bind), or the Edit… popup
+            # (which writes through `var`). Compare against the last-seen
+            # text rather than bumping unconditionally: the trace also fires
+            # on a same-value .set() (e.g. Edit… Save with no change), which
+            # isn't a real edit — bumping on that would falsely discard an
+            # unrelated in-flight read/fetch that's actually still valid.
+            key_var.trace_add("write", lambda *_a: self._kv_key_edited(rd))
             var.trace_add("write", lambda *_a: self._kv_value_edited(rd))
             show_b = ttk.Button(row, text="Show", style="Icon.TButton",
                                 command=lambda: self._kv_toggle_show(rd))
@@ -716,12 +722,10 @@ class App(tk.Tk):
         self._kv_edit_gen += 1
 
     def _kv_key_edited(self, rd):
-        """<KeyRelease> handler for a row's key Entry: bump _kv_edit_gen only
-        if the text actually changed. <KeyRelease> also fires on pure cursor
-        movement (arrows, Tab, Home/End) with no content change — bumping
-        unconditionally would falsely discard an unrelated in-flight
-        read/fetch that's actually still valid."""
-        text = rd["key_e"].get()
+        """Write-trace handler for a row's key StringVar: bump _kv_edit_gen
+        only if the text actually changed. Mirrors _kv_value_edited (the
+        trace also fires on a same-value .set(), which isn't a real edit)."""
+        text = rd["key_var"].get()
         if text != rd["key_text"]:
             rd["key_text"] = text
             self._kv_row_edited()

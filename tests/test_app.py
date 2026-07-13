@@ -1047,22 +1047,41 @@ def test_kubectl_rc_error_consistent_across_call_sites():
         win.destroy()
 
 
-def test_kv_key_edited_ignores_navigation_only_keyrelease():
-    """<KeyRelease> also fires on pure cursor movement (arrows, Tab,
-    Home/End), not just actual typing. _kv_key_edited must only bump
-    _kv_edit_gen when the key text actually changed, or an unrelated
-    in-flight read/fetch gets falsely discarded on a stray arrow-key press."""
+def test_kv_key_edited_ignores_noop_set():
+    """The key StringVar's write trace also fires on a same-value .set()
+    (calling _kv_key_edited with no actual change) — it must only bump
+    _kv_edit_gen when the text actually changed, or an unrelated in-flight
+    read/fetch gets falsely discarded."""
     win = _make_win()
     try:
         rd = win._kv_add_row("KEY", "value")
         gen = win._kv_edit_gen
 
-        win._kv_key_edited(rd)          # simulates KeyRelease, no text change
+        rd["key_var"].set("KEY")        # same value — a no-op re-set
         assert win._kv_edit_gen == gen  # not bumped
 
-        rd["key_e"].insert("end", "2")  # an actual edit
-        win._kv_key_edited(rd)
+        rd["key_var"].set("KEY2")       # an actual edit
         assert win._kv_edit_gen == gen + 1
+    finally:
+        win.destroy()
+
+
+def test_kv_key_edited_catches_non_keyboard_text_change():
+    """The key field is textvariable-bound (not a raw <KeyRelease> bind)
+    specifically so a non-keyboard edit — e.g. X11 middle-click paste, or
+    any other path that changes the Entry's displayed text without a key
+    event — still bumps _kv_edit_gen. Simulated here via .insert(), which is
+    exactly how such a paste lands: no keyboard event, just an Entry-content
+    mutation that Tk syncs to the bound StringVar (and hence the trace)."""
+    win = _make_win()
+    try:
+        rd = win._kv_add_row("KEY", "value")
+        gen = win._kv_edit_gen
+
+        rd["key_e"].insert("end", "2")  # content changes with no KeyRelease
+
+        assert win._kv_edit_gen == gen + 1  # still caught
+        assert rd["key_var"].get() == "KEY2"
     finally:
         win.destroy()
 

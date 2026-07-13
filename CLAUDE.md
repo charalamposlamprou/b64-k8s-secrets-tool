@@ -112,14 +112,23 @@ shape.
 
 A background op that's about to *replace all KV rows* (`_read_editor_file`,
 `_got_template`) needs a THIRD check beyond `_out_gen`: `_kv_edit_gen`, bumped
-by `_kv_row_edited` on every row add/remove/key-or-value edit. `_out_gen`
-only moves when the output panes' generation changes (a full repopulation, or
+by `_kv_row_edited` on every row add/remove, and — via `_kv_key_edited`/
+`_kv_value_edited` — on a key-or-value edit that actually changes the text
+(both fields' Entries are `textvariable`-bound, with a write trace on each
+StringVar; `_kv_key_edited`/`_kv_value_edited` filter out a same-value
+`.set()`, which fires the trace but isn't a real edit). `_out_gen` only moves
+when the output panes' generation changes (a full repopulation, or
 `_gen_yaml`) — a plain in-place row edit (type a new value, click "+", click
 "✕") doesn't touch it, so a slow file read or template fetch landing after
 such an edit would sail past `_discard_stale` and silently clobber the edit.
 `_discard_if_kv_edited(kv_gen, verb)` is the row-level counterpart of
 `_discard_stale`; any op that replaces rows on landing should capture
-`self._kv_edit_gen` at dispatch and check both.
+`self._kv_edit_gen` at dispatch and check both. Both fields use a
+`textvariable` write trace rather than a raw `<KeyRelease>` bind
+specifically because a bind only sees keyboard-driven edits — a non-keyboard
+mutation (e.g. X11 middle-click paste, which inserts the primary selection
+with no keyboard event at all) would leave the key/value text changed but
+`_kv_edit_gen` un-bumped.
 
 ### Per-secret state that must stay consistent
 
