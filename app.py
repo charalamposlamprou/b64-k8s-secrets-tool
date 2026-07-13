@@ -162,11 +162,24 @@ class App(tk.Tk):
         # SAME value in flight, which value-equality landing guards (e.g.
         # _got_ns's ctx check) cannot tell apart.
         self._latest_tok = {}
+        # Successful controller detections, context → (ns, name). Detection is
+        # a cluster-wide `kubectl get svc -A` — multi-second on a big cluster,
+        # with Seal/Validate blocked while it runs — so flipping back to an
+        # already-detected context reuses the result instead of re-listing
+        # every service. The ⟳ refresh (_fetch_contexts) clears it, which is
+        # how a freshly installed controller gets picked up.
+        self._ctl_cache = {}
         # Whether a seal / validate kubeseal run is currently in flight. These
         # gate the action buttons (see _refresh_action_buttons) so a controller
         # lookup landing mid-operation can't re-enable a button under it.
         self._sealing = False
         self._validating = False
+        # Whether the sealed pane holds a real manifest (set by _on_sealed,
+        # cleared by _invalidate_outputs). An explicit flag, not a string
+        # match on the pane text: _sealed_output / Copy / Save must never
+        # treat _on_sealed's error dump as a sealable manifest, and a shared
+        # magic prefix would silently invert on the next rewording.
+        self._sealed_ok = False
         # Editor generation, bumped by _invalidate_outputs. A seal/validate
         # captures it at dispatch; a result landing after the editor was
         # repopulated is stale (it describes the previous secret) and is
@@ -627,8 +640,8 @@ class App(tk.Tk):
         # Output actions sit below the pane now that the page scrolls.
         br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
         ttk.Button(br, text="Copy YAML",
-                   command=lambda: self._clip(self._yaml_out.get("1.0", "end"),
-                                              qualify=True)) \
+                   command=lambda: self._clip(
+                       self._yaml_out.get("1.0", "end-1c"), qualify=True)) \
             .pack(side="left", padx=(0, 6))
         ttk.Button(br, text="Save YAML…", command=self._save_yaml).pack(side="left")
 
@@ -775,28 +788,39 @@ class App(tk.Tk):
         self._kv_set_pairs([])
 
     def _kv_drop_binary(self):
-        """Delete every binary marker row along with its _tpl_binary
-        passthrough. The explicit reset keeps the drop correct even if a
-        passthrough key ever lacked a matching marker row. Returns how many
-        rows were dropped."""
+        """Delete every binary marker row, then reset the per-secret state
+        trio (the explicit reset keeps the drop correct even if a passthrough
+        key ever lacked a matching marker row). The identity-only load's leg
+        of the state swap: _set_secret_identity assigns the new doc's
+        carry/skipped right after, exactly like the _kv_set_pairs path.
+        Returns how many rows were dropped."""
         dropped = [rd for rd in self._kv_rows if rd["binary"]]
         for rd in dropped:
             self._kv_del_row(rd)
-        self._tpl_binary = {}
+        self._reset_secret_state()
         return len(dropped)
+
+    def _reset_secret_state(self, binary=None):
+        """The per-secret state trio's reset — its ONLY owner. Both paths a
+        new secret can enter the editor by come through here: the
+        row-replacement choke point (_kv_set_pairs/_kv_clear) and the
+        identity-only load (via _kv_drop_binary). A fourth piece of
+        per-secret state added here covers both structurally, instead of the
+        second path relying on someone re-reading a warning comment."""
+        self._tpl_binary = dict(binary or {})
+        self._tpl_carry = {}
+        self._tpl_skipped = 0
 
     def _kv_set_pairs(self, pairs, binary=None):
         """Replace all rows with `pairs` (key, value) plus a read-only marker
         row per `binary` entry (key → original base64, re-emitted verbatim on
-        Generate). Keeps one blank row if everything's empty. Owns the
-        per-secret state swap: _tpl_binary/_tpl_carry/_tpl_skipped are reset
-        HERE, at the choke point, so a load path can't forget one — stale
-        _tpl_binary would silently re-emit deleted values into generated
-        YAML. (The one caller with real carryover, _apply_secret_doc,
-        assigns it via _set_secret_identity right after.)"""
-        self._tpl_binary = dict(binary or {})
-        self._tpl_carry = {}
-        self._tpl_skipped = 0
+        Generate). Keeps one blank row if everything's empty. Resets the
+        per-secret state at this choke point (_reset_secret_state) so a load
+        path can't forget it — stale _tpl_binary would silently re-emit
+        deleted values into generated YAML. (The one caller with real
+        carryover, _apply_secret_doc, assigns it via _set_secret_identity
+        right after.)"""
+        self._reset_secret_state(binary)
         for rd in list(self._kv_rows):
             rd["frame"].destroy()
         self._kv_rows.clear()
@@ -821,6 +845,7 @@ class App(tk.Tk):
         passing either tail. A future repopulation path that neither replaces
         rows nor sets a doc identity must call it itself."""
         self._out_gen += 1  # in-flight seal/validate results are now stale
+        self._sealed_ok = False  # before the button refresh reads it
         self._set_text(self._yaml_out, "")
         self._set_text(self._sealed_out, "")
         self._refresh_action_buttons()
@@ -1286,9 +1311,7 @@ class App(tk.Tk):
 
         # Output actions sit below the pane now that the page scrolls.
         br = ttk.Frame(p); br.pack(fill="x", pady=(6, 0))
-        ttk.Button(br, text="Copy Sealed",
-                   command=lambda: self._clip(self._sealed_out.get("1.0", "end"),
-                                              qualify=True)) \
+        ttk.Button(br, text="Copy Sealed", command=self._copy_sealed) \
             .pack(side="left", padx=(0, 6))
         ttk.Button(br, text="Save Sealed…", command=self._save_sealed).pack(side="left")
 
@@ -1409,6 +1432,14 @@ class App(tk.Tk):
             return f"{tool} timed out"
         return None
 
+    def _tool_err(self, rc, stderr, tool, what):
+        """Error status for a failed kubectl landing: the shared sentinel
+        mapping (_rc_error), else `what` plus truncated stderr. One owner for
+        the fallback format — the five hand-rolled copies had already drifted
+        to three different truncation lengths."""
+        self._status(self._rc_error(rc, tool) or
+                     f"{what}: {stderr.strip()[:80]}", "err")
+
     def _on_sealed(self, stdout, stderr, rc, gen):
         self._sealing = False
         # A stale result describes the previous secret: drop it rather than
@@ -1424,11 +1455,14 @@ class App(tk.Tk):
         if rc != 0:
             err = stderr.strip() or "kubeseal failed"
             # Show the full error in the output pane (it scrolls); the status bar
-            # only fits one truncated line.
+            # only fits one truncated line. The pane now holds a dump, not a
+            # manifest — _sealed_ok keeps Validate/Copy/Save off it.
+            self._sealed_ok = False
             self._set_text(self._sealed_out, "# kubeseal error\n" + err)
             self._refresh_action_buttons()
             self._status(f"kubeseal error: {err.splitlines()[-1][:90]}", "err")
             return
+        self._sealed_ok = True
         self._set_text(self._sealed_out, stdout)
         self._refresh_action_buttons()
         # Via _status_output: a seal of lossy-carryover YAML must not read as
@@ -1436,9 +1470,11 @@ class App(tk.Tk):
         self._status_output("Sealed successfully")
 
     def _sealed_output(self) -> str:
-        """The sealed YAML in the output pane, or '' when empty / an error."""
-        sealed = self._sealed_out.get("1.0", "end").strip()
-        return "" if not sealed or sealed.startswith("# kubeseal error") else sealed
+        """The sealed YAML in the output pane, or '' when empty / an error
+        dump (per the explicit _sealed_ok flag, not a pane-text match)."""
+        if not self._sealed_ok:
+            return ""
+        return self._sealed_out.get("1.0", "end").strip()
 
     def _refresh_action_buttons(self):
         """Single source of truth for the Seal / Validate button states.
@@ -1495,26 +1531,43 @@ class App(tk.Tk):
             self._status(f"Invalid seal: {err}", "err"); return
         self._status("Valid — the controller can decrypt this", "ok")
 
+    def _copy_sealed(self):
+        """Copy the sealed manifest — via _sealed_output, so an error dump in
+        the pane can't leave the app masquerading as a sealable manifest."""
+        sealed = self._sealed_output()
+        if not sealed:
+            self._status("Seal a secret first", "err"); return
+        self._clip(sealed + "\n", qualify=True)
+
     def _save_sealed(self):
+        sealed = self._sealed_output()
+        if not sealed:
+            # Same gate as _copy_sealed: never write an empty file or the
+            # error dump to a sealed-*.yaml the user may try to apply.
+            self._status("Seal a secret first", "err"); return
         name = self._sec_name.get().strip() or DEF_NAME
         path = filedialog.asksaveasfilename(
             defaultextension=".yaml", initialfile=f"sealed-{name}.yaml",
             filetypes=[("YAML", "*.yaml"), ("All", "*.*")])
         if not path:
             return
-        self._write_file(path, self._sealed_out.get("1.0", "end-1c"))
+        self._write_file(path, sealed + "\n")
 
     # -------------------------------------------------------- kubectl integration
 
     def _fetch_contexts(self):
+        # The ⟳ refresh is the controller cache's invalidation point: it
+        # already means "re-read the cluster inventory" (new contexts), so a
+        # controller installed since the last detection is re-found on the
+        # next context selection instead of never.
+        self._ctl_cache.clear()
         self._dispatch_latest("contexts",
                               ["kubectl", "config", "get-contexts", "-o", "name"],
                               self._got_contexts)
 
     def _got_contexts(self, stdout, stderr, rc):
         if rc != 0:
-            self._status(self._rc_error(rc, "kubectl") or
-                         f"kubectl error: {stderr.strip()[:60]}", "err")
+            self._tool_err(rc, stderr, "kubectl", "kubectl error")
             return
         ctxs = [c.strip() for c in stdout.splitlines() if c.strip()]
         self._ctx_cb["values"] = ctxs
@@ -1550,7 +1603,19 @@ class App(tk.Tk):
 
     def _detect_controller(self, ctx: str):
         """Find the sealed-secrets controller service in the cluster and
-        auto-fill the Controller name / NS fields (read-only lookup)."""
+        auto-fill the Controller name / NS fields (read-only lookup).
+        Served from _ctl_cache when this context was already detected."""
+        hit = self._ctl_cache.get(ctx)
+        if hit:
+            ns, name = hit
+            # Any older in-flight detection is for a different context (a
+            # same-context lookup would have had to land to fill the cache)
+            # and its landing guard drops it — nothing is pending for THIS one.
+            self._ctl_pending = None
+            self._set_ro_entry(self._ctl_name, name)
+            self._set_ro_entry(self._ctl_ns, ns)
+            self._refresh_action_buttons()
+            return
         self._ctl_pending = ctx
         # Block Seal/Validate while the controller for the new context resolves —
         # acting now would seal/validate against an empty or stale controller.
@@ -1574,9 +1639,7 @@ class App(tk.Tk):
         if rc != 0:
             # Say so — a silent return leaves blank Controller fields with no
             # explanation.
-            self._status(self._rc_error(rc, "kubectl") or
-                         f"Controller detection failed: {stderr.strip()[:60]}",
-                         "err")
+            self._tool_err(rc, stderr, "kubectl", "Controller detection failed")
             return
         svcs = []
         for line in stdout.splitlines():
@@ -1590,6 +1653,7 @@ class App(tk.Tk):
         # Prefer the canonical "sealed-secrets-controller" service if present.
         ns, name = next((s for s in svcs if s[1] == "sealed-secrets-controller"),
                         svcs[0])
+        self._ctl_cache[ctx] = (ns, name)  # reused on re-selection
         self._set_ro_entry(self._ctl_name, name)
         self._set_ro_entry(self._ctl_ns, ns)
         self._status(f"Sealed-secrets controller: {ns}/{name}", "ok")
@@ -1605,8 +1669,7 @@ class App(tk.Tk):
         if ctx != self._enc_ctx.get():
             return
         if rc != 0:
-            self._status(self._rc_error(rc, "kubectl") or
-                         f"Namespace fetch failed: {stderr.strip()[:60]}", "err")
+            self._tool_err(rc, stderr, "kubectl", "Namespace fetch failed")
             return
         nss = stdout.strip().split()
         self._ns_cb["values"] = nss
@@ -1631,9 +1694,7 @@ class App(tk.Tk):
         if rc != 0:
             # Say so — a silent return leaves an empty Secret combobox that
             # reads as "no secrets in this namespace".
-            self._status(self._rc_error(rc, "kubectl") or
-                         f"Secret list fetch failed: {stderr.strip()[:60]}",
-                         "err")
+            self._tool_err(rc, stderr, "kubectl", "Secret list fetch failed")
             return
         secs = stdout.strip().split()
         self._sec_cb["values"] = secs
@@ -1648,13 +1709,22 @@ class App(tk.Tk):
                f"--context={ctx}", f"--namespace={ns}", "-o", "yaml"]
         self._load_btn.configure(state="disabled")
         kv_gen = self._kv_edit_gen
+        # Newest-wins token: two Load clicks for the SAME selection (a
+        # double-click, or re-clicking past a hung fetch) would otherwise
+        # resolve first-to-land-wins — the older snapshot applies, bumps the
+        # generations, and the fresher one is discarded with a misleading
+        # "editor changed" message. The (ctx, ns, sec) equality check in
+        # _got_template can't tell same-selection fetches apart.
+        tok = self._claim_latest("template")
+
+        def land(o, e, r, gen):
+            if not self._is_latest("template", tok):
+                return  # superseded by a newer Load — its landing takes over
+            self._got_template(ctx, ns, sec, kv_gen, o, e, r, gen)
         # Via _dispatch_gen: the template write must also be discarded if the
         # editor is repopulated (Import / Browse / Clear) while kubectl runs —
-        # the (ctx, ns, sec) check below only catches *selection* changes.
-        self._dispatch_gen(cmd,
-                           lambda o, e, r, gen: self._got_template(
-                               ctx, ns, sec, kv_gen, o, e, r, gen),
-                           None)
+        # the (ctx, ns, sec) check only catches *selection* changes.
+        self._dispatch_gen(cmd, land, None)
 
     def _got_template(self, ctx, ns, sec, kv_gen, stdout, stderr, rc, gen):
         # Re-enable the button regardless — the load attempt is done — *before*
@@ -1671,8 +1741,7 @@ class App(tk.Tk):
         if self._discard_stale(gen, "the template load"):
             return
         if rc != 0:
-            self._status(self._rc_error(rc, "kubectl") or
-                         f"kubectl error: {stderr.strip()[:80]}", "err")
+            self._tool_err(rc, stderr, "kubectl", "kubectl error")
             return
         try:
             doc = yaml.safe_load(stdout)
@@ -1814,11 +1883,14 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _clip(self, text: str, qualify: bool = False):
-        """Copy `text` to the clipboard. `qualify=True` for the generated /
+        """Copy `text` to the clipboard VERBATIM — a trailing newline can be
+        part of a secret value (PEM certs/keys end with one), so nothing is
+        trimmed here; pane callers strip the Text widget's implicit trailing
+        newline themselves via "end-1c". `qualify=True` for the generated /
         sealed YAML, whose copy is another way the (possibly lossy) manifest
         leaves the app — its confirmation carries the skip count like Save/Seal
         rather than an unqualified 'Copied'."""
-        payload = text.rstrip("\n")
+        payload = text
         # Freeze the skip count NOW: the clipboard write below is async on
         # Linux, and _tpl_skipped can change (Clear / load another secret)
         # before _clip_done fires — the confirmation must describe the payload

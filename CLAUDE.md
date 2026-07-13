@@ -104,7 +104,9 @@ for the *same* selection apart (switch prod → staging → prod fast and the
 older prod result could land last, overwriting the newer one or clearing the
 `_ctl_pending` guard while the newer lookup still runs) — the token handles
 that ordering. `_read_file_async` reuses the same tokens so a newer file pick
-supersedes a hung read. New fetch call sites should come through
+supersedes a hung read, and `_load_template` claims a `"template"` token on
+top of its `_dispatch_gen` checks so a double-click can't apply the older of
+two same-selection fetches. New fetch call sites should come through
 `_dispatch_latest` rather than hand-rolling the wrapper — it's not the *only*
 place a `self.after` marshal is written (`_dispatch_gen` and `_run_async`
 each write their own), but it's the one built for this per-key-supersession
@@ -137,18 +139,16 @@ Loading/importing a secret populates three parallel pieces of state:
 verbatim), `_tpl_carry` (labels/annotations/`immutable` carried through from
 the source doc, via `core.secret_carryover`), and `_tpl_skipped` (count of
 malformed metadata fields dropped rather than silently corrupted). The
-row-replacement choke points own the reset: `_kv_set_pairs(pairs, binary=…)`
-installs the binary passthrough and zeroes carry/skipped — `_kv_clear` is
-just `_kv_set_pairs([])`, not a separate reset — and `_set_secret_identity`
-assigns the newly loaded doc's
-carry/skipped right after (`_apply_secret_doc` relies on that ordering — rows
-first, then identity). Don't reset the trio caller-side; pass `binary=` to
-the choke point instead. One sharp edge remains: the identity-only load
-(`_apply_identity_only`) replaces no rows, so it bypasses the choke points —
-it drops the previous secret's passthrough via `_kv_drop_binary` and then
-sets identity. When adding a fourth piece of per-secret state, wire it into
-`_kv_set_pairs`/`_kv_clear` the same way, and check the identity-only path
-separately.
+reset has a single owner, `_reset_secret_state(binary=…)`, reached from both
+paths a new secret can enter the editor by: the row-replacement choke point
+`_kv_set_pairs(pairs, binary=…)` (`_kv_clear` is just `_kv_set_pairs([])`,
+not a separate reset), and the identity-only load (`_apply_identity_only`,
+which replaces no rows and instead resets via `_kv_drop_binary`). In both,
+`_set_secret_identity` assigns the newly loaded doc's carry/skipped right
+after (rows/reset first, then identity — `_apply_secret_doc` relies on that
+ordering). Don't reset the trio caller-side; pass `binary=` to the choke
+point instead. When adding a fourth piece of per-secret state, add it to
+`_reset_secret_state` and both paths get it structurally.
 
 ### Status messaging
 

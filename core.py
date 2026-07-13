@@ -136,18 +136,36 @@ _YAML_AMBIG = {
 }
 
 
+# Everything that can't appear raw inside a double-quoted YAML scalar: the
+# two syntax characters, the C0/C1 controls (raw controls aren't YAML
+# c-printable at all — the document fails to parse), and the extra YAML 1.1
+# line breaks (U+0085 NEL, U+2028 LS, U+2029 PS) which, like a raw \n,
+# would be FOLDED TO SPACES on reparse — silently corrupting the value.
+_DQ_NAMED = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+_DQ_UNSAFE = re.compile(
+    r'[\\"\n\r\t\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]')
+
+
+def _dq_escape(m):
+    c = m.group(0)
+    if c in _DQ_NAMED:
+        return _DQ_NAMED[c]
+    n = ord(c)
+    return f"\\x{n:02X}" if n <= 0xFF else f"\\u{n:04X}"
+
+
 def yaml_scalar(v: str) -> str:
     """Return v as a YAML scalar, double-quoting (with escaping) if it isn't a
     plain DNS-safe token, so hand-edited names/keys can't break the document.
     The empty string is quoted too — a bare empty scalar reads as null.
-    Newlines/CRs are escaped, not emitted raw: a double-quoted scalar spanning
-    physical lines gets its line breaks FOLDED TO SPACES on reparse, which
-    corrupts values (e.g. multi-line base64 passthrough gains spaces that
-    Kubernetes' decoder rejects)."""
+    Line breaks (\\n, \\r, and YAML 1.1's NEL/LS/PS) are escaped, not emitted
+    raw: a double-quoted scalar spanning physical lines gets its breaks FOLDED
+    TO SPACES on reparse, which corrupts values (e.g. multi-line base64
+    passthrough gains spaces that Kubernetes' decoder rejects). Raw control
+    characters aren't YAML-printable at all, so they leave as escapes too."""
     if _SAFE_YAML.match(v) and v not in _YAML_AMBIG:
         return v
-    return '"' + (v.replace("\\", "\\\\").replace('"', '\\"')
-                   .replace("\n", "\\n").replace("\r", "\\r")) + '"'
+    return '"' + _DQ_UNSAFE.sub(_dq_escape, v) + '"'
 
 
 # Annotation kubectl regenerates on apply; it embeds a JSON snapshot of the
@@ -294,6 +312,10 @@ def secret_entries(doc) -> list:
     data = doc.get("data")
     if isinstance(data, dict):
         for k, v in data.items():
+            # Coerce like the values below: a hand-authored `123:` key parses
+            # as an int, and a non-str key kept raw would crash yaml_scalar
+            # when the binary passthrough re-emits it at Generate time.
+            k = str(k)
             if v is None:  # genuinely missing value (`KEY:`); 0/False are real
                 put(k, (k, "", "text"))
                 continue
@@ -314,6 +336,7 @@ def secret_entries(doc) -> list:
     sdata = doc.get("stringData")
     if isinstance(sdata, dict):
         for k, v in sdata.items():
+            k = str(k)  # same coercion as the data loop above
             put(k, (k, "" if v is None else str(v), "text"))
 
     return out
@@ -423,9 +446,13 @@ def write_secret_file(path: str, content: str) -> None:
     existing (possibly world-readable) file would otherwise keep its old mode;
     fchmod forces 0o600 regardless. (fchmod is absent on Windows, where POSIX
     permissions don't apply — there the open mode is the best available.)
+
+    Explicit UTF-8: the locale default (cp1252 on Windows, ASCII under
+    LC_ALL=C) would raise UnicodeEncodeError mid-write on non-ASCII content,
+    leaving a truncated file behind the O_TRUNC.
     """
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         if hasattr(os, "fchmod"):
             os.fchmod(f.fileno(), 0o600)
         f.write(content)
