@@ -174,12 +174,20 @@ def test_controller_landing_mid_seal_keeps_buttons_disabled():
         win.destroy()
 
 
+def _sync_io(win, monkeypatch):
+    """Run _run_async work inline: file reads/writes (and their landing
+    callbacks) complete synchronously so tests can assert right after the
+    call, without pumping the Tk event loop."""
+    monkeypatch.setattr(win, "_run_async", lambda work, done: done(work()))
+
+
 def _import_file(win, monkeypatch, tmp_path, content):
     """Drive Import Secret… against a temp YAML file, bypassing the dialog."""
     path = tmp_path / "secret.yaml"
     path.write_text(content)
     monkeypatch.setattr(app.filedialog, "askopenfilename",
                         lambda **k: str(path))
+    _sync_io(win, monkeypatch)
     win._import_secret()
     return path
 
@@ -374,7 +382,7 @@ def test_load_template_empty_secret_loads_identity_only():
         win._kv_set_pairs([("KEEP", "me")])
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", win._kv_edit_gen,
                           "apiVersion: v1\nkind: Secret\nmetadata:\n"
                           "  name: hollow\n  namespace: prod\n"
                           "type: kubernetes.io/tls\n",
@@ -399,14 +407,13 @@ def test_identity_only_load_invalidates_and_drops_binary():
     try:
         # State from a previously loaded secret A: a text row, a binary
         # passthrough, generated + sealed output, and an in-flight seal.
-        win._tpl_binary = {"tls.key": "QUJD"}
-        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._kv_set_pairs([("KEEP", "me")], binary={"tls.key": "QUJD"})
         win._set_text(win._yaml_out,   "kind: Secret  # A\n")
         win._set_text(win._sealed_out, "kind: SealedSecret  # A\n")
         gen = win._out_gen  # a seal dispatched under the old identity
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", win._kv_edit_gen,
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)
 
@@ -516,6 +523,7 @@ def test_browse_yaml_keeps_label_on_failed_decode(monkeypatch, tmp_path):
         path.write_text("kind: SealedSecret\nspec:\n  encryptedData:\n    p: AgA=\n")
         monkeypatch.setattr(app.filedialog, "askopenfilename",
                             lambda **k: str(path))
+        _sync_io(win, monkeypatch)
 
         win._browse_yaml()
 
@@ -533,10 +541,11 @@ def test_stale_template_result_is_discarded_after_repopulation():
     win = _make_win()
     try:
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
-        gen = win._out_gen  # generation the fetch was dispatched under
-        win._kv_set_pairs([("FRESH", "import")])  # repopulation bumps it
+        gen = win._out_gen          # generation the fetch was dispatched under
+        kv_gen = win._kv_edit_gen   # ditto, row-edit generation
+        win._kv_set_pairs([("FRESH", "import")])  # repopulation bumps both
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", kv_gen,
                           "kind: Secret\ndata:\n  old: c3RhbGU=\n", "", 0, gen)
 
         assert win._kv_get_pairs() == {"FRESH": "import"}  # not clobbered
@@ -718,13 +727,13 @@ def test_load_template_repoints_file_label_to_cluster():
         win._env_lbl.configure(text="/tmp/imported.yaml")
         win._enc_ctx.set("c"); win._enc_ns.set("prod"); win._enc_sec.set("s")
 
-        win._got_template("c", "prod", "s",
+        win._got_template("c", "prod", "s", win._kv_edit_gen,
                           "kind: Secret\ndata:\n  token: c2VjcmV0\n", "", 0,
                           win._out_gen)
         assert win._env_lbl.cget("text") == "(cluster: prod/s)"
 
         win._env_lbl.configure(text="/tmp/imported.yaml")
-        win._got_template("c", "prod", "s",
+        win._got_template("c", "prod", "s", win._kv_edit_gen,
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)  # identity-only branch
         assert win._env_lbl.cget("text") == "(cluster: prod/s)"
@@ -880,15 +889,216 @@ def test_identity_only_binary_drop_uses_warning_severity():
     pytest.importorskip("yaml")
     win = _make_win()
     try:
-        win._tpl_binary = {"tls.key": "QUJD"}
-        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._kv_set_pairs([("KEEP", "me")], binary={"tls.key": "QUJD"})
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
-        win._got_template("c", "n", "s",
+        win._got_template("c", "n", "s", win._kv_edit_gen,
                           "kind: Secret\nmetadata:\n  name: hollow\n", "", 0,
                           win._out_gen)
 
         assert "dropped 1 binary value(s)" in win._status_var.get()
         assert win._status_lbl.cget("fg") == app.ERR_C
+    finally:
+        win.destroy()
+
+
+def test_regenerate_after_inplace_edit_stales_inflight_seal():
+    """Editing a row's value IN PLACE passes no repopulation choke point, so
+    Generate itself must advance the generation: a seal of the previous YAML
+    still in flight has to land stale instead of overwriting the pane with a
+    manifest that no longer matches the shown YAML — and sealed output of the
+    previous YAML must be retired immediately."""
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("A", "1")])
+        win._gen_yaml()
+        gen = win._out_gen                       # a seal dispatched now
+        win._set_text(win._sealed_out, "kind: SealedSecret  # of A=1\n")
+
+        win._kv_rows[0]["var"].set("2")          # in-place value edit
+        win._gen_yaml()                          # regenerate
+
+        assert win._out_gen != gen               # in-flight seal is now stale
+        assert win._sealed_out.get("1.0", "end").strip() == ""  # retired
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret  # of A=1\n", "", 0, gen)
+        assert "stale result discarded" in win._status_var.get()
+        assert win._sealed_out.get("1.0", "end").strip() == ""  # not resurrected
+    finally:
+        win.destroy()
+
+
+def test_kv_clear_resets_per_secret_state():
+    """_kv_clear/_kv_set_pairs own the per-secret state reset (the choke
+    point): a caller that skips the manual resets must still get a clean
+    slate, or stale _tpl_binary would silently re-emit deleted values into
+    the next Generate."""
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("A", "1")], binary={"blob": "QUJD"})
+        win._tpl_carry = {"labels": {"x": "y"}}
+        win._tpl_skipped = 2
+
+        win._kv_clear()
+
+        assert win._tpl_binary == {}
+        assert win._tpl_carry == {}
+        assert win._tpl_skipped == 0
+        win._gen_yaml()  # nothing left — must not resurrect the binary blob
+        assert "No KEY=VALUE pairs found" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_dispatch_latest_drops_superseded_result(monkeypatch):
+    """Two in-flight lookups for the SAME selection: the older result landing
+    last must be dropped — the value-equality guards in the landing callbacks
+    can't tell the two apart (the controller-detection race)."""
+    win = _make_win()
+    try:
+        landings = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: landings.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        got = []
+        win._dispatch_latest("k", ["cmd1"],
+                             lambda o, e, r: got.append(("old", o)))
+        win._dispatch_latest("k", ["cmd2"],
+                             lambda o, e, r: got.append(("new", o)))
+
+        landings[1]("out2", "", 0)   # newer lands first
+        landings[0]("out1", "", 0)   # older lands last — must be dropped
+
+        assert got == [("new", "out2")]
+    finally:
+        win.destroy()
+
+
+def test_browse_read_discards_result_after_concurrent_row_edit(monkeypatch, tmp_path):
+    """A Browse .env read is async (so the UI stays live while it runs); if
+    the user directly edits a KV row (add/type, no Generate, no selector
+    change) before the read lands, applying the read must not silently
+    overwrite that edit — the race the async-I/O fix itself opened."""
+    win = _make_win()
+    try:
+        path = tmp_path / "x.env"
+        path.write_text("NEW=1\n")
+        monkeypatch.setattr(app.filedialog, "askopenfilename",
+                            lambda **k: str(path))
+        captured = {}
+        monkeypatch.setattr(win, "_read_file_async",
+                            lambda path, key, done: captured.setdefault("done", done))
+        win._kv_set_pairs([("EXISTING", "value")])
+
+        win._browse_env()               # dispatches; read hasn't "landed" yet
+        win._kv_add_row("NEWKEY", "newval")  # user edits mid-read
+        captured["done"](str(path), "NEW=1\n")  # the read finally lands
+
+        assert win._kv_get_pairs() == {"EXISTING": "value", "NEWKEY": "newval"}
+        assert "KV rows changed" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_load_template_discards_result_after_concurrent_row_edit():
+    """Same race as above for the kubectl fetch path: a Load Template result
+    landing after a direct row edit (no selector change, so the (ctx,ns,sec)
+    guard alone wouldn't catch it) must be discarded, not silently applied."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("EXISTING", "value")])
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+        kv_gen = win._kv_edit_gen   # captured at dispatch time
+        gen = win._out_gen
+
+        win._kv_add_row("NEWKEY", "newval")  # user edits mid-fetch
+
+        win._got_template("c", "n", "s", kv_gen,
+                          "kind: Secret\ndata:\n  token: c2VjcmV0\n", "", 0, gen)
+
+        assert win._kv_get_pairs() == {"EXISTING": "value", "NEWKEY": "newval"}
+        assert "KV rows changed" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_kubectl_rc_error_consistent_across_call_sites():
+    """_got_contexts/_got_controller (and the other kubectl landing
+    callbacks) map run_bg's not-found sentinel through the same shared
+    _rc_error helper, so a missing kubectl reads identically everywhere
+    instead of five near-but-not-quite-identical strings."""
+    win = _make_win()
+    try:
+        assert win._rc_error(-1, "kubectl") == "kubectl not in PATH"
+        assert win._rc_error(-2, "kubectl") == "kubectl timed out"
+        assert win._rc_error(0, "kubectl") is None
+        assert win._rc_error(-1, "kubeseal") == "kubeseal not in PATH"
+
+        win._got_contexts("", "Command not found: kubectl", -1)
+        ctx_msg = win._status_var.get()
+
+        win._seal_ctx.set("ctxA")
+        win._got_controller("ctxA", "", "Command not found: kubectl", -1)
+        controller_msg = win._status_var.get()
+
+        assert ctx_msg == controller_msg == "kubectl not in PATH"
+    finally:
+        win.destroy()
+
+
+def test_kv_key_edited_ignores_noop_set():
+    """The key StringVar's write trace also fires on a same-value .set()
+    (calling _kv_key_edited with no actual change) — it must only bump
+    _kv_edit_gen when the text actually changed, or an unrelated in-flight
+    read/fetch gets falsely discarded."""
+    win = _make_win()
+    try:
+        rd = win._kv_add_row("KEY", "value")
+        gen = win._kv_edit_gen
+
+        rd["key_var"].set("KEY")        # same value — a no-op re-set
+        assert win._kv_edit_gen == gen  # not bumped
+
+        rd["key_var"].set("KEY2")       # an actual edit
+        assert win._kv_edit_gen == gen + 1
+    finally:
+        win.destroy()
+
+
+def test_kv_key_edited_catches_non_keyboard_text_change():
+    """The key field is textvariable-bound (not a raw <KeyRelease> bind)
+    specifically so a non-keyboard edit — e.g. X11 middle-click paste, or
+    any other path that changes the Entry's displayed text without a key
+    event — still bumps _kv_edit_gen. Simulated here via .insert(), which is
+    exactly how such a paste lands: no keyboard event, just an Entry-content
+    mutation that Tk syncs to the bound StringVar (and hence the trace)."""
+    win = _make_win()
+    try:
+        rd = win._kv_add_row("KEY", "value")
+        gen = win._kv_edit_gen
+
+        rd["key_e"].insert("end", "2")  # content changes with no KeyRelease
+
+        assert win._kv_edit_gen == gen + 1  # still caught
+        assert rd["key_var"].get() == "KEY2"
+    finally:
+        win.destroy()
+
+
+def test_kv_value_edited_ignores_noop_set():
+    """The value StringVar's write trace also fires on a same-value .set()
+    (e.g. the Edit… popup's Save with no change). _kv_value_edited must only
+    bump _kv_edit_gen when the value actually changed."""
+    win = _make_win()
+    try:
+        rd = win._kv_add_row("KEY", "value")
+        gen = win._kv_edit_gen
+
+        rd["var"].set("value")          # same value — the popup's no-op save
+        assert win._kv_edit_gen == gen  # not bumped
+
+        rd["var"].set("changed")        # an actual edit
+        assert win._kv_edit_gen == gen + 1
     finally:
         win.destroy()
