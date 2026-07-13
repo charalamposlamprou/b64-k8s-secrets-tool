@@ -1470,11 +1470,15 @@ class App(tk.Tk):
         self._status_output("Sealed successfully")
 
     def _sealed_output(self) -> str:
-        """The sealed YAML in the output pane, or '' when empty / an error
-        dump (per the explicit _sealed_ok flag, not a pane-text match)."""
+        """The sealed YAML in the output pane, verbatim (via "end-1c", same
+        convention as Copy YAML — drops only the Text widget's implicit
+        trailing newline, not the manifest's own), or '' when empty / an
+        error dump (per the explicit _sealed_ok flag, not a pane-text
+        match). _sealed_ok already guarantees non-error content is exactly
+        _on_sealed's kubeseal stdout, so there's nothing further to strip."""
         if not self._sealed_ok:
             return ""
-        return self._sealed_out.get("1.0", "end").strip()
+        return self._sealed_out.get("1.0", "end-1c")
 
     def _refresh_action_buttons(self):
         """Single source of truth for the Seal / Validate button states.
@@ -1499,9 +1503,9 @@ class App(tk.Tk):
         # Round-trips the sealed output through the controller's verify endpoint:
         # catches a wrong key/controller, wrong scope, or wrong name/namespace —
         # the mis-seals that otherwise only surface at apply time. Creates nothing.
-        sealed = self._sealed_output()
-        if not sealed:
-            self._status("Seal a secret first", "err"); return
+        sealed = self._require_sealed()
+        if sealed is None:
+            return
         # Controller lookup for the current context hasn't landed yet — validating
         # now would hit an empty/stale controller and fail confusingly.
         if self._ctl_pending == self._seal_ctx.get():
@@ -1531,27 +1535,35 @@ class App(tk.Tk):
             self._status(f"Invalid seal: {err}", "err"); return
         self._status("Valid — the controller can decrypt this", "ok")
 
-    def _copy_sealed(self):
-        """Copy the sealed manifest — via _sealed_output, so an error dump in
-        the pane can't leave the app masquerading as a sealable manifest."""
+    def _require_sealed(self):
+        """The sealed YAML in the output pane, or None — with the status bar
+        already set to the shared "nothing to act on" message. The guard
+        Validate / Copy Sealed / Save Sealed… all need before touching the
+        pane (an error dump in it must never leave the app as if it were a
+        manifest)."""
         sealed = self._sealed_output()
         if not sealed:
-            self._status("Seal a secret first", "err"); return
-        self._clip(sealed + "\n", qualify=True)
+            self._status("Seal a secret first", "err")
+            return None
+        return sealed
+
+    def _copy_sealed(self):
+        sealed = self._require_sealed()
+        if sealed is None:
+            return
+        self._clip(sealed, qualify=True)
 
     def _save_sealed(self):
-        sealed = self._sealed_output()
-        if not sealed:
-            # Same gate as _copy_sealed: never write an empty file or the
-            # error dump to a sealed-*.yaml the user may try to apply.
-            self._status("Seal a secret first", "err"); return
+        sealed = self._require_sealed()
+        if sealed is None:
+            return
         name = self._sec_name.get().strip() or DEF_NAME
         path = filedialog.asksaveasfilename(
             defaultextension=".yaml", initialfile=f"sealed-{name}.yaml",
             filetypes=[("YAML", "*.yaml"), ("All", "*.*")])
         if not path:
             return
-        self._write_file(path, sealed + "\n")
+        self._write_file(path, sealed)
 
     # -------------------------------------------------------- kubectl integration
 
@@ -1604,16 +1616,33 @@ class App(tk.Tk):
     def _detect_controller(self, ctx: str):
         """Find the sealed-secrets controller service in the cluster and
         auto-fill the Controller name / NS fields (read-only lookup).
-        Served from _ctl_cache when this context was already detected."""
-        hit = self._ctl_cache.get(ctx)
-        if hit:
-            ns, name = hit
-            # Any older in-flight detection is for a different context (a
-            # same-context lookup would have had to land to fill the cache)
-            # and its landing guard drops it — nothing is pending for THIS one.
+        Served from _ctl_cache when this context was already detected —
+        `in`, not `.get()`: a cluster with no controller caches as `None`
+        (see _got_controller), which `.get()` couldn't tell apart from
+        never having been looked up, so it would re-run the full
+        `get svc -A` on every reselection of exactly the contexts (dev/
+        staging without sealed-secrets installed) most likely to be
+        revisited while hunting for the right one."""
+        if ctx in self._ctl_cache:
+            hit = self._ctl_cache[ctx]
             self._ctl_pending = None
-            self._set_ro_entry(self._ctl_name, name)
-            self._set_ro_entry(self._ctl_ns, ns)
+            # Claim (supersede) the "controller" token even on a hit: an
+            # older still-in-flight lookup for a DIFFERENT context — one
+            # this cache hit interrupted — would otherwise keep it as
+            # "latest" and, if the user returns to that still-uncached
+            # context before the old lookup lands, _detect_controller would
+            # dispatch a SECOND redundant kubectl call for it (the in-flight
+            # one's stale result is still correctly dropped by _is_latest
+            # either way — this only saves the extra cluster round-trip).
+            self._claim_latest("controller")
+            if hit:
+                ns, name = hit
+                self._set_ro_entry(self._ctl_name, name)
+                self._set_ro_entry(self._ctl_ns, ns)
+                self._status(f"Sealed-secrets controller: {ns}/{name}", "ok")
+            # else: no controller in this cluster — RO fields stay blank
+            # (the caller clears them before calling), matching a live
+            # lookup's own no-controller-found behavior, which is silent too.
             self._refresh_action_buttons()
             return
         self._ctl_pending = ctx
@@ -1649,6 +1678,11 @@ class App(tk.Tk):
             if "sealed-secrets" in name and "metrics" not in name:
                 svcs.append((ns.strip(), name.strip()))
         if not svcs:
+            # Cache the negative result too — an uninstalled/dev cluster is
+            # exactly the context most likely to be reselected repeatedly
+            # while hunting for the right one; leaving it uncached would
+            # re-run the full svc listing every single time.
+            self._ctl_cache[ctx] = None
             return
         # Prefer the canonical "sealed-secrets-controller" service if present.
         ns, name = next((s for s in svcs if s[1] == "sealed-secrets-controller"),
@@ -1709,17 +1743,26 @@ class App(tk.Tk):
                f"--context={ctx}", f"--namespace={ns}", "-o", "yaml"]
         self._load_btn.configure(state="disabled")
         kv_gen = self._kv_edit_gen
-        # Newest-wins token: two Load clicks for the SAME selection (a
-        # double-click, or re-clicking past a hung fetch) would otherwise
-        # resolve first-to-land-wins — the older snapshot applies, bumps the
-        # generations, and the fresher one is discarded with a misleading
-        # "editor changed" message. The (ctx, ns, sec) equality check in
-        # _got_template can't tell same-selection fetches apart.
-        tok = self._claim_latest("template")
+        # Newest-wins token keyed by SELECTION, not a single global slot: two
+        # Load clicks for the SAME (ctx, ns, sec) — a double-click, or
+        # re-clicking past a hung fetch — would otherwise resolve
+        # first-to-land-wins, with the older snapshot applying and the
+        # fresher one discarded via a misleading "editor changed" message
+        # (the (ctx, ns, sec) equality check in _got_template can't tell two
+        # same-selection fetches apart). A single global key would go
+        # further and break a DIFFERENT case that used to work: switch A →
+        # B (Load) → back to A without re-clicking Load — A's still-in-flight
+        # result would arrive claiming a stale token and be silently
+        # dropped, along with B's (rejected by the plain selector check
+        # since the selection moved on). Keying per-selection supersedes
+        # only genuine same-selection re-dispatches, leaving cross-selection
+        # ordering to the existing (ctx, ns, sec) / _discard_stale checks.
+        key = ("template", ctx, ns, sec)
+        tok = self._claim_latest(key)
 
         def land(o, e, r, gen):
-            if not self._is_latest("template", tok):
-                return  # superseded by a newer Load — its landing takes over
+            if not self._is_latest(key, tok):
+                return  # superseded by a newer Load of this SAME selection
             self._got_template(ctx, ns, sec, kv_gen, o, e, r, gen)
         # Via _dispatch_gen: the template write must also be discarded if the
         # editor is repopulated (Import / Browse / Clear) while kubectl runs —

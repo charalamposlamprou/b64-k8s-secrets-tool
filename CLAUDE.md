@@ -104,13 +104,31 @@ for the *same* selection apart (switch prod → staging → prod fast and the
 older prod result could land last, overwriting the newer one or clearing the
 `_ctl_pending` guard while the newer lookup still runs) — the token handles
 that ordering. `_read_file_async` reuses the same tokens so a newer file pick
-supersedes a hung read, and `_load_template` claims a `"template"` token on
-top of its `_dispatch_gen` checks so a double-click can't apply the older of
-two same-selection fetches. New fetch call sites should come through
+supersedes a hung read, and `_load_template` claims a token keyed by
+`("template", ctx, ns, sec)` on top of its `_dispatch_gen` checks, so a
+double-click can't apply the older of two same-selection fetches — keyed by
+selection, not a single global slot, so switching to a different secret and
+back without re-clicking Load doesn't make the still-in-flight original
+fetch land as "superseded" when nothing actually superseded it. New fetch
+call sites should come through
 `_dispatch_latest` rather than hand-rolling the wrapper — it's not the *only*
 place a `self.after` marshal is written (`_dispatch_gen` and `_run_async`
 each write their own), but it's the one built for this per-key-supersession
 shape.
+
+`_ctl_cache` (context → `(ns, name)` or `None`) sits on top of the
+`"controller"` `_dispatch_latest` key: `_detect_controller` checks
+`ctx in self._ctl_cache` (not `.get()`) before dispatching, because a
+context with no sealed-secrets controller caches as the value `None` — a
+context genuinely never looked up is *absent* from the dict, not present
+with a `None` value, and `.get()` can't tell the two apart. On a cache hit
+it also claims (supersedes) the `"controller"` token itself, since an older
+still-in-flight lookup for a *different* context that this hit interrupted
+would otherwise stay "latest" and trigger a redundant re-dispatch if the
+user returns to that context before the old lookup lands. The whole cache is
+invalidated by the ⟳ refresh (`_fetch_contexts`) — there's no per-context or
+TTL invalidation, so a controller reinstalled under a different name/
+namespace in an already-cached context reads stale until refresh.
 
 A background op that's about to *replace all KV rows* (`_read_editor_file`,
 `_got_template`) needs a THIRD check beyond `_out_gen`: `_kv_edit_gen`, bumped

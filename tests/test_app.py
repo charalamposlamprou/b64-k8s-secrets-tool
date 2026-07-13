@@ -1218,3 +1218,68 @@ def test_controller_detection_cached_per_context(monkeypatch):
         assert len(calls) == 3                    # contexts fetch + fresh lookup
     finally:
         win.destroy()
+
+
+def test_controller_cache_covers_negative_result(monkeypatch):
+    """A context with no sealed-secrets controller (dev/staging without it
+    installed — exactly the case most likely to be reselected while hunting
+    for the right cluster) must also be cached, not re-listed every time."""
+    win = _make_win()
+    try:
+        calls = []
+        monkeypatch.setattr(app, "run_bg", lambda *a, **k: calls.append(a))
+        win._seal_ctx.set("dev")
+
+        win._detect_controller("dev")
+        assert len(calls) == 1
+        win._got_controller("dev", "kube-system\tcoredns\n", "", 0)  # no match
+        assert win._ctl_name.get() == "" and win._ctl_ns.get() == ""
+
+        win._detect_controller("dev")               # re-select — served from cache
+        assert len(calls) == 1                       # no second kubectl call
+        assert win._ctl_name.get() == "" and win._ctl_ns.get() == ""
+    finally:
+        win.destroy()
+
+
+def test_load_template_switching_selection_and_back_still_applies(monkeypatch):
+    """Load A, switch to B and Load (superseding A's in-flight fetch), then
+    switch back to A WITHOUT re-clicking Load. A's result must still apply
+    when it lands — a same-selection-only supersession token (keyed by
+    (ctx, ns, sec), not a single global slot) must not treat a genuinely
+    different selection's dispatch as superseding this one."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        win._enc_ctx.set("c"); win._enc_ns.set("n")
+
+        win._enc_sec.set("A"); win._load_template()   # dispatch for A hangs
+        win._enc_sec.set("B"); win._load_template()   # dispatch for B hangs
+        win._enc_sec.set("A")                          # back to A, no re-click
+
+        launched[0]("kind: Secret\ndata:\n  a: YQ==\n", "", 0)  # A lands
+
+        assert win._kv_get_pairs() == {"a": "a"}       # applied, not dropped
+    finally:
+        win.destroy()
+
+
+def test_copy_yaml_and_copy_sealed_have_consistent_trailing_newline():
+    """Copy YAML and Copy Sealed must both hand the clipboard the manifest
+    with exactly one trailing newline — matching Save YAML/Save Sealed's
+    existing "end-1c" convention — rather than the two diverging (one
+    stripped bare, one strip-then-reappended)."""
+    win = _make_win()
+    try:
+        win._set_text(win._yaml_out, "kind: Secret\ndata:\n  a: b\n")
+        assert win._yaml_out.get("1.0", "end-1c") == "kind: Secret\ndata:\n  a: b\n"
+
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret\ndata:\n  a: b\n", "", 0, win._out_gen)
+        assert win._sealed_output() == "kind: SealedSecret\ndata:\n  a: b\n"
+    finally:
+        win.destroy()
