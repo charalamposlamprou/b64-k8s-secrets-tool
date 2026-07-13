@@ -660,6 +660,7 @@ class App(tk.Tk):
         key_e.insert(0, key)
         key_e.pack(side="left", padx=(0, 6))
         rd["key_e"] = key_e
+        rd["key_text"] = key  # last-seen text, for _kv_key_edited's comparison
 
         if binary:
             key_e.configure(state="readonly")  # binary keys aren't text-editable
@@ -677,10 +678,17 @@ class App(tk.Tk):
             val_e = ttk.Entry(row, textvariable=var, font=(MONO, SZ), show="•")
             rd["val_e"] = val_e
             rd["shown"] = False
+            rd["value_text"] = value  # last-seen text, for _kv_value_edited
             # Typing a key or value (including via the Edit… popup, which
             # writes through `var`) bumps _kv_edit_gen — see its docstring.
-            key_e.bind("<KeyRelease>", self._kv_row_edited)
-            var.trace_add("write", self._kv_row_edited)
+            # Compare against the last-seen text rather than bumping
+            # unconditionally: <KeyRelease> also fires on pure cursor
+            # movement (arrows, Tab, Home/End) and the trace also fires on a
+            # same-value .set() (e.g. Edit… Save with no change), neither of
+            # which is a real edit — bumping on those would falsely discard
+            # an unrelated in-flight read/fetch that's actually still valid.
+            key_e.bind("<KeyRelease>", lambda _e: self._kv_key_edited(rd))
+            var.trace_add("write", lambda *_a: self._kv_value_edited(rd))
             show_b = ttk.Button(row, text="Show", style="Icon.TButton",
                                 command=lambda: self._kv_toggle_show(rd))
             rd["show_b"] = show_b
@@ -700,13 +708,34 @@ class App(tk.Tk):
         return rd
 
     def _kv_row_edited(self, *_args):
-        """A KV row was added, removed, or its key/value text changed —
-        including internal rebuilds by _kv_set_pairs/_kv_clear, where it's a
-        harmless extra bump. Bound to _kv_add_row/_kv_del_row and, for
-        editable rows, to the key Entry's <KeyRelease> and the value
-        StringVar's write trace (also covers the Edit… popup, which writes
-        through the same var). See self._kv_edit_gen for what reads this."""
+        """A KV row was added or removed — including internal rebuilds by
+        _kv_set_pairs/_kv_clear, where it's a harmless extra bump. Bound
+        directly to _kv_add_row/_kv_del_row; key/value text edits go through
+        _kv_key_edited/_kv_value_edited instead, which only bump on an actual
+        change. See self._kv_edit_gen for what reads this."""
         self._kv_edit_gen += 1
+
+    def _kv_key_edited(self, rd):
+        """<KeyRelease> handler for a row's key Entry: bump _kv_edit_gen only
+        if the text actually changed. <KeyRelease> also fires on pure cursor
+        movement (arrows, Tab, Home/End) with no content change — bumping
+        unconditionally would falsely discard an unrelated in-flight
+        read/fetch that's actually still valid."""
+        text = rd["key_e"].get()
+        if text != rd["key_text"]:
+            rd["key_text"] = text
+            self._kv_row_edited()
+
+    def _kv_value_edited(self, rd):
+        """Write-trace handler for a row's value StringVar: bump
+        _kv_edit_gen only if the text actually changed. The trace also fires
+        on a same-value .set() (e.g. the Edit… popup's Save with no actual
+        change) — bumping unconditionally would falsely discard an unrelated
+        in-flight read/fetch."""
+        text = rd["var"].get()
+        if text != rd["value_text"]:
+            rd["value_text"] = text
+            self._kv_row_edited()
 
     def _kv_del_row(self, rd):
         if rd in self._kv_rows:
@@ -1364,25 +1393,16 @@ class App(tk.Tk):
         return True
 
     @staticmethod
-    def _kubeseal_rc_error(rc):
-        """Map run_bg's sentinel return codes to a status message, or None."""
+    def _rc_error(rc, tool):
+        """Map run_bg's sentinel return codes to a status message naming
+        `tool`, or None. Every kubeseal/kubectl landing callback should check
+        this before falling back to its own descriptive message, so a
+        missing/timed-out tool reads the same way everywhere instead of
+        several near-but-not-quite-identical strings."""
         if rc == -1:
-            return "kubeseal not in PATH"
+            return f"{tool} not in PATH"
         if rc == -2:
-            return "kubeseal timed out"
-        return None
-
-    @staticmethod
-    def _kubectl_rc_error(rc):
-        """The kubectl counterpart of _kubeseal_rc_error: every kubectl
-        landing callback (_got_contexts/_got_controller/_got_ns/_got_secrets/
-        _got_template) should check this before falling back to its own
-        descriptive message, so a missing/timed-out kubectl reads the same
-        way everywhere instead of five near-but-not-quite-identical strings."""
-        if rc == -1:
-            return "kubectl not in PATH"
-        if rc == -2:
-            return "kubectl timed out"
+            return f"{tool} timed out"
         return None
 
     def _on_sealed(self, stdout, stderr, rc, gen):
@@ -1393,7 +1413,7 @@ class App(tk.Tk):
         if self._discard_stale(gen, "sealing", hint="; seal again"):
             self._refresh_action_buttons()
             return
-        sentinel = self._kubeseal_rc_error(rc)
+        sentinel = self._rc_error(rc, "kubeseal")
         if sentinel:
             self._refresh_action_buttons()
             self._status(sentinel, "err"); return
@@ -1462,7 +1482,7 @@ class App(tk.Tk):
         # cleared) — reporting "Valid" now would mislead. Drop it.
         if self._discard_stale(gen, "validation"):
             return
-        sentinel = self._kubeseal_rc_error(rc)
+        sentinel = self._rc_error(rc, "kubeseal")
         if sentinel:
             self._status(sentinel, "err"); return
         if rc != 0:
@@ -1489,7 +1509,7 @@ class App(tk.Tk):
 
     def _got_contexts(self, stdout, stderr, rc):
         if rc != 0:
-            self._status(self._kubectl_rc_error(rc) or
+            self._status(self._rc_error(rc, "kubectl") or
                          f"kubectl error: {stderr.strip()[:60]}", "err")
             return
         ctxs = [c.strip() for c in stdout.splitlines() if c.strip()]
@@ -1550,7 +1570,7 @@ class App(tk.Tk):
         if rc != 0:
             # Say so — a silent return leaves blank Controller fields with no
             # explanation.
-            self._status(self._kubectl_rc_error(rc) or
+            self._status(self._rc_error(rc, "kubectl") or
                          f"Controller detection failed: {stderr.strip()[:60]}",
                          "err")
             return
@@ -1581,7 +1601,7 @@ class App(tk.Tk):
         if ctx != self._enc_ctx.get():
             return
         if rc != 0:
-            self._status(self._kubectl_rc_error(rc) or
+            self._status(self._rc_error(rc, "kubectl") or
                          f"Namespace fetch failed: {stderr.strip()[:60]}", "err")
             return
         nss = stdout.strip().split()
@@ -1607,7 +1627,7 @@ class App(tk.Tk):
         if rc != 0:
             # Say so — a silent return leaves an empty Secret combobox that
             # reads as "no secrets in this namespace".
-            self._status(self._kubectl_rc_error(rc) or
+            self._status(self._rc_error(rc, "kubectl") or
                          f"Secret list fetch failed: {stderr.strip()[:60]}",
                          "err")
             return
@@ -1647,7 +1667,7 @@ class App(tk.Tk):
         if self._discard_stale(gen, "the template load"):
             return
         if rc != 0:
-            self._status(self._kubectl_rc_error(rc) or
+            self._status(self._rc_error(rc, "kubectl") or
                          f"kubectl error: {stderr.strip()[:80]}", "err")
             return
         try:

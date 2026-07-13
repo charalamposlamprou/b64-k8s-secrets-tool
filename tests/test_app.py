@@ -1025,14 +1025,15 @@ def test_load_template_discards_result_after_concurrent_row_edit():
 
 def test_kubectl_rc_error_consistent_across_call_sites():
     """_got_contexts/_got_controller (and the other kubectl landing
-    callbacks) map run_bg's not-found sentinel through the same
-    _kubectl_rc_error helper, so a missing kubectl reads identically
-    everywhere instead of five near-but-not-quite-identical strings."""
+    callbacks) map run_bg's not-found sentinel through the same shared
+    _rc_error helper, so a missing kubectl reads identically everywhere
+    instead of five near-but-not-quite-identical strings."""
     win = _make_win()
     try:
-        assert win._kubectl_rc_error(-1) == "kubectl not in PATH"
-        assert win._kubectl_rc_error(-2) == "kubectl timed out"
-        assert win._kubectl_rc_error(0) is None
+        assert win._rc_error(-1, "kubectl") == "kubectl not in PATH"
+        assert win._rc_error(-2, "kubectl") == "kubectl timed out"
+        assert win._rc_error(0, "kubectl") is None
+        assert win._rc_error(-1, "kubeseal") == "kubeseal not in PATH"
 
         win._got_contexts("", "Command not found: kubectl", -1)
         ctx_msg = win._status_var.get()
@@ -1042,5 +1043,43 @@ def test_kubectl_rc_error_consistent_across_call_sites():
         controller_msg = win._status_var.get()
 
         assert ctx_msg == controller_msg == "kubectl not in PATH"
+    finally:
+        win.destroy()
+
+
+def test_kv_key_edited_ignores_navigation_only_keyrelease():
+    """<KeyRelease> also fires on pure cursor movement (arrows, Tab,
+    Home/End), not just actual typing. _kv_key_edited must only bump
+    _kv_edit_gen when the key text actually changed, or an unrelated
+    in-flight read/fetch gets falsely discarded on a stray arrow-key press."""
+    win = _make_win()
+    try:
+        rd = win._kv_add_row("KEY", "value")
+        gen = win._kv_edit_gen
+
+        win._kv_key_edited(rd)          # simulates KeyRelease, no text change
+        assert win._kv_edit_gen == gen  # not bumped
+
+        rd["key_e"].insert("end", "2")  # an actual edit
+        win._kv_key_edited(rd)
+        assert win._kv_edit_gen == gen + 1
+    finally:
+        win.destroy()
+
+
+def test_kv_value_edited_ignores_noop_set():
+    """The value StringVar's write trace also fires on a same-value .set()
+    (e.g. the Edit… popup's Save with no change). _kv_value_edited must only
+    bump _kv_edit_gen when the value actually changed."""
+    win = _make_win()
+    try:
+        rd = win._kv_add_row("KEY", "value")
+        gen = win._kv_edit_gen
+
+        rd["var"].set("value")          # same value — the popup's no-op save
+        assert win._kv_edit_gen == gen  # not bumped
+
+        rd["var"].set("changed")        # an actual edit
+        assert win._kv_edit_gen == gen + 1
     finally:
         win.destroy()
