@@ -25,17 +25,24 @@ except ImportError:
 
 
 def _resolve_version() -> str:
-    """Best-effort app version.
+    """Best-effort app version, cheaply (no subprocess) — runs at import.
 
     Release tarballs carry a stamped ``_version.py`` (written by the release
-    workflow); a plain git checkout falls back to ``git describe``; failing
-    both, the version is unknown.
+    workflow). A plain git checkout has no stamp; App resolves ``git
+    describe`` on a background thread after startup instead (_set_version),
+    so a slow or absent git can't stall the window for the subprocess
+    timeout on every launch.
     """
     try:
         from _version import __version__ as stamped
         return stamped
     except Exception:
-        pass
+        return "unknown"
+
+
+def _git_describe_version():
+    """``git describe`` fallback for a plain checkout, or None. Blocking
+    (up to 2s) — call it off the UI thread."""
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         out = subprocess.run(
@@ -45,7 +52,7 @@ def _resolve_version() -> str:
             return out.stdout.strip().lstrip("v")
     except Exception:
         pass
-    return "unknown"
+    return None
 
 
 __version__ = _resolve_version()
@@ -150,6 +157,11 @@ class App(tk.Tk):
         # fast leaves the Controller fields blank until detection lands; Validate
         # checks this so it doesn't run against an empty/stale controller.
         self._ctl_pending = None
+        # Newest-wins tokens for in-flight background ops, per key (see
+        # _claim_latest): rapid re-selection can leave two lookups for the
+        # SAME value in flight, which value-equality landing guards (e.g.
+        # _got_ns's ctx check) cannot tell apart.
+        self._latest_tok = {}
         # Whether a seal / validate kubeseal run is currently in flight. These
         # gate the action buttons (see _refresh_action_buttons) so a controller
         # lookup landing mid-operation can't re-enable a button under it.
@@ -184,6 +196,21 @@ class App(tk.Tk):
         # back via self.after(), which raises RuntimeError before mainloop
         # starts (e.g. kubectl missing fails the thread instantly).
         self.after(0, self._fetch_contexts)
+        if __version__ == "unknown":
+            # No stamped version — resolve `git describe` off the UI thread
+            # (it can take up to its 2s timeout; doing it at import time
+            # stalled every launch). Deferred like _fetch_contexts above.
+            self.after(0, lambda: self._run_async(_git_describe_version,
+                                                  self._set_version))
+
+    def _set_version(self, ver):
+        """Landing callback for the deferred git-describe version lookup."""
+        if not ver:
+            return  # git absent / not a checkout — keep "unknown"
+        global __version__
+        __version__ = ver
+        self.title(f"b64 - Kubernetes Secrets Tool — v{ver}")
+        self._ver_lbl.configure(text=f"v{ver}")
 
     def _fix_x11_paste(self):
         """On X11, tk.Text's default <<Paste>> inserts at the cursor without
@@ -321,8 +348,11 @@ class App(tk.Tk):
         # this separator (pack after=) rather than relying on packing order.
         self._status_sep = tk.Frame(self, bg=BORDER, height=1)
         self._status_sep.pack(side="bottom", fill="x")
-        tk.Label(bar, text=f"v{__version__}", bg=BG, fg=FGDIM,
-                 anchor="e", padx=10, font=(SANS, SZ - 1)).pack(side="right")
+        # Kept as an attribute so _set_version can update it once the
+        # deferred git-describe lookup lands.
+        self._ver_lbl = tk.Label(bar, text=f"v{__version__}", bg=BG, fg=FGDIM,
+                                 anchor="e", padx=10, font=(SANS, SZ - 1))
+        self._ver_lbl.pack(side="right")
         self._status_var = tk.StringVar(value="Ready")
         self._status_lbl = tk.Label(
             bar, textvariable=self._status_var,
@@ -679,6 +709,11 @@ class App(tk.Tk):
                 self._kv_set_row_visible(rd, show)
 
     def _kv_clear(self):
+        # Per-secret state is reset HERE, at the row-replacement choke point
+        # (see _kv_set_pairs) — not left to caller discipline.
+        self._tpl_binary = {}
+        self._tpl_carry = {}
+        self._tpl_skipped = 0
         for rd in list(self._kv_rows):
             rd["frame"].destroy()
         self._kv_rows.clear()
@@ -696,15 +731,24 @@ class App(tk.Tk):
         self._tpl_binary = {}
         return len(dropped)
 
-    def _kv_set_pairs(self, pairs, binary_keys=None):
-        """Replace all rows with `pairs` (key, value) plus a read-only marker row
-        for each key in `binary_keys`. Keeps one blank row if everything's empty."""
+    def _kv_set_pairs(self, pairs, binary=None):
+        """Replace all rows with `pairs` (key, value) plus a read-only marker
+        row per `binary` entry (key → original base64, re-emitted verbatim on
+        Generate). Keeps one blank row if everything's empty. Owns the
+        per-secret state swap: _tpl_binary/_tpl_carry/_tpl_skipped are reset
+        HERE, at the choke point, so a load path can't forget one — stale
+        _tpl_binary would silently re-emit deleted values into generated
+        YAML. (The one caller with real carryover, _apply_secret_doc,
+        assigns it via _set_secret_identity right after.)"""
+        self._tpl_binary = dict(binary or {})
+        self._tpl_carry = {}
+        self._tpl_skipped = 0
         for rd in list(self._kv_rows):
             rd["frame"].destroy()
         self._kv_rows.clear()
         for k, v in pairs:
             self._kv_add_row(k, v)
-        for k in (binary_keys or []):
+        for k in self._tpl_binary:
             self._kv_add_row(k, binary=True)
         if not self._kv_rows:
             self._kv_add_row()
@@ -714,11 +758,13 @@ class App(tk.Tk):
         """The secret in the editor changed — any generated YAML and any
         sealed output describe the *previous* one, so clear both, advance the
         generation (in-flight seal/validate results become stale), and re-gate
-        the Seal-tab buttons. Called structurally from two tails: the
+        the Seal-tab buttons. Called structurally from two tails — the
         row-replacement choke points (_kv_set_pairs / _kv_clear — Browse .env
         / Import / full Load Template / Clear) and _set_secret_identity (every
         doc-driven identity change, including the identity-only load, which
-        replaces no rows). A future repopulation path that neither replaces
+        replaces no rows) — plus _gen_yaml, because regenerating over an
+        in-place row-value edit changes what the panes describe without
+        passing either tail. A future repopulation path that neither replaces
         rows nor sets a doc identity must call it itself."""
         self._out_gen += 1  # in-flight seal/validate results are now stale
         self._set_text(self._yaml_out, "")
@@ -823,13 +869,13 @@ class App(tk.Tk):
             filetypes=[(".env files", "*.env"), ("All files", "*.*")])
         if not path:
             return
-        text = self._read_file(path)
-        if text is None:
-            return
+        self._read_editor_file(path, self._env_read)
+
+    def _env_read(self, path, text):
+        """Landing callback for Browse .env's background file read."""
         self._env_lbl.configure(text=path)
-        self._tpl_binary = {}  # a plain .env carries no binary passthrough...
-        self._tpl_carry = {}   # ...and no metadata to carry over
-        self._tpl_skipped = 0
+        # _kv_set_pairs resets the per-secret state — right for a plain .env,
+        # which carries no binary passthrough and no metadata to carry over.
         self._kv_set_pairs(parse_dotenv(text).items())  # invalidates outputs
         self._sec_type.set("Opaque")
         self._status(f"Loaded {os.path.basename(path)}", "ok")
@@ -845,9 +891,10 @@ class App(tk.Tk):
             filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")])
         if not path:
             return
-        content = self._read_file(path)
-        if content is None:
-            return
+        self._read_editor_file(path, self._import_read)
+
+    def _import_read(self, path, content):
+        """Landing callback for Import Secret…'s background file read."""
         doc = self._yaml_secret_doc(content, verb="import")
         if doc is None:
             return
@@ -883,10 +930,7 @@ class App(tk.Tk):
 
     def _clear_env(self):
         self._env_lbl.configure(text="(no file)")
-        self._tpl_binary = {}
-        self._tpl_carry = {}
-        self._tpl_skipped = 0
-        self._kv_clear()  # invalidates outputs
+        self._kv_clear()  # resets per-secret state, invalidates outputs
         self._sec_type.set("Opaque")
         self._status("Cleared", "ok")
 
@@ -903,6 +947,12 @@ class App(tk.Tk):
         if not type_:
             type_ = "Opaque"
             self._sec_type.set(type_)
+        # The panes are about to describe a NEW generation of the secret:
+        # advance the guard so an in-flight seal/validate of the previous
+        # YAML lands stale, and retire sealed output that no longer matches
+        # what this pane will show. (An in-place row-value edit passes no
+        # repopulation choke point — this is where it takes effect.)
+        self._invalidate_outputs()
         self._set_text(self._yaml_out,
                        build_secret_yaml(name, ns, data, type_, raw_data=raw,
                                          carryover=self._tpl_carry))
@@ -1027,9 +1077,12 @@ class App(tk.Tk):
             filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")])
         if not path:
             return
-        content = self._read_file(path)
-        if content is None:
-            return
+        # Own newest-wins key: the decode table has no generation counter, so
+        # two overlapping picks must be serialized by the token alone.
+        self._read_file_async(path, "decode-read", self._decode_read)
+
+    def _decode_read(self, path, content):
+        """Landing callback for the Decode tab's background file read."""
         # Label only on success: on a bail (SealedSecret / no Secret / parse
         # error) the previous file's rows stay on screen, and the label must
         # keep naming *them*, not the file that failed to decode.
@@ -1234,6 +1287,37 @@ class App(tk.Tk):
                lambda o, e, r: self.after(0, lambda: handler(o, e, r, gen)),
                stdin_data=stdin_data)
 
+    def _claim_latest(self, key: str):
+        """Mark a new in-flight background op for `key`, superseding any
+        earlier one still running: the returned token stays current until the
+        next claim under the same key. A landing op whose token is no longer
+        current must drop its result — the value-equality guards in the
+        landing callbacks (e.g. _got_ns's ctx check) cannot tell two
+        in-flight lookups for the SAME selection apart, so without this the
+        older result can land last and overwrite the newer one (or clear its
+        in-flight flag, e.g. _ctl_pending, while it is still running)."""
+        tok = object()
+        self._latest_tok[key] = tok
+        return tok
+
+    def _is_latest(self, key: str, tok) -> bool:
+        return self._latest_tok.get(key) is tok
+
+    def _dispatch_latest(self, key, cmd, handler, *args):
+        """Run `cmd` in the background and land handler(*args, stdout,
+        stderr, rc) on the UI thread — unless a newer dispatch claimed `key`
+        meanwhile (see _claim_latest). The plain companion of _dispatch_gen
+        for the selector-driven kubectl fetches, and the one place their
+        self.after marshal is written: Tk is not thread-safe, so a new fetch
+        call site should come through here rather than hand-rolling the
+        wrapper (and possibly forgetting it)."""
+        tok = self._claim_latest(key)
+
+        def land(o, e, r):
+            if self._is_latest(key, tok):
+                handler(*args, o, e, r)
+        run_bg(cmd, lambda o, e, r: self.after(0, land, o, e, r))
+
     def _discard_stale(self, gen, verb, hint=""):
         """True (with an explanatory status) when a background result was made
         stale by an editor repopulation while it ran — the shared guard for
@@ -1351,8 +1435,9 @@ class App(tk.Tk):
     # -------------------------------------------------------- kubectl integration
 
     def _fetch_contexts(self):
-        run_bg(["kubectl", "config", "get-contexts", "-o", "name"],
-               lambda o, e, r: self.after(0, lambda: self._got_contexts(o, e, r)))
+        self._dispatch_latest("contexts",
+                              ["kubectl", "config", "get-contexts", "-o", "name"],
+                              self._got_contexts)
 
     def _got_contexts(self, stdout, stderr, rc):
         if rc == -1:
@@ -1401,12 +1486,12 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "svc", "-A", f"--context={ctx}", "-o",
                "jsonpath={range .items[*]}{.metadata.namespace}{'\\t'}"
                "{.metadata.name}{'\\n'}{end}"]
-        run_bg(cmd, lambda o, e, r: self.after(0,
-               lambda: self._got_controller(ctx, o, e, r)))
+        self._dispatch_latest("controller", cmd, self._got_controller, ctx)
 
     def _got_controller(self, ctx, stdout, stderr, rc):
-        # Lookups run on background threads and resolve out of order; ignore a
-        # stale result if the user has since switched to a different context.
+        # Ignore a stale result if the user has since switched to a different
+        # context. (An older in-flight lookup for the SAME context — which
+        # this check can't distinguish — is dropped by _dispatch_latest.)
         if ctx != self._seal_ctx.get():
             return
         # This is the result for the current context — detection is no longer in
@@ -1415,6 +1500,10 @@ class App(tk.Tk):
         self._ctl_pending = None
         self._refresh_action_buttons()
         if rc != 0:
+            # Say so — a silent return leaves blank Controller fields with no
+            # explanation (run_bg substitutes clean text for its sentinels).
+            self._status("Controller detection failed: "
+                         f"{stderr.strip()[:60]}", "err")
             return
         svcs = []
         for line in stdout.splitlines():
@@ -1435,11 +1524,11 @@ class App(tk.Tk):
     def _fetch_namespaces(self, ctx: str):
         cmd = ["kubectl", "get", "namespaces", f"--context={ctx}",
                "-o", "jsonpath={.items[*].metadata.name}"]
-        run_bg(cmd, lambda o, e, r: self.after(0, lambda: self._got_ns(ctx, o, e, r)))
+        self._dispatch_latest("namespaces", cmd, self._got_ns, ctx)
 
     def _got_ns(self, ctx, stdout, stderr, rc):
-        # Lookups run on background threads and resolve out of order; ignore a
-        # stale result if the user has since switched to a different context.
+        # Ignore a stale result if the user has since switched to a different
+        # context (same-context overlap is dropped by _dispatch_latest).
         if ctx != self._enc_ctx.get():
             return
         if rc != 0:
@@ -1459,13 +1548,16 @@ class App(tk.Tk):
     def _fetch_secrets(self, ctx: str, ns: str):
         cmd = ["kubectl", "get", "secrets", f"--context={ctx}", f"--namespace={ns}",
                "-o", "jsonpath={.items[*].metadata.name}"]
-        run_bg(cmd, lambda o, e, r: self.after(0,
-               lambda: self._got_secrets(ctx, ns, o, e, r)))
+        self._dispatch_latest("secrets", cmd, self._got_secrets, ctx, ns)
 
     def _got_secrets(self, ctx, ns, stdout, stderr, rc):
         if ctx != self._enc_ctx.get() or ns != self._enc_ns.get():
             return
         if rc != 0:
+            # Say so — a silent return leaves an empty Secret combobox that
+            # reads as "no secrets in this namespace".
+            self._status(f"Secret list fetch failed: {stderr.strip()[:60]}",
+                         "err")
             return
         secs = stdout.strip().split()
         self._sec_cb["values"] = secs
@@ -1551,7 +1643,7 @@ class App(tk.Tk):
         the _check_entries guard, so the base64 decode pass runs only once.
         (doc normalization lives in _set_secret_identity, the only place doc
         is read.) Returns (total_keys, binary_keys) for the status line."""
-        self._tpl_binary = {}
+        binary = {}
         text_pairs = []
         for k, value, kind in entries:
             if kind == "text":
@@ -1559,20 +1651,20 @@ class App(tk.Tk):
             else:
                 # binary can't be edited as text without corrupting it on
                 # re-encode: keep the original base64 and re-emit it verbatim
-                # at Generate (tracked in _tpl_binary). A marker row shows it
-                # in the editor. ("invalid" never reaches here — both callers
-                # run _check_entries first.)
-                self._tpl_binary[k] = value
+                # at Generate (installed as _tpl_binary by _kv_set_pairs). A
+                # marker row shows it in the editor. ("invalid" never reaches
+                # here — both callers run _check_entries first.)
+                binary[k] = value
         # _kv_set_pairs and _set_secret_identity each invalidate outputs (and
-        # so refresh the skip warning); the first runs with the PREVIOUS
-        # secret's _tpl_skipped, the second with this doc's. Both are
-        # synchronous within this call with no event-loop turn between, so the
-        # transient intermediate never renders — but keep them in this order
-        # (rows, then identity+skip count) if a later change adds an async
-        # boundary here, or the stale count could briefly flash.
-        self._kv_set_pairs(text_pairs, binary_keys=list(self._tpl_binary.keys()))
+        # so refresh the skip warning); the first resets _tpl_skipped, the
+        # second assigns this doc's. Both are synchronous within this call
+        # with no event-loop turn between, so the transient intermediate
+        # never renders — but keep them in this order (rows, then
+        # identity+skip count) if a later change adds an async boundary here,
+        # or a zero count could briefly flash.
+        self._kv_set_pairs(text_pairs, binary=binary)
         self._set_secret_identity(doc, fb_name, fb_ns)
-        return len(entries), len(self._tpl_binary)
+        return len(entries), len(binary)
 
     def _apply_identity_only(self, doc, fb_name, fb_ns):
         """Apply an entry-less Secret to the editor — _apply_secret_doc's
@@ -1684,17 +1776,45 @@ class App(tk.Tk):
                 continue
         return False
 
-    def _read_file(self, path: str):
-        """Read a user-picked text file, reporting failure in the status bar.
-        Returns the content, or None on error. Explicit UTF-8: the locale
-        default (e.g. cp1252 on Windows) would reject or mojibake non-ASCII
-        secret values saved as UTF-8."""
-        try:
-            with open(path, encoding="utf-8") as f:
-                return f.read()
-        except (OSError, UnicodeDecodeError) as e:
-            self._status(f"Could not read file: {e}", "err")
-            return None
+    def _read_file_async(self, path: str, key: str, done):
+        """Read a user-picked text file off the UI thread (a network mount or
+        cloud-sync placeholder can stall open()/read(), which would freeze the
+        whole window), then done(path, text) on the UI thread. Newest-wins on
+        `key` (_claim_latest): picking another file while a slow read hangs
+        supersedes it. Explicit UTF-8: the locale default (e.g. cp1252 on
+        Windows) would reject or mojibake non-ASCII secret values saved as
+        UTF-8. On read failure, reports in the status bar; done isn't called."""
+        tok = self._claim_latest(key)
+
+        def work():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return f.read()
+            except (OSError, UnicodeDecodeError) as e:
+                return e
+
+        def landed(result):
+            if not self._is_latest(key, tok):
+                return  # superseded by a newer pick
+            if isinstance(result, Exception):
+                self._status(f"Could not read file: {result}", "err")
+                return
+            done(path, result)
+        self._run_async(work, landed)
+
+    def _read_editor_file(self, path: str, done):
+        """_read_file_async for files headed into the KV editor (Browse .env /
+        Import Secret…): the two share one newest-wins key, plus the
+        generation guard — a Load Template / Clear that repopulated the
+        editor while the read ran makes this result stale (same rule as
+        _dispatch_gen results)."""
+        gen = self._out_gen
+
+        def landed(p, text):
+            if self._discard_stale(gen, "the file read"):
+                return
+            done(p, text)
+        self._read_file_async(path, "editor-read", landed)
 
     def _yaml_secret_doc(self, content: str, verb: str):
         """Parse YAML text (multi-doc tolerant — manifests often bundle several
@@ -1716,14 +1836,30 @@ class App(tk.Tk):
         return doc
 
     def _write_file(self, path: str, content: str):
-        try:
-            write_secret_file(path, content)  # owner-only (0o600) — holds secrets
+        """Write secret-bearing output off the UI thread (a slow destination
+        would freeze the window — same reasoning as _read_file_async). The
+        skip count is frozen at dispatch, like _clip's, so the confirmation
+        describes the saved payload, not editor state the user reached while
+        the write ran."""
+        skipped = self._tpl_skipped
+
+        def work():
+            try:
+                write_secret_file(path, content)  # owner-only (0o600) write
+                return None
+            except OSError as e:
+                return e
+
+        def landed(err):
+            if err is not None:
+                self._status(f"Save failed: {err}", "err")
+                return
             # Via _status_output: a plain green "Saved" would erase the lossy-
             # carryover warning at the exact moment the incomplete file lands
             # on disk (both save paths hold YAML derived from the generation).
-            self._status_output(f"Saved {os.path.basename(path)}")
-        except OSError as e:
-            self._status(f"Save failed: {e}", "err")
+            self._status_output(f"Saved {os.path.basename(path)}",
+                                skipped=skipped)
+        self._run_async(work, landed)
 
 
 if __name__ == "__main__":

@@ -80,10 +80,22 @@ def parse_dotenv(text: str) -> dict:
 # Values that survive a bare (unquoted) .env line verbatim.
 _BARE_ENV = re.compile(r"[A-Za-z0-9_./:@+,=-]+\Z")
 
+# Keys parse_dotenv reads back unchanged. Every Kubernetes-legal secret key
+# ([-._a-zA-Z0-9]+) qualifies; anything else (whitespace, '=', a leading
+# '#', ...) has no .env spelling at all — the format cannot quote keys.
+_SAFE_ENV_KEY = re.compile(r"[A-Za-z0-9_.-]+\Z")
+
 
 def dotenv_line(key: str, val: str) -> str:
     """Render KEY=value so parse_dotenv reads the exact value back:
-    bare when safe, otherwise double-quoted with escaping."""
+    bare when safe, otherwise double-quoted with escaping.
+
+    Raises ValueError for a key with no .env spelling (keys can't be
+    quoted): parse_dotenv would drop the line entirely (leading '#' reads
+    as a comment) or corrupt it ('=' in the key splits early), so emitting
+    it would be silent data loss, not a round-trip."""
+    if not _SAFE_ENV_KEY.match(key):
+        raise ValueError(f".env cannot represent key {key!r}")
     if _BARE_ENV.match(val):
         return f"{key}={val}"
     esc = (val.replace("\\", "\\\\").replace('"', '\\"')
@@ -285,11 +297,19 @@ def secret_entries(doc) -> list:
             if v is None:  # genuinely missing value (`KEY:`); 0/False are real
                 put(k, (k, "", "text"))
                 continue
+            s = str(v)
+            if not b64_valid_for_k8s(s):
+                # Check BEFORE decoding: the forgiving b64_decode strips all
+                # whitespace, so base64 with a stray inner space decodes fine
+                # here yet is rejected by Kubernetes' Go decoder (only \r/\n
+                # are ignored) — that must surface as invalid, not import
+                # silently as clean text and fail at apply time.
+                put(k, (k, s, "invalid"))
+                continue
             try:
-                put(k, (k, b64_decode(str(v), errors="strict"), "text"))
-            except Exception:
-                kind = "binary" if b64_valid_for_k8s(str(v)) else "invalid"
-                put(k, (k, str(v), kind))
+                put(k, (k, b64_decode(s, errors="strict"), "text"))
+            except Exception:  # valid base64, not UTF-8 text
+                put(k, (k, s, "binary"))
 
     sdata = doc.get("stringData")
     if isinstance(sdata, dict):

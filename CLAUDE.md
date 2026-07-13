@@ -71,23 +71,42 @@ returncode)` callback contract (plus sentinel codes for not-found/timeout).
 Never call `subprocess.run` directly from a UI callback. `_run_async(work,
 done)` is the more general form — it runs any callable on a daemon thread and
 delivers its return value to `done(result)` — for background work whose result
-doesn't fit `run_bg`'s stdout/stderr/rc shape (e.g. the Linux clipboard write,
-which is itself a subprocess but returns a plain success bool).
+doesn't fit `run_bg`'s stdout/stderr/rc shape: the Linux clipboard write, and
+all file I/O on user-picked paths (`_read_file_async`/`_read_editor_file` for
+Browse/Import reads, `_write_file` for saves — a network mount or cloud-sync
+placeholder can stall `open()`/`read()`/`write()` and would freeze the
+window). Tests make these synchronous by stubbing `_run_async` to run inline
+(`_sync_io` in `tests/test_app.py`) instead of pumping the event loop.
 
 ### The staleness guard: `_out_gen` / `_dispatch_gen` / `_discard_stale`
 
 Because background results land asynchronously, a fetch or seal dispatched for
 one secret can complete *after* the user has already loaded a different one.
-`_out_gen` is an integer bumped every time the editor's secret changes
-(`_invalidate_outputs`, called from the row-replacement choke points
-`_kv_set_pairs`/`_kv_clear` and from `_set_secret_identity`). Any background
-op whose result writes into `_yaml_out`/`_sealed_out` must dispatch through
-`_dispatch_gen()` (captures the current generation) and check it on landing
-via `_discard_stale()` — if the generation changed while the op was in
-flight, the result is stale and gets discarded rather than applied. `_do_seal`/
-`_on_sealed` and `_load_template`/`_got_template` follow this pattern; adopt
-it for any new background op that writes into those panes rather than
-inventing a one-off guard.
+`_out_gen` is an integer bumped every time what the output panes describe
+changes (`_invalidate_outputs`, called from the row-replacement choke points
+`_kv_set_pairs`/`_kv_clear`, from `_set_secret_identity`, and from `_gen_yaml`
+— regenerating over an in-place row-value edit changes the panes without
+replacing rows). Any background op whose result writes into
+`_yaml_out`/`_sealed_out` must dispatch through `_dispatch_gen()` (captures
+the current generation) and check it on landing via `_discard_stale()` — if
+the generation changed while the op was in flight, the result is stale and
+gets discarded rather than applied. `_do_seal`/`_on_sealed` and
+`_load_template`/`_got_template` follow this pattern; adopt it for any new
+background op that writes into those panes rather than inventing a one-off
+guard.
+
+The selector-driven kubectl fetches (contexts / controller / namespaces /
+secret list) use the companion `_dispatch_latest(key, cmd, handler, *args)`:
+a newest-wins token per key (`_claim_latest`/`_is_latest`). Their landing
+callbacks also compare the captured ctx/ns against the current combobox
+selection, but that value-equality check cannot tell two in-flight lookups
+for the *same* selection apart (switch prod → staging → prod fast and the
+older prod result could land last, overwriting the newer one or clearing the
+`_ctl_pending` guard while the newer lookup still runs) — the token handles
+that ordering. `_read_file_async` reuses the same tokens so a newer file pick
+supersedes a hung read. New fetch call sites should come through
+`_dispatch_latest` — it is also the one place the `self.after` marshal to the
+UI thread is written.
 
 ### Per-secret state that must stay consistent
 
@@ -95,17 +114,18 @@ Loading/importing a secret populates three parallel pieces of state:
 `_tpl_binary` (base64 values that can't round-trip as plaintext — re-emitted
 verbatim), `_tpl_carry` (labels/annotations/`immutable` carried through from
 the source doc, via `core.secret_carryover`), and `_tpl_skipped` (count of
-malformed metadata fields dropped rather than silently corrupted). They are
-reset on different paths, not one shared choke point — the usual source of
-"a load path forgot to reset X" bugs. Before changing any code that replaces
-the editor's secret, grep for every `self._tpl_binary =` / `self._tpl_carry` /
-`self._tpl_skipped` assignment (the call sites shift as this area gets
-refactored — don't trust a stale list of function names) and confirm your
-change leaves all three consistent with the newly-loaded (or empty) secret.
-One sharp edge: the identity-population step does **not** touch `_tpl_binary`
-— that's reset separately wherever the KV rows themselves are (re)populated.
-When adding a fourth piece of per-secret state, trace where it belongs the
-same way.
+malformed metadata fields dropped rather than silently corrupted). The
+row-replacement choke points own the reset: `_kv_set_pairs(pairs, binary=…)`
+installs the binary passthrough and zeroes carry/skipped, `_kv_clear` zeroes
+all three, and `_set_secret_identity` assigns the newly loaded doc's
+carry/skipped right after (`_apply_secret_doc` relies on that ordering — rows
+first, then identity). Don't reset the trio caller-side; pass `binary=` to
+the choke point instead. One sharp edge remains: the identity-only load
+(`_apply_identity_only`) replaces no rows, so it bypasses the choke points —
+it drops the previous secret's passthrough via `_kv_drop_binary` and then
+sets identity. When adding a fourth piece of per-secret state, wire it into
+`_kv_set_pairs`/`_kv_clear` the same way, and check the identity-only path
+separately.
 
 ### Status messaging
 

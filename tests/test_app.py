@@ -174,12 +174,20 @@ def test_controller_landing_mid_seal_keeps_buttons_disabled():
         win.destroy()
 
 
+def _sync_io(win, monkeypatch):
+    """Run _run_async work inline: file reads/writes (and their landing
+    callbacks) complete synchronously so tests can assert right after the
+    call, without pumping the Tk event loop."""
+    monkeypatch.setattr(win, "_run_async", lambda work, done: done(work()))
+
+
 def _import_file(win, monkeypatch, tmp_path, content):
     """Drive Import Secret… against a temp YAML file, bypassing the dialog."""
     path = tmp_path / "secret.yaml"
     path.write_text(content)
     monkeypatch.setattr(app.filedialog, "askopenfilename",
                         lambda **k: str(path))
+    _sync_io(win, monkeypatch)
     win._import_secret()
     return path
 
@@ -399,8 +407,7 @@ def test_identity_only_load_invalidates_and_drops_binary():
     try:
         # State from a previously loaded secret A: a text row, a binary
         # passthrough, generated + sealed output, and an in-flight seal.
-        win._tpl_binary = {"tls.key": "QUJD"}
-        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._kv_set_pairs([("KEEP", "me")], binary={"tls.key": "QUJD"})
         win._set_text(win._yaml_out,   "kind: Secret  # A\n")
         win._set_text(win._sealed_out, "kind: SealedSecret  # A\n")
         gen = win._out_gen  # a seal dispatched under the old identity
@@ -516,6 +523,7 @@ def test_browse_yaml_keeps_label_on_failed_decode(monkeypatch, tmp_path):
         path.write_text("kind: SealedSecret\nspec:\n  encryptedData:\n    p: AgA=\n")
         monkeypatch.setattr(app.filedialog, "askopenfilename",
                             lambda **k: str(path))
+        _sync_io(win, monkeypatch)
 
         win._browse_yaml()
 
@@ -880,8 +888,7 @@ def test_identity_only_binary_drop_uses_warning_severity():
     pytest.importorskip("yaml")
     win = _make_win()
     try:
-        win._tpl_binary = {"tls.key": "QUJD"}
-        win._kv_set_pairs([("KEEP", "me")], binary_keys=["tls.key"])
+        win._kv_set_pairs([("KEEP", "me")], binary={"tls.key": "QUJD"})
         win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
 
         win._got_template("c", "n", "s",
@@ -890,5 +897,77 @@ def test_identity_only_binary_drop_uses_warning_severity():
 
         assert "dropped 1 binary value(s)" in win._status_var.get()
         assert win._status_lbl.cget("fg") == app.ERR_C
+    finally:
+        win.destroy()
+
+
+def test_regenerate_after_inplace_edit_stales_inflight_seal():
+    """Editing a row's value IN PLACE passes no repopulation choke point, so
+    Generate itself must advance the generation: a seal of the previous YAML
+    still in flight has to land stale instead of overwriting the pane with a
+    manifest that no longer matches the shown YAML — and sealed output of the
+    previous YAML must be retired immediately."""
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("A", "1")])
+        win._gen_yaml()
+        gen = win._out_gen                       # a seal dispatched now
+        win._set_text(win._sealed_out, "kind: SealedSecret  # of A=1\n")
+
+        win._kv_rows[0]["var"].set("2")          # in-place value edit
+        win._gen_yaml()                          # regenerate
+
+        assert win._out_gen != gen               # in-flight seal is now stale
+        assert win._sealed_out.get("1.0", "end").strip() == ""  # retired
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret  # of A=1\n", "", 0, gen)
+        assert "stale result discarded" in win._status_var.get()
+        assert win._sealed_out.get("1.0", "end").strip() == ""  # not resurrected
+    finally:
+        win.destroy()
+
+
+def test_kv_clear_resets_per_secret_state():
+    """_kv_clear/_kv_set_pairs own the per-secret state reset (the choke
+    point): a caller that skips the manual resets must still get a clean
+    slate, or stale _tpl_binary would silently re-emit deleted values into
+    the next Generate."""
+    win = _make_win()
+    try:
+        win._kv_set_pairs([("A", "1")], binary={"blob": "QUJD"})
+        win._tpl_carry = {"labels": {"x": "y"}}
+        win._tpl_skipped = 2
+
+        win._kv_clear()
+
+        assert win._tpl_binary == {}
+        assert win._tpl_carry == {}
+        assert win._tpl_skipped == 0
+        win._gen_yaml()  # nothing left — must not resurrect the binary blob
+        assert "No KEY=VALUE pairs found" in win._status_var.get()
+    finally:
+        win.destroy()
+
+
+def test_dispatch_latest_drops_superseded_result(monkeypatch):
+    """Two in-flight lookups for the SAME selection: the older result landing
+    last must be dropped — the value-equality guards in the landing callbacks
+    can't tell the two apart (the controller-detection race)."""
+    win = _make_win()
+    try:
+        landings = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: landings.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        got = []
+        win._dispatch_latest("k", ["cmd1"],
+                             lambda o, e, r: got.append(("old", o)))
+        win._dispatch_latest("k", ["cmd2"],
+                             lambda o, e, r: got.append(("new", o)))
+
+        landings[1]("out2", "", 0)   # newer lands first
+        landings[0]("out1", "", 0)   # older lands last — must be dropped
+
+        assert got == [("new", "out2")]
     finally:
         win.destroy()

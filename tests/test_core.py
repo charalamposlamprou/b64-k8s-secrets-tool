@@ -90,6 +90,15 @@ def test_dotenv_line_round_trips(value):
     assert core.parse_dotenv(line) == {"KEY": value}
 
 
+@pytest.mark.parametrize("key", ["#FOO", "A=B", "SP ACE", "", "K\n", " KEY"])
+def test_dotenv_line_rejects_unrepresentable_keys(key):
+    # .env has no key quoting: a leading '#' would read back as a comment
+    # (silent data loss), '=' in the key would split early (corruption) —
+    # such keys must raise instead of emitting a lossy line.
+    with pytest.raises(ValueError):
+        core.dotenv_line(key, "v")
+
+
 # --------------------------------------------------------------------------
 # YAML scalar quoting
 # --------------------------------------------------------------------------
@@ -273,6 +282,16 @@ def test_secret_entries_flags_invalid_base64_as_invalid():
     b64 = base64.b64encode(b"\xff\xfe\x00raw").decode()
     [(_k, _v, kind)] = core.secret_entries({"data": {"CERT": b64}})
     assert kind == "binary"
+
+
+def test_secret_entries_rejects_base64_with_inner_space():
+    # A stray internal space decodes under the forgiving b64_decode (which
+    # strips ALL whitespace) but Kubernetes' Go decoder ignores only \r/\n —
+    # it must surface as "invalid", not import silently as clean text and
+    # then fail at apply time.
+    [(_k, value, kind)] = core.secret_entries({"data": {"G": "aGVs bG8="}})
+    assert kind == "invalid"
+    assert value == "aGVs bG8="  # original preserved for the error message
 
 
 def test_b64_valid_for_k8s_matches_go_semantics():
