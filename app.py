@@ -1504,7 +1504,7 @@ class App(tk.Tk):
         # catches a wrong key/controller, wrong scope, or wrong name/namespace —
         # the mis-seals that otherwise only surface at apply time. Creates nothing.
         sealed = self._require_sealed()
-        if sealed is None:
+        if not sealed:
             return
         # Controller lookup for the current context hasn't landed yet — validating
         # now would hit an empty/stale controller and fail confusingly.
@@ -1536,26 +1536,28 @@ class App(tk.Tk):
         self._status("Valid — the controller can decrypt this", "ok")
 
     def _require_sealed(self):
-        """The sealed YAML in the output pane, or None — with the status bar
-        already set to the shared "nothing to act on" message. The guard
-        Validate / Copy Sealed / Save Sealed… all need before touching the
-        pane (an error dump in it must never leave the app as if it were a
+        """The sealed YAML in the output pane, or '' — with the status bar
+        already set to the shared "nothing to act on" message. Same falsy
+        convention as _sealed_output() (a real manifest is never legitimately
+        empty), so every caller can use the codebase's usual `if not sealed`
+        rather than a second, None-based empty check. The guard Validate /
+        Copy Sealed / Save Sealed… all need before touching the pane (an
+        error dump in it must never leave the app as if it were a
         manifest)."""
         sealed = self._sealed_output()
         if not sealed:
             self._status("Seal a secret first", "err")
-            return None
         return sealed
 
     def _copy_sealed(self):
         sealed = self._require_sealed()
-        if sealed is None:
+        if not sealed:
             return
         self._clip(sealed, qualify=True)
 
     def _save_sealed(self):
         sealed = self._require_sealed()
-        if sealed is None:
+        if not sealed:
             return
         name = self._sec_name.get().strip() or DEF_NAME
         path = filedialog.asksaveasfilename(
@@ -1626,20 +1628,8 @@ class App(tk.Tk):
         if ctx in self._ctl_cache:
             hit = self._ctl_cache[ctx]
             self._ctl_pending = None
-            # Claim (supersede) the "controller" token even on a hit: an
-            # older still-in-flight lookup for a DIFFERENT context — one
-            # this cache hit interrupted — would otherwise keep it as
-            # "latest" and, if the user returns to that still-uncached
-            # context before the old lookup lands, _detect_controller would
-            # dispatch a SECOND redundant kubectl call for it (the in-flight
-            # one's stale result is still correctly dropped by _is_latest
-            # either way — this only saves the extra cluster round-trip).
-            self._claim_latest("controller")
             if hit:
-                ns, name = hit
-                self._set_ro_entry(self._ctl_name, name)
-                self._set_ro_entry(self._ctl_ns, ns)
-                self._status(f"Sealed-secrets controller: {ns}/{name}", "ok")
+                self._apply_controller(*hit)
             # else: no controller in this cluster — RO fields stay blank
             # (the caller clears them before calling), matching a live
             # lookup's own no-controller-found behavior, which is silent too.
@@ -1688,6 +1678,12 @@ class App(tk.Tk):
         ns, name = next((s for s in svcs if s[1] == "sealed-secrets-controller"),
                         svcs[0])
         self._ctl_cache[ctx] = (ns, name)  # reused on re-selection
+        self._apply_controller(ns, name)
+
+    def _apply_controller(self, ns: str, name: str):
+        """Fill the Controller name/NS fields and confirm — shared by a fresh
+        detection landing and a _ctl_cache hit, so the two can't drift on
+        what "found" looks like."""
         self._set_ro_entry(self._ctl_name, name)
         self._set_ro_entry(self._ctl_ns, ns)
         self._status(f"Sealed-secrets controller: {ns}/{name}", "ok")
@@ -1757,6 +1753,15 @@ class App(tk.Tk):
         # since the selection moved on). Keying per-selection supersedes
         # only genuine same-selection re-dispatches, leaving cross-selection
         # ordering to the existing (ctx, ns, sec) / _discard_stale checks.
+        #
+        # Defense-in-depth, not a live bug today: _load_btn.configure
+        # (state="disabled") two lines above is currently the ONLY thing
+        # preventing a second concurrent dispatch — there's no keyboard
+        # binding or other call site, and the button only re-enables once
+        # _got_template finishes processing this one. If that invariant
+        # ever slips (a keyboard shortcut, a changed re-enable point), this
+        # token is what keeps a same-selection double-dispatch harmless
+        # instead of silently reintroducing the race.
         key = ("template", ctx, ns, sec)
         tok = self._claim_latest(key)
 
