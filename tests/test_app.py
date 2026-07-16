@@ -1229,12 +1229,13 @@ def test_controller_detection_cached_per_context(monkeypatch):
 
 
 def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
-    """⟳ clears _ctl_cache and bumps _ctl_refresh_gen, but a lookup dispatched
-    BEFORE the refresh must not land after it and re-populate the cache with
-    pre-refresh state (a stale negative for a controller installed
-    mid-flight, say) — its captured generation no longer matches, so
-    _got_controller shows the (harmless, if dated) answer but skips the
-    cache write."""
+    """⟳ clears _ctl_cache and bumps _ctl_refresh_gen. A lookup dispatched
+    BEFORE the refresh, landing AFTER it, must not be shown OR cached as if
+    fresh — its captured generation no longer matches, so _got_controller
+    discards the whole result (fields included: Seal/Validate read them
+    directly, so a stale answer there is exactly as wrong as a stale cache
+    entry) and re-dispatches automatically, keeping Seal/Validate correctly
+    blocked until a genuinely fresh answer lands."""
     win = _make_win()
     try:
         launched = []
@@ -1247,16 +1248,20 @@ def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
         win._fetch_contexts()           # ⟳: only the contexts fetch (cb 1)
         assert len(launched) == 2       # no eager re-detect dispatched
 
-        launched[0]("", "", 0)          # pre-refresh lookup lands: no svcs
-        assert "A" not in win._ctl_cache  # stale negative NOT cached
+        # The pre-refresh lookup lands with a REAL find — proving the stale
+        # answer is discarded even when it isn't a boring negative.
+        launched[0]("kube-system\told-controller\n", "", 0)
+        assert "A" not in win._ctl_cache      # NOT cached
+        assert win._ctl_name.get() == ""      # NOT shown as if fresh
+        assert win._ctl_pending == "A"        # still (correctly) blocked
+        assert len(launched) == 3             # auto-redispatched in its place
 
-        # Re-selecting now dispatches fresh (A is uncached) under the NEW
-        # generation, and THIS landing is cacheable.
-        win._detect_controller("A")
-        assert len(launched) == 3
+        # The auto-redispatched lookup lands under the CURRENT generation —
+        # this one is genuinely fresh, so it applies and caches normally.
         launched[2]("kube-system\tsealed-secrets-controller\n", "", 0)
         assert win._ctl_cache["A"] == ("kube-system", "sealed-secrets-controller")
         assert win._ctl_name.get() == "sealed-secrets-controller"
+        assert win._ctl_pending is None
     finally:
         win.destroy()
 

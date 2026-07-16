@@ -129,17 +129,23 @@ landing populated the cache was dispatched after — and thereby superseded
 — every earlier same-context lookup, including ones still in flight), and
 `_got_controller`'s `ctx != self._seal_ctx.get()` check drops
 cross-context stragglers. The cache is invalidated by the ⟳ refresh
-(`_fetch_contexts`), which clears the dict and bumps `_ctl_refresh_gen` —
-a lookup dispatched before the refresh captures the pre-bump generation,
-and `_got_controller` only WRITES the cache when its captured generation
-still matches on landing, so a pre-refresh answer landing after ⟳ can't
-silently repopulate the cache the refresh just cleared. It still fills the
-fields/status normally (a slightly-dated answer is harmless to show) —
-only the cache write is gated, so ⟳ stays a cheap dict-clear-and-bump
-rather than forcing a fresh `get svc -A` for the current context on every
-click. There's no per-context or TTL invalidation, so a controller
-reinstalled under a different name/namespace in an already-cached context
-reads stale until ⟳ (and even then, only once that context is reselected).
+(`_invalidate_ctl_cache`, called from `_fetch_contexts`), which clears the
+dict and bumps `_ctl_refresh_gen` together (never one without the other —
+that's the whole point of having them share one method) — a lookup
+dispatched before the refresh captures the pre-bump generation as
+`ctl_gen`, and `_got_controller` compares it on landing: a mismatch means
+a ⟳ happened meanwhile, so the WHOLE result is discarded (not shown, not
+cached — showing a stale answer in the fields would be just as wrong as
+caching it, since Seal/Validate read those fields directly) and
+`_detect_controller` is called again for a fresh one. This only pays the
+extra round-trip in the (rare) case a landing actually goes stale — ⟳
+itself stays a cheap dict-clear-and-bump, not a forced `get svc -A` for
+the current context on every click. There's no per-context or TTL
+invalidation, so a controller reinstalled under a different name/namespace
+in an already-cached context reads stale until ⟳ (and even then, only
+once that context is reselected — the ⟳ won't proactively pick it up
+until it does, and only self-corrects sooner if a lookup happens to
+already be in flight when ⟳ is clicked).
 
 A background op that's about to *replace all KV rows* (`_read_editor_file`,
 `_got_template`) needs a THIRD check beyond `_out_gen`: `_kv_edit_gen`, bumped
