@@ -134,7 +134,8 @@ def test_controller_landing_reenables_seal_only(monkeypatch):
         win._seal_btn.configure(state="disabled")
         win._validate_btn.configure(state="disabled")
 
-        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+        win._got_controller("ctxA", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n", "", 0)
 
         assert str(win._seal_btn.cget("state")) == "normal"
         assert str(win._validate_btn.cget("state")) == "disabled"
@@ -151,7 +152,8 @@ def test_controller_landing_reenables_validate_with_output():
         win._sealed_ok = True  # simulate a successful earlier seal
         win._validate_btn.configure(state="disabled")
 
-        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+        win._got_controller("ctxA", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n", "", 0)
 
         assert str(win._validate_btn.cget("state")) == "normal"
     finally:
@@ -170,7 +172,8 @@ def test_controller_landing_mid_seal_keeps_buttons_disabled():
         win._seal_btn.configure(state="disabled")
         win._validate_btn.configure(state="disabled")
 
-        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+        win._got_controller("ctxA", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n", "", 0)
 
         assert str(win._seal_btn.cget("state")) == "disabled"
         assert str(win._validate_btn.cget("state")) == "disabled"
@@ -1043,7 +1046,8 @@ def test_kubectl_rc_error_consistent_across_call_sites():
         ctx_msg = win._status_var.get()
 
         win._seal_ctx.set("ctxA")
-        win._got_controller("ctxA", "", "Command not found: kubectl", -1)
+        win._got_controller("ctxA", win._ctl_refresh_gen, "",
+                           "Command not found: kubectl", -1)
         controller_msg = win._status_var.get()
 
         assert ctx_msg == controller_msg == "kubectl not in PATH"
@@ -1203,8 +1207,9 @@ def test_controller_detection_cached_per_context(monkeypatch):
 
         win._detect_controller("A")
         assert len(calls) == 1                    # real lookup dispatched
-        win._got_controller("A", "kube-system\tsealed-secrets-controller\n",
-                            "", 0)                # lands and caches
+        win._got_controller("A", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n",
+                           "", 0)                 # lands and caches
 
         win._set_ro_entry(win._ctl_name, ""); win._set_ro_entry(win._ctl_ns, "")
         win._detect_controller("A")               # re-select the same context
@@ -1213,19 +1218,23 @@ def test_controller_detection_cached_per_context(monkeypatch):
         assert win._ctl_ns.get() == "kube-system"
         assert str(win._seal_btn.cget("state")) == "normal"  # never blocked
 
-        win._fetch_contexts()   # ⟳ — clears the cache AND re-detects "A"
-        assert len(calls) == 3                    # contexts fetch + re-detect
-        win._detect_controller("A")               # still un-landed → uncached
-        assert len(calls) == 4                    # so a fresh lookup dispatches
+        win._fetch_contexts()   # ⟳ — clears the cache, bumps _ctl_refresh_gen
+        assert len(calls) == 2                    # only the contexts fetch —
+        # ⟳ stays cheap: no eager re-detect, no re-blocked Seal/Validate.
+        assert str(win._seal_btn.cget("state")) == "normal"
+        win._detect_controller("A")               # cache was cleared → uncached
+        assert len(calls) == 3                    # so THIS dispatches fresh
     finally:
         win.destroy()
 
 
 def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
-    """⟳ clears _ctl_cache, but a lookup dispatched BEFORE the refresh must
-    not land after it and re-populate the cache with pre-refresh state (a
-    stale negative for a controller installed mid-flight, say). The refresh's
-    own re-detect claims a fresh token, so the old landing is dropped."""
+    """⟳ clears _ctl_cache and bumps _ctl_refresh_gen, but a lookup dispatched
+    BEFORE the refresh must not land after it and re-populate the cache with
+    pre-refresh state (a stale negative for a controller installed
+    mid-flight, say) — its captured generation no longer matches, so
+    _got_controller shows the (harmless, if dated) answer but skips the
+    cache write."""
     win = _make_win()
     try:
         launched = []
@@ -1235,11 +1244,16 @@ def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
         win._seal_ctx.set("A")
 
         win._detect_controller("A")     # pre-refresh lookup hangs (cb 0)
-        win._fetch_contexts()           # ⟳: contexts (cb 1) + re-detect (cb 2)
+        win._fetch_contexts()           # ⟳: only the contexts fetch (cb 1)
+        assert len(launched) == 2       # no eager re-detect dispatched
 
         launched[0]("", "", 0)          # pre-refresh lookup lands: no svcs
         assert "A" not in win._ctl_cache  # stale negative NOT cached
 
+        # Re-selecting now dispatches fresh (A is uncached) under the NEW
+        # generation, and THIS landing is cacheable.
+        win._detect_controller("A")
+        assert len(launched) == 3
         launched[2]("kube-system\tsealed-secrets-controller\n", "", 0)
         assert win._ctl_cache["A"] == ("kube-system", "sealed-secrets-controller")
         assert win._ctl_name.get() == "sealed-secrets-controller"
@@ -1259,7 +1273,8 @@ def test_controller_cache_covers_negative_result(monkeypatch):
 
         win._detect_controller("dev")
         assert len(calls) == 1
-        win._got_controller("dev", "kube-system\tcoredns\n", "", 0)  # no match
+        win._got_controller("dev", win._ctl_refresh_gen,
+                           "kube-system\tcoredns\n", "", 0)  # no match
         assert win._ctl_name.get() == "" and win._ctl_ns.get() == ""
 
         win._detect_controller("dev")               # re-select — served from cache

@@ -166,9 +166,15 @@ class App(tk.Tk):
         # context that was looked up and has no controller (`in`-checked, so
         # the negative is a hit too). Detection is a cluster-wide
         # `kubectl get svc -A` with Seal/Validate blocked while it runs, so
-        # re-selecting a known context must not re-pay it. Invalidated only
-        # by the ⟳ refresh — see _fetch_contexts and CLAUDE.md.
+        # re-selecting a known context must not re-pay it. Cleared by the ⟳
+        # refresh — see _fetch_contexts and CLAUDE.md.
         self._ctl_cache = {}
+        # Bumped by the ⟳ refresh alongside the _ctl_cache clear.
+        # _detect_controller captures this at dispatch and _got_controller
+        # only WRITES the cache if it still matches on landing — a lookup
+        # dispatched before a refresh must not repopulate the cache the
+        # refresh just cleared with pre-refresh data. See _fetch_contexts.
+        self._ctl_refresh_gen = 0
         # Whether a seal / validate kubeseal run is currently in flight. These
         # gate the action buttons (see _refresh_action_buttons) so a controller
         # lookup landing mid-operation can't re-enable a button under it.
@@ -1469,6 +1475,12 @@ class App(tk.Tk):
         self._sealed_ok = bool(stdout.strip())
         self._set_text(self._sealed_out, stdout)
         self._refresh_action_buttons()
+        if not self._sealed_ok:
+            # Don't report success — the status line must not contradict
+            # Copy/Save/Validate all being disabled by the flag just above.
+            self._status("kubeseal exited successfully but produced no output",
+                         "err")
+            return
         # Via _status_output: a seal of lossy-carryover YAML must not read as
         # an unqualified success right as the manifest becomes applyable.
         self._status_output("Sealed successfully")
@@ -1579,21 +1591,20 @@ class App(tk.Tk):
         # alone isn't enough, though — a controller lookup dispatched BEFORE
         # the refresh could land after it and silently re-populate the cache
         # with pre-refresh state (a stale negative, or a controller since
-        # moved). Re-detecting the current context below closes that race at
-        # the token level: the fresh dispatch's _claim_latest supersedes the
-        # pre-refresh lookup, whose landing is then dropped — and it makes ⟳
-        # actually pick up a freshly installed controller without requiring
-        # a context re-selection.
+        # moved). Bumping _ctl_refresh_gen closes that race cheaply: it
+        # doesn't force a re-detect (⟳ stays fast, and Seal/Validate stay
+        # enabled, when nothing was actually in flight) — it just makes
+        # _got_controller's cache WRITE a no-op for any lookup dispatched
+        # before this point, whenever it happens to land. The visible
+        # fields/status still update normally (a slightly-dated answer is
+        # harmless to show); only the cache write is gated. A context whose
+        # controller changed meanwhile is picked up on its next selection,
+        # same as any other never-cached context.
         self._ctl_cache.clear()
+        self._ctl_refresh_gen += 1
         self._dispatch_latest("contexts",
                               ["kubectl", "config", "get-contexts", "-o", "name"],
                               self._got_contexts)
-        ctx = self._seal_ctx.get()
-        if ctx:  # blank at startup — _got_contexts detects the default then
-            # Same clear-then-detect the context-change handlers do.
-            self._set_ro_entry(self._ctl_name, "")
-            self._set_ro_entry(self._ctl_ns, "")
-            self._detect_controller(ctx)
 
     def _got_contexts(self, stdout, stderr, rc):
         if rc != 0:
@@ -1658,9 +1669,13 @@ class App(tk.Tk):
         cmd = ["kubectl", "get", "svc", "-A", f"--context={ctx}", "-o",
                "jsonpath={range .items[*]}{.metadata.namespace}{'\\t'}"
                "{.metadata.name}{'\\n'}{end}"]
-        self._dispatch_latest("controller", cmd, self._got_controller, ctx)
+        # Captured now so _got_controller can tell, on landing, whether a ⟳
+        # refresh happened after this lookup was dispatched (see
+        # _ctl_refresh_gen / _fetch_contexts).
+        gen = self._ctl_refresh_gen
+        self._dispatch_latest("controller", cmd, self._got_controller, ctx, gen)
 
-    def _got_controller(self, ctx, stdout, stderr, rc):
+    def _got_controller(self, ctx, gen, stdout, stderr, rc):
         # Ignore a stale result if the user has since switched to a different
         # context. (An older in-flight lookup for the SAME context — which
         # this check can't distinguish — is dropped by _dispatch_latest.)
@@ -1683,17 +1698,24 @@ class App(tk.Tk):
             ns, name = line.split("\t", 1)
             if "sealed-secrets" in name and "metrics" not in name:
                 svcs.append((ns.strip(), name.strip()))
+        # A ⟳ refresh since this lookup was dispatched means the answer is
+        # for a generation the cache no longer represents — still show it
+        # (harmless, and still true as of when it was asked), but don't let
+        # it write into a cache the refresh just cleared for a reason.
+        cacheable = gen == self._ctl_refresh_gen
         if not svcs:
-            # Cache the negative result too — an uninstalled/dev cluster is
-            # exactly the context most likely to be reselected repeatedly
-            # while hunting for the right one; leaving it uncached would
-            # re-run the full svc listing every single time.
-            self._ctl_cache[ctx] = None
+            if cacheable:
+                # Cache the negative result too — an uninstalled/dev cluster
+                # is exactly the context most likely to be reselected
+                # repeatedly while hunting for the right one; leaving it
+                # uncached would re-run the full svc listing every time.
+                self._ctl_cache[ctx] = None
             return
         # Prefer the canonical "sealed-secrets-controller" service if present.
         ns, name = next((s for s in svcs if s[1] == "sealed-secrets-controller"),
                         svcs[0])
-        self._ctl_cache[ctx] = (ns, name)  # reused on re-selection
+        if cacheable:
+            self._ctl_cache[ctx] = (ns, name)  # reused on re-selection
         self._apply_controller(ns, name)
 
     def _apply_controller(self, ns: str, name: str):
