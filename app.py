@@ -1683,30 +1683,36 @@ class App(tk.Tk):
         # this check can't distinguish — is dropped by _dispatch_latest.)
         if ctx != self._seal_ctx.get():
             return
-        if ctl_gen != self._ctl_refresh_gen:
-            # A ⟳ refresh happened after this lookup was dispatched — its
-            # answer (found / not found / error) might be stale (the
-            # controller could have moved or been reinstalled meanwhile),
-            # and nothing would stop Seal/Validate from acting on it the
-            # instant it lands. Discard it entirely (don't show it, don't
-            # cache it) and re-dispatch instead of either showing stale data
-            # or leaving _ctl_pending stuck with nothing to ever resolve it.
-            # _detect_controller re-sets _ctl_pending itself (ctx is
-            # guaranteed uncached here — this landing never wrote to
-            # _ctl_cache, and the refresh that made us stale already
-            # cleared it), so Seal/Validate stay correctly blocked until a
-            # genuinely fresh answer lands.
-            self._detect_controller(ctx)
-            return
         # This is the result for the current context — detection is no longer in
         # flight, whatever the outcome (error / no controller / found). Re-enable
         # the buttons, unless a seal/validate is still running under us.
         self._ctl_pending = None
         self._refresh_action_buttons()
         if rc != 0:
-            # Say so — a silent return leaves blank Controller fields with no
-            # explanation.
+            # Always reported, even on a stale generation: an error carries
+            # no controller DATA that could be wrongly shown or cached, so
+            # the staleness gate below — which exists to stop Seal/Validate
+            # from acting on a stale found/not-found ANSWER — doesn't apply
+            # here. Discarding an error the same way a stale answer is
+            # discarded would instead leave the user watching detection
+            # silently retry forever against a persistently unreachable
+            # cluster, with no explanation ever shown.
             self._tool_err(rc, stderr, "kubectl", "Controller detection failed")
+            return
+        if ctl_gen != self._ctl_refresh_gen:
+            # A ⟳ refresh happened after this lookup was dispatched — its
+            # found/not-found answer might be stale (the controller could
+            # have moved or been reinstalled meanwhile), and nothing would
+            # stop Seal/Validate from acting on it the instant it lands.
+            # Discard it entirely (don't show it, don't cache it) and
+            # re-dispatch — _detect_controller re-sets _ctl_pending itself
+            # (ctx is guaranteed uncached here — this landing never wrote to
+            # _ctl_cache, and the refresh that made us stale already
+            # cleared it), so Seal/Validate stay correctly blocked until a
+            # genuinely fresh answer lands.
+            self._status("Refreshed — re-checking the controller for this "
+                        "context…", "dim")
+            self._detect_controller(ctx)
             return
         svcs = []
         for line in stdout.splitlines():

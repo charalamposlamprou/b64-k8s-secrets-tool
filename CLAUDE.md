@@ -133,11 +133,17 @@ cross-context stragglers. The cache is invalidated by the ⟳ refresh
 dict and bumps `_ctl_refresh_gen` together (never one without the other —
 that's the whole point of having them share one method) — a lookup
 dispatched before the refresh captures the pre-bump generation as
-`ctl_gen`, and `_got_controller` compares it on landing: a mismatch means
-a ⟳ happened meanwhile, so the WHOLE result is discarded (not shown, not
-cached — showing a stale answer in the fields would be just as wrong as
-caching it, since Seal/Validate read those fields directly) and
-`_detect_controller` is called again for a fresh one. This only pays the
+`ctl_gen`, and `_got_controller` checks it on landing, but only for a
+successful (`rc == 0`) result: a mismatch there means a ⟳ happened
+meanwhile, so the found/not-found ANSWER is discarded entirely (not
+shown, not cached — showing a stale answer in the fields would be just as
+wrong as caching it, since Seal/Validate read those fields directly) and
+`_detect_controller` is called again for a fresh one, with a `_status`
+line so the wait isn't silent. An `rc != 0` result is reported
+unconditionally regardless of `ctl_gen`, staleness or not — an error
+carries no controller DATA for the gate to protect, and discarding it the
+same way would leave a persistently unreachable cluster retrying forever
+with no explanation ever shown. Discarding a stale answer only pays the
 extra round-trip in the (rare) case a landing actually goes stale — ⟳
 itself stays a cheap dict-clear-and-bump, not a forced `get svc -A` for
 the current context on every click. There's no per-context or TTL

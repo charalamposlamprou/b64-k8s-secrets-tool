@@ -1266,6 +1266,37 @@ def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
         win.destroy()
 
 
+def test_stale_controller_error_is_still_reported(monkeypatch):
+    """Unlike a found/not-found ANSWER, a kubectl ERROR carries no
+    controller data that could be wrongly shown or cached — so a landing
+    that's stale relative to a ⟳ refresh must still surface the error
+    (not silently discard-and-retry), or a persistently unreachable
+    cluster would leave the user watching detection retry forever with no
+    explanation."""
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        statuses = []
+        monkeypatch.setattr(win, "_status",
+                            lambda msg, *a, **k: statuses.append(msg))
+        win._seal_ctx.set("A")
+
+        win._detect_controller("A")     # pre-refresh lookup hangs
+        win._fetch_contexts()           # ⟳ bumps the generation
+        assert len(launched) == 2
+
+        launched[0]("", "Command not found: kubectl", -1)  # stale, but a real error
+
+        assert statuses[-1] == "kubectl not in PATH"
+        assert len(launched) == 2       # NOT silently redispatched
+        assert win._ctl_pending is None  # unblocked — user is free to retry
+    finally:
+        win.destroy()
+
+
 def test_controller_cache_covers_negative_result(monkeypatch):
     """A context with no sealed-secrets controller (dev/staging without it
     installed — exactly the case most likely to be reselected while hunting
