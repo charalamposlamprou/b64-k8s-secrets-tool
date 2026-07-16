@@ -122,17 +122,19 @@ shape.
 context with no sealed-secrets controller caches as the value `None` — a
 context genuinely never looked up is *absent* from the dict, not present
 with a `None` value, and `.get()` can't tell the two apart. A cache hit
-does NOT need to claim the `"controller"` token itself: any older in-flight
-lookup for a *different* context is either for a context that's still
-uncached (so re-selecting it dispatches through `_dispatch_latest`, which
-claims its own fresh token regardless of what happened in between) or is
-already excluded by `_got_controller`'s own `ctx != self._seal_ctx.get()`
-check — a same-context in-flight lookup can't coexist with a cache hit for
-that context, since the cache is only ever populated by that lookup's own
-landing. The whole cache is invalidated by the ⟳ refresh
-(`_fetch_contexts`) — there's no per-context or TTL invalidation, so a
-controller reinstalled under a different name/namespace in an
-already-cached context reads stale until refresh.
+dispatches nothing and needs no token bookkeeping of its own, because
+every landing is guarded where it lands: `_dispatch_latest`'s token drops
+any superseded lookup (each new dispatch claims afresh, so whichever
+landing populated the cache was dispatched after — and thereby superseded
+— every earlier same-context lookup, including ones still in flight), and
+`_got_controller`'s `ctx != self._seal_ctx.get()` check drops
+cross-context stragglers. The cache is invalidated by the ⟳ refresh
+(`_fetch_contexts`), which clears the dict AND re-detects the current
+context — the re-detect's fresh token claim is what stops a lookup
+dispatched before the refresh from landing after it and re-populating the
+cache with pre-refresh state. There's no per-context or TTL invalidation,
+so a controller reinstalled under a different name/namespace in an
+already-cached context reads stale until ⟳.
 
 A background op that's about to *replace all KV rows* (`_read_editor_file`,
 `_got_template`) needs a THIRD check beyond `_out_gen`: `_kv_edit_gen`, bumped

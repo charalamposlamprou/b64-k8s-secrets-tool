@@ -1213,9 +1213,36 @@ def test_controller_detection_cached_per_context(monkeypatch):
         assert win._ctl_ns.get() == "kube-system"
         assert str(win._seal_btn.cget("state")) == "normal"  # never blocked
 
-        win._fetch_contexts()                     # ⟳ — clears the cache
-        win._detect_controller("A")
-        assert len(calls) == 3                    # contexts fetch + fresh lookup
+        win._fetch_contexts()   # ⟳ — clears the cache AND re-detects "A"
+        assert len(calls) == 3                    # contexts fetch + re-detect
+        win._detect_controller("A")               # still un-landed → uncached
+        assert len(calls) == 4                    # so a fresh lookup dispatches
+    finally:
+        win.destroy()
+
+
+def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
+    """⟳ clears _ctl_cache, but a lookup dispatched BEFORE the refresh must
+    not land after it and re-populate the cache with pre-refresh state (a
+    stale negative for a controller installed mid-flight, say). The refresh's
+    own re-detect claims a fresh token, so the old landing is dropped."""
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        win._seal_ctx.set("A")
+
+        win._detect_controller("A")     # pre-refresh lookup hangs (cb 0)
+        win._fetch_contexts()           # ⟳: contexts (cb 1) + re-detect (cb 2)
+
+        launched[0]("", "", 0)          # pre-refresh lookup lands: no svcs
+        assert "A" not in win._ctl_cache  # stale negative NOT cached
+
+        launched[2]("kube-system\tsealed-secrets-controller\n", "", 0)
+        assert win._ctl_cache["A"] == ("kube-system", "sealed-secrets-controller")
+        assert win._ctl_name.get() == "sealed-secrets-controller"
     finally:
         win.destroy()
 

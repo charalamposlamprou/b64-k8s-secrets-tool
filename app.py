@@ -162,12 +162,12 @@ class App(tk.Tk):
         # SAME value in flight, which value-equality landing guards (e.g.
         # _got_ns's ctx check) cannot tell apart.
         self._latest_tok = {}
-        # Successful controller detections, context → (ns, name). Detection is
-        # a cluster-wide `kubectl get svc -A` — multi-second on a big cluster,
-        # with Seal/Validate blocked while it runs — so flipping back to an
-        # already-detected context reuses the result instead of re-listing
-        # every service. The ⟳ refresh (_fetch_contexts) clears it, which is
-        # how a freshly installed controller gets picked up.
+        # Landed controller detections, context → (ns, name), or None for a
+        # context that was looked up and has no controller (`in`-checked, so
+        # the negative is a hit too). Detection is a cluster-wide
+        # `kubectl get svc -A` with Seal/Validate blocked while it runs, so
+        # re-selecting a known context must not re-pay it. Invalidated only
+        # by the ⟳ refresh — see _fetch_contexts and CLAUDE.md.
         self._ctl_cache = {}
         # Whether a seal / validate kubeseal run is currently in flight. These
         # gate the action buttons (see _refresh_action_buttons) so a controller
@@ -1462,7 +1462,11 @@ class App(tk.Tk):
             self._refresh_action_buttons()
             self._status(f"kubeseal error: {err.splitlines()[-1][:90]}", "err")
             return
-        self._sealed_ok = True
+        # bool(strip()): the pane read is verbatim ("end-1c"), so arm the
+        # flag only on real content — an rc==0 with whitespace-only stdout
+        # (no known kubeseal does this, but the flag is what gates Copy/
+        # Save/Validate) must not let whitespace leave the app as a manifest.
+        self._sealed_ok = bool(stdout.strip())
         self._set_text(self._sealed_out, stdout)
         self._refresh_action_buttons()
         # Via _status_output: a seal of lossy-carryover YAML must not read as
@@ -1571,13 +1575,25 @@ class App(tk.Tk):
 
     def _fetch_contexts(self):
         # The ⟳ refresh is the controller cache's invalidation point: it
-        # already means "re-read the cluster inventory" (new contexts), so a
-        # controller installed since the last detection is re-found on the
-        # next context selection instead of never.
+        # already means "re-read the cluster inventory". Clearing the dict
+        # alone isn't enough, though — a controller lookup dispatched BEFORE
+        # the refresh could land after it and silently re-populate the cache
+        # with pre-refresh state (a stale negative, or a controller since
+        # moved). Re-detecting the current context below closes that race at
+        # the token level: the fresh dispatch's _claim_latest supersedes the
+        # pre-refresh lookup, whose landing is then dropped — and it makes ⟳
+        # actually pick up a freshly installed controller without requiring
+        # a context re-selection.
         self._ctl_cache.clear()
         self._dispatch_latest("contexts",
                               ["kubectl", "config", "get-contexts", "-o", "name"],
                               self._got_contexts)
+        ctx = self._seal_ctx.get()
+        if ctx:  # blank at startup — _got_contexts detects the default then
+            # Same clear-then-detect the context-change handlers do.
+            self._set_ro_entry(self._ctl_name, "")
+            self._set_ro_entry(self._ctl_ns, "")
+            self._detect_controller(ctx)
 
     def _got_contexts(self, stdout, stderr, rc):
         if rc != 0:
