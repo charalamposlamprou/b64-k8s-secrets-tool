@@ -909,6 +909,32 @@ def test_identity_only_binary_drop_uses_warning_severity():
         win.destroy()
 
 
+def test_yaml_pane_sizes_to_content():
+    """The YAML pane can't expand=True inside the scrollable page canvas, so
+    _fit_yaml_out sets its height explicitly: YAML_H_MIN while empty (so the
+    resting layout isn't mostly void), the content's line count once YAML
+    lands, and back to YAML_H_MIN when the panes are invalidated."""
+    win = _make_win()
+    try:
+        assert win._yaml_out.cget("height") == app.YAML_H_MIN
+
+        win._kv_set_pairs([("A", "1")])
+        win._gen_yaml()
+        lines = int(win._yaml_out.index("end-1c").split(".")[0])
+        assert app.YAML_H_MIN < lines <= app.YAML_H_MAX  # grew, no clamping
+        assert win._yaml_out.cget("height") == lines
+
+        # Past the ceiling the pane stops growing and scrolls instead.
+        win._kv_set_pairs([(f"K{i}", str(i)) for i in range(app.YAML_H_MAX)])
+        win._gen_yaml()
+        assert win._yaml_out.cget("height") == app.YAML_H_MAX
+
+        win._invalidate_outputs()  # clearing returns it to the resting height
+        assert win._yaml_out.cget("height") == app.YAML_H_MIN
+    finally:
+        win.destroy()
+
+
 def test_regenerate_after_inplace_edit_stales_inflight_seal():
     """Editing a row's value IN PLACE passes no repopulation choke point, so
     Generate itself must advance the generation: a seal of the previous YAML

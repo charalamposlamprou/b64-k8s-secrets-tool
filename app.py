@@ -84,6 +84,11 @@ else:
     SANS = "DejaVu Sans"
 SZ = 11
 
+# Output-pane sizing: rows shown when the pane is empty, and the ceiling it
+# grows to as YAML lands (past that it scrolls). See _fit_yaml_out.
+YAML_H_MIN = 6
+YAML_H_MAX = 18
+
 # ---------------------------------------------------------------------------
 # Core logic lives in core.py (pure, no UI) — re-exported here so the rest of
 # the app and the test suite can keep referring to these names.
@@ -146,7 +151,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"b64 - Kubernetes Secrets Tool — v{__version__}")
-        self.geometry("880x720")
+        self.geometry("880x660")
         self.minsize(740, 580)
         self.configure(bg=BG)
         self._status_job = None
@@ -507,7 +512,8 @@ class App(tk.Tk):
         # The input is the plaintext secret, so mask it by default (like the
         # Decode tab masks its decoded output) with a Show/Hide toggle.
         r = ttk.Frame(p); r.pack(fill="x", pady=2)
-        ttk.Button(r, text="Encode →", command=self._sv_encode) \
+        ttk.Button(r, text="Encode →", style="Accent.TButton",
+                   command=self._sv_encode) \
             .pack(side="right", padx=(6, 0))
         self._sv_in = ttk.Entry(r, font=(MONO, SZ), show="•")
         self._sv_shown = False
@@ -584,12 +590,16 @@ class App(tk.Tk):
         # the editor reads as a table (Key | Value | Actions) instead of rows
         # joined by "=". (The malformed-metadata warning lives in the shared
         # window chrome — see _build_status_bar — so it shows on every tab.)
+        # Header text is FG, not ACCENT: the accent marks the primary action on
+        # a row (Encode →, Generate YAML, Seal →) and the section headings, so
+        # spending it on a column header too would leave it meaning nothing.
+        # Bold on BG3 already reads as a header. Same for the Decode table.
         kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
-        tk.Label(kv_hdr, text="Key", bg=BG3, fg=ACCENT, width=22, anchor="w",
+        tk.Label(kv_hdr, text="Key", bg=BG3, fg=FG, width=22, anchor="w",
                  padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
-        tk.Label(kv_hdr, text="Actions", bg=BG3, fg=ACCENT, anchor="e",
+        tk.Label(kv_hdr, text="Actions", bg=BG3, fg=FG, anchor="e",
                  padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="right")
-        tk.Label(kv_hdr, text="Value", bg=BG3, fg=ACCENT, anchor="w",
+        tk.Label(kv_hdr, text="Value", bg=BG3, fg=FG, anchor="w",
                  padx=6, pady=4, font=(SANS, SZ, "bold")) \
             .pack(side="left", fill="x", expand=True)
         self._kv_frame = ttk.Frame(p); self._kv_frame.pack(fill="x")
@@ -612,7 +622,8 @@ class App(tk.Tk):
         # The editable type combo lets you pick a built-in type or enter a
         # custom one; Load Template fills it from the fetched secret.
         form = ttk.Frame(p); form.pack(fill="x", pady=(6, 2))
-        gen_btn = ttk.Button(form, text="Generate YAML", command=self._gen_yaml)
+        gen_btn = ttk.Button(form, text="Generate YAML", style="Accent.TButton",
+                             command=self._gen_yaml)
         gen_btn.pack(side="right", padx=(12, 0))
         ttk.Label(form, text="Secret name:").pack(side="left")
         self._sec_name = ttk.Entry(form, width=16, font=(MONO, SZ))
@@ -631,13 +642,16 @@ class App(tk.Tk):
         # last (matching its rightmost position) rather than its creation order.
         gen_btn.lift()
 
-        # YAML output — fixed height so the scrollable page has a definite size
-        # (an expanding pane would fight the canvas for vertical space).
+        # YAML output — explicit height (never expand=True) so the scrollable
+        # page has a definite size; an expanding pane would fight the canvas for
+        # vertical space. _fit_yaml_out sizes it to the content between
+        # YAML_H_MIN and YAML_H_MAX so an empty pane isn't the biggest thing on
+        # screen at rest.
         yf = ttk.Frame(p); yf.pack(fill="x", pady=(6, 2))
         xsb = ttk.Scrollbar(yf, orient="horizontal"); xsb.pack(side="bottom", fill="x")
         ysb = ttk.Scrollbar(yf, orient="vertical");   ysb.pack(side="right",  fill="y")
         self._yaml_out = tk.Text(
-            yf, height=14, bg=BG3, fg=BLUE, insertbackground=FG,
+            yf, height=YAML_H_MIN, bg=BG3, fg=BLUE, insertbackground=FG,
             font=(MONO, SZ), relief="flat", bd=0, padx=6, pady=4, wrap="none",
             highlightthickness=1, highlightbackground=BORDER,
             xscrollcommand=xsb.set, yscrollcommand=ysb.set, state="disabled")
@@ -855,6 +869,7 @@ class App(tk.Tk):
         self._out_gen += 1  # in-flight seal/validate results are now stale
         self._sealed_ok = False  # before the button refresh reads it
         self._set_text(self._yaml_out, "")
+        self._fit_yaml_out()  # back to resting height now that it's empty
         self._set_text(self._sealed_out, "")
         self._refresh_action_buttons()
         # Every path that changes _tpl_skipped (Browse .env / Clear reset it,
@@ -1043,6 +1058,7 @@ class App(tk.Tk):
         self._set_text(self._yaml_out,
                        build_secret_yaml(name, ns, data, type_, raw_data=raw,
                                          carryover=self._tpl_carry))
+        self._fit_yaml_out()
         msg = f"Generated YAML with {len(data) + len(raw)} key(s)"
         if raw:
             msg += f" ({len(raw)} binary kept as-is)"
@@ -1113,11 +1129,11 @@ class App(tk.Tk):
         # pinned right so it lines up with the row buttons (which are themselves
         # right-pinned so they're never clipped by the scrollbar).
         hdr = tk.Frame(p, bg=BG3); hdr.pack(fill="x", pady=(8, 0))
-        tk.Label(hdr, text="Key", bg=BG3, fg=ACCENT, width=22, anchor="w",
+        tk.Label(hdr, text="Key", bg=BG3, fg=FG, width=22, anchor="w",
                  padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="left")
-        tk.Label(hdr, text="Actions", bg=BG3, fg=ACCENT, anchor="e",
+        tk.Label(hdr, text="Actions", bg=BG3, fg=FG, anchor="e",
                  padx=6, pady=4, font=(SANS, SZ, "bold")).pack(side="right")
-        tk.Label(hdr, text="Decoded value", bg=BG3, fg=ACCENT, anchor="w",
+        tk.Label(hdr, text="Decoded value", bg=BG3, fg=FG, anchor="w",
                  padx=6, pady=4, font=(SANS, SZ, "bold")) \
             .pack(side="left", fill="x", expand=True)
 
@@ -1966,6 +1982,18 @@ class App(tk.Tk):
         entry.delete(0, "end")
         entry.insert(0, value)
         entry.configure(state="readonly")
+
+    def _fit_yaml_out(self):
+        """Size the Encode tab's YAML pane to its content.
+
+        The pane can't use expand=True (it lives in the scrollable page canvas,
+        which needs a definite size), so its height is set explicitly here after
+        every write: YAML_H_MIN while empty so the resting layout isn't mostly
+        void, growing with the content up to YAML_H_MAX, beyond which it
+        scrolls."""
+        lines = int(self._yaml_out.index("end-1c").split(".")[0])
+        self._yaml_out.configure(
+            height=max(YAML_H_MIN, min(lines, YAML_H_MAX)))
 
     def _set_text(self, widget: tk.Text, text: str):
         widget.configure(state="normal")
