@@ -41,6 +41,7 @@ def test_validate_waits_for_in_flight_controller_lookup(monkeypatch):
         calls = []
         monkeypatch.setattr(app, "run_bg", lambda *a, **k: calls.append((a, k)))
         win._set_text(win._sealed_out, "kind: SealedSecret\n")
+        win._sealed_ok = True  # simulate a successful earlier seal
         win._seal_ctx.set("ctxA")
         win._ctl_pending = "ctxA"  # detection for the current context still running
 
@@ -59,6 +60,7 @@ def test_validate_runs_once_controller_lookup_lands(monkeypatch):
         calls = []
         monkeypatch.setattr(app, "run_bg", lambda *a, **k: calls.append((a, k)))
         win._set_text(win._sealed_out, "kind: SealedSecret\n")
+        win._sealed_ok = True  # simulate a successful earlier seal
         win._seal_ctx.set("ctxA")
         win._ctl_pending = None  # lookup landed
 
@@ -132,7 +134,8 @@ def test_controller_landing_reenables_seal_only(monkeypatch):
         win._seal_btn.configure(state="disabled")
         win._validate_btn.configure(state="disabled")
 
-        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+        win._got_controller("ctxA", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n", "", 0)
 
         assert str(win._seal_btn.cget("state")) == "normal"
         assert str(win._validate_btn.cget("state")) == "disabled"
@@ -146,9 +149,11 @@ def test_controller_landing_reenables_validate_with_output():
     try:
         win._seal_ctx.set("ctxA")
         win._set_text(win._sealed_out, "kind: SealedSecret\n")
+        win._sealed_ok = True  # simulate a successful earlier seal
         win._validate_btn.configure(state="disabled")
 
-        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+        win._got_controller("ctxA", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n", "", 0)
 
         assert str(win._validate_btn.cget("state")) == "normal"
     finally:
@@ -162,11 +167,13 @@ def test_controller_landing_mid_seal_keeps_buttons_disabled():
     try:
         win._seal_ctx.set("ctxA")
         win._set_text(win._sealed_out, "kind: SealedSecret\n")
+        win._sealed_ok = True  # simulate a successful earlier seal
         win._sealing = True  # a seal started by _do_seal is still running
         win._seal_btn.configure(state="disabled")
         win._validate_btn.configure(state="disabled")
 
-        win._got_controller("ctxA", "kube-system\tsealed-secrets-controller\n", "", 0)
+        win._got_controller("ctxA", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n", "", 0)
 
         assert str(win._seal_btn.cget("state")) == "disabled"
         assert str(win._validate_btn.cget("state")) == "disabled"
@@ -1039,7 +1046,8 @@ def test_kubectl_rc_error_consistent_across_call_sites():
         ctx_msg = win._status_var.get()
 
         win._seal_ctx.set("ctxA")
-        win._got_controller("ctxA", "", "Command not found: kubectl", -1)
+        win._got_controller("ctxA", win._ctl_refresh_gen, "",
+                           "Command not found: kubectl", -1)
         controller_msg = win._status_var.get()
 
         assert ctx_msg == controller_msg == "kubectl not in PATH"
@@ -1100,5 +1108,256 @@ def test_kv_value_edited_ignores_noop_set():
 
         rd["var"].set("changed")        # an actual edit
         assert win._kv_edit_gen == gen + 1
+    finally:
+        win.destroy()
+
+
+def test_sealed_error_dump_never_copies_saves_or_validates(monkeypatch, tmp_path):
+    """After a failed seal the pane shows the error dump for reading, but it
+    must never leave the app as if it were a manifest: Copy Sealed / Save
+    Sealed… / Validate all gate on the explicit _sealed_ok flag, not on a
+    magic-prefix match of the pane text (which a rewording would invert)."""
+    win = _make_win()
+    try:
+        win._sealing = True
+        win._on_sealed("", "cannot fetch certificate", 1, win._out_gen)
+        assert "# kubeseal error" in win._sealed_out.get("1.0", "end")
+
+        copied = []
+        monkeypatch.setattr(win, "_clip",
+                            lambda text, qualify=False: copied.append(text))
+        win._copy_sealed()
+        assert copied == []                       # dump not copied
+        assert "Seal a secret first" in win._status_var.get()
+
+        out = tmp_path / "sealed.yaml"
+        monkeypatch.setattr(app.filedialog, "asksaveasfilename",
+                            lambda **k: str(out))
+        _sync_io(win, monkeypatch)
+        win._save_sealed()
+        assert not out.exists()                   # dump not written
+
+        win._do_validate()
+        assert "Seal a secret first" in win._status_var.get()
+
+        # A successful seal flips the gate back on.
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret\n", "", 0, win._out_gen)
+        win._copy_sealed()
+        assert copied and "kind: SealedSecret" in copied[0]
+    finally:
+        win.destroy()
+
+
+def test_clip_copies_value_verbatim(monkeypatch):
+    """Copied values must be byte-exact: a trailing newline is part of the
+    secret (PEM certs/keys end with one) — stripping it would paste an
+    altered value into the next system."""
+    win = _make_win()
+    try:
+        monkeypatch.setattr(app.sys, "platform", "darwin")  # sync clip path
+        seen = {}
+        win._clip_done = lambda ok, payload, qualify=False, skipped=None: \
+            seen.setdefault("payload", payload)
+        win._clip("-----END CERTIFICATE-----\n")
+        assert seen["payload"] == "-----END CERTIFICATE-----\n"
+    finally:
+        win.destroy()
+
+
+def test_load_template_newest_wins_on_same_selection(monkeypatch):
+    """Two Load clicks for the SAME secret while the first fetch hangs: the
+    older result landing first must be dropped as superseded — previously it
+    applied first-wins and the fresher snapshot was discarded with a
+    misleading 'editor changed' message."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        statuses = []
+        monkeypatch.setattr(win, "_status",
+                            lambda msg, *a, **k: statuses.append(msg))
+        win._enc_ctx.set("c"); win._enc_ns.set("n"); win._enc_sec.set("s")
+
+        win._load_template()   # click 1 — fetch hangs
+        win._load_template()   # click 2 — supersedes click 1
+        launched[0]("kind: Secret\ndata:\n  old: c3RhbGU=\n", "", 0)
+        launched[1]("kind: Secret\ndata:\n  fresh: c2VjcmV0\n", "", 0)
+
+        assert win._kv_get_pairs() == {"fresh": "secret"}  # newest won
+        assert not any("discarded" in m for m in statuses)
+        assert any(m.startswith("Loaded 1 key(s)") for m in statuses)
+    finally:
+        win.destroy()
+
+
+def test_controller_detection_cached_per_context(monkeypatch):
+    """Detection is a cluster-wide `kubectl get svc -A` with Seal/Validate
+    blocked while it runs: re-selecting an already-detected context must be
+    served from the cache (no re-list, no blocked buttons); the ⟳ refresh is
+    the invalidation point."""
+    win = _make_win()
+    try:
+        calls = []
+        monkeypatch.setattr(app, "run_bg", lambda *a, **k: calls.append(a))
+        win._seal_ctx.set("A")
+
+        win._detect_controller("A")
+        assert len(calls) == 1                    # real lookup dispatched
+        win._got_controller("A", win._ctl_refresh_gen,
+                           "kube-system\tsealed-secrets-controller\n",
+                           "", 0)                 # lands and caches
+
+        win._set_ro_entry(win._ctl_name, ""); win._set_ro_entry(win._ctl_ns, "")
+        win._detect_controller("A")               # re-select the same context
+        assert len(calls) == 1                    # served from cache
+        assert win._ctl_name.get() == "sealed-secrets-controller"
+        assert win._ctl_ns.get() == "kube-system"
+        assert str(win._seal_btn.cget("state")) == "normal"  # never blocked
+
+        win._fetch_contexts()   # ⟳ — clears the cache, bumps _ctl_refresh_gen
+        assert len(calls) == 2                    # only the contexts fetch —
+        # ⟳ stays cheap: no eager re-detect, no re-blocked Seal/Validate.
+        assert str(win._seal_btn.cget("state")) == "normal"
+        win._detect_controller("A")               # cache was cleared → uncached
+        assert len(calls) == 3                    # so THIS dispatches fresh
+    finally:
+        win.destroy()
+
+
+def test_refresh_supersedes_inflight_controller_lookup(monkeypatch):
+    """⟳ clears _ctl_cache and bumps _ctl_refresh_gen. A lookup dispatched
+    BEFORE the refresh, landing AFTER it, must not be shown OR cached as if
+    fresh — its captured generation no longer matches, so _got_controller
+    discards the whole result (fields included: Seal/Validate read them
+    directly, so a stale answer there is exactly as wrong as a stale cache
+    entry) and re-dispatches automatically, keeping Seal/Validate correctly
+    blocked until a genuinely fresh answer lands."""
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        win._seal_ctx.set("A")
+
+        win._detect_controller("A")     # pre-refresh lookup hangs (cb 0)
+        win._fetch_contexts()           # ⟳: only the contexts fetch (cb 1)
+        assert len(launched) == 2       # no eager re-detect dispatched
+
+        # The pre-refresh lookup lands with a REAL find — proving the stale
+        # answer is discarded even when it isn't a boring negative.
+        launched[0]("kube-system\told-controller\n", "", 0)
+        assert "A" not in win._ctl_cache      # NOT cached
+        assert win._ctl_name.get() == ""      # NOT shown as if fresh
+        assert win._ctl_pending == "A"        # still (correctly) blocked
+        assert len(launched) == 3             # auto-redispatched in its place
+
+        # The auto-redispatched lookup lands under the CURRENT generation —
+        # this one is genuinely fresh, so it applies and caches normally.
+        launched[2]("kube-system\tsealed-secrets-controller\n", "", 0)
+        assert win._ctl_cache["A"] == ("kube-system", "sealed-secrets-controller")
+        assert win._ctl_name.get() == "sealed-secrets-controller"
+        assert win._ctl_pending is None
+    finally:
+        win.destroy()
+
+
+def test_stale_controller_error_is_still_reported(monkeypatch):
+    """Unlike a found/not-found ANSWER, a kubectl ERROR carries no
+    controller data that could be wrongly shown or cached — so a landing
+    that's stale relative to a ⟳ refresh must still surface the error
+    (not silently discard-and-retry), or a persistently unreachable
+    cluster would leave the user watching detection retry forever with no
+    explanation."""
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        statuses = []
+        monkeypatch.setattr(win, "_status",
+                            lambda msg, *a, **k: statuses.append(msg))
+        win._seal_ctx.set("A")
+
+        win._detect_controller("A")     # pre-refresh lookup hangs
+        win._fetch_contexts()           # ⟳ bumps the generation
+        assert len(launched) == 2
+
+        launched[0]("", "Command not found: kubectl", -1)  # stale, but a real error
+
+        assert statuses[-1] == "kubectl not in PATH"
+        assert len(launched) == 2       # NOT silently redispatched
+        assert win._ctl_pending is None  # unblocked — user is free to retry
+    finally:
+        win.destroy()
+
+
+def test_controller_cache_covers_negative_result(monkeypatch):
+    """A context with no sealed-secrets controller (dev/staging without it
+    installed — exactly the case most likely to be reselected while hunting
+    for the right cluster) must also be cached, not re-listed every time."""
+    win = _make_win()
+    try:
+        calls = []
+        monkeypatch.setattr(app, "run_bg", lambda *a, **k: calls.append(a))
+        win._seal_ctx.set("dev")
+
+        win._detect_controller("dev")
+        assert len(calls) == 1
+        win._got_controller("dev", win._ctl_refresh_gen,
+                           "kube-system\tcoredns\n", "", 0)  # no match
+        assert win._ctl_name.get() == "" and win._ctl_ns.get() == ""
+
+        win._detect_controller("dev")               # re-select — served from cache
+        assert len(calls) == 1                       # no second kubectl call
+        assert win._ctl_name.get() == "" and win._ctl_ns.get() == ""
+    finally:
+        win.destroy()
+
+
+def test_load_template_switching_selection_and_back_still_applies(monkeypatch):
+    """Load A, switch to B and Load (superseding A's in-flight fetch), then
+    switch back to A WITHOUT re-clicking Load. A's result must still apply
+    when it lands — a same-selection-only supersession token (keyed by
+    (ctx, ns, sec), not a single global slot) must not treat a genuinely
+    different selection's dispatch as superseding this one."""
+    pytest.importorskip("yaml")
+    win = _make_win()
+    try:
+        launched = []
+        monkeypatch.setattr(app, "run_bg",
+                            lambda cmd, cb, **k: launched.append(cb))
+        monkeypatch.setattr(win, "after", lambda _ms, fn, *a: fn(*a))
+        win._enc_ctx.set("c"); win._enc_ns.set("n")
+
+        win._enc_sec.set("A"); win._load_template()   # dispatch for A hangs
+        win._enc_sec.set("B"); win._load_template()   # dispatch for B hangs
+        win._enc_sec.set("A")                          # back to A, no re-click
+
+        launched[0]("kind: Secret\ndata:\n  a: YQ==\n", "", 0)  # A lands
+
+        assert win._kv_get_pairs() == {"a": "a"}       # applied, not dropped
+    finally:
+        win.destroy()
+
+
+def test_copy_yaml_and_copy_sealed_have_consistent_trailing_newline():
+    """Copy YAML and Copy Sealed must both hand the clipboard the manifest
+    with exactly one trailing newline — matching Save YAML/Save Sealed's
+    existing "end-1c" convention — rather than the two diverging (one
+    stripped bare, one strip-then-reappended)."""
+    win = _make_win()
+    try:
+        win._set_text(win._yaml_out, "kind: Secret\ndata:\n  a: b\n")
+        assert win._yaml_out.get("1.0", "end-1c") == "kind: Secret\ndata:\n  a: b\n"
+
+        win._sealing = True
+        win._on_sealed("kind: SealedSecret\ndata:\n  a: b\n", "", 0, win._out_gen)
+        assert win._sealed_output() == "kind: SealedSecret\ndata:\n  a: b\n"
     finally:
         win.destroy()

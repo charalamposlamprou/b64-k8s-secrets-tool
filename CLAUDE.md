@@ -104,11 +104,54 @@ for the *same* selection apart (switch prod → staging → prod fast and the
 older prod result could land last, overwriting the newer one or clearing the
 `_ctl_pending` guard while the newer lookup still runs) — the token handles
 that ordering. `_read_file_async` reuses the same tokens so a newer file pick
-supersedes a hung read. New fetch call sites should come through
+supersedes a hung read, and `_load_template` claims a token keyed by
+`("template", ctx, ns, sec)` on top of its `_dispatch_gen` checks, so a
+double-click can't apply the older of two same-selection fetches — keyed by
+selection, not a single global slot, so switching to a different secret and
+back without re-clicking Load doesn't make the still-in-flight original
+fetch land as "superseded" when nothing actually superseded it. New fetch
+call sites should come through
 `_dispatch_latest` rather than hand-rolling the wrapper — it's not the *only*
 place a `self.after` marshal is written (`_dispatch_gen` and `_run_async`
 each write their own), but it's the one built for this per-key-supersession
 shape.
+
+`_ctl_cache` (context → `(ns, name)` or `None`) sits alongside the
+`"controller"` `_dispatch_latest` key: `_detect_controller` checks
+`ctx in self._ctl_cache` (not `.get()`) before dispatching, because a
+context with no sealed-secrets controller caches as the value `None` — a
+context genuinely never looked up is *absent* from the dict, not present
+with a `None` value, and `.get()` can't tell the two apart. A cache hit
+dispatches nothing and needs no token bookkeeping of its own, because
+every landing is guarded where it lands: `_dispatch_latest`'s token drops
+any superseded lookup (each new dispatch claims afresh, so whichever
+landing populated the cache was dispatched after — and thereby superseded
+— every earlier same-context lookup, including ones still in flight), and
+`_got_controller`'s `ctx != self._seal_ctx.get()` check drops
+cross-context stragglers. The cache is invalidated by the ⟳ refresh
+(`_invalidate_ctl_cache`, called from `_fetch_contexts`), which clears the
+dict and bumps `_ctl_refresh_gen` together (never one without the other —
+that's the whole point of having them share one method) — a lookup
+dispatched before the refresh captures the pre-bump generation as
+`ctl_gen`, and `_got_controller` checks it on landing, but only for a
+successful (`rc == 0`) result: a mismatch there means a ⟳ happened
+meanwhile, so the found/not-found ANSWER is discarded entirely (not
+shown, not cached — showing a stale answer in the fields would be just as
+wrong as caching it, since Seal/Validate read those fields directly) and
+`_detect_controller` is called again for a fresh one, with a `_status`
+line so the wait isn't silent. An `rc != 0` result is reported
+unconditionally regardless of `ctl_gen`, staleness or not — an error
+carries no controller DATA for the gate to protect, and discarding it the
+same way would leave a persistently unreachable cluster retrying forever
+with no explanation ever shown. Discarding a stale answer only pays the
+extra round-trip in the (rare) case a landing actually goes stale — ⟳
+itself stays a cheap dict-clear-and-bump, not a forced `get svc -A` for
+the current context on every click. There's no per-context or TTL
+invalidation, so a controller reinstalled under a different name/namespace
+in an already-cached context reads stale until ⟳ (and even then, only
+once that context is reselected — the ⟳ won't proactively pick it up
+until it does, and only self-corrects sooner if a lookup happens to
+already be in flight when ⟳ is clicked).
 
 A background op that's about to *replace all KV rows* (`_read_editor_file`,
 `_got_template`) needs a THIRD check beyond `_out_gen`: `_kv_edit_gen`, bumped
@@ -137,18 +180,16 @@ Loading/importing a secret populates three parallel pieces of state:
 verbatim), `_tpl_carry` (labels/annotations/`immutable` carried through from
 the source doc, via `core.secret_carryover`), and `_tpl_skipped` (count of
 malformed metadata fields dropped rather than silently corrupted). The
-row-replacement choke points own the reset: `_kv_set_pairs(pairs, binary=…)`
-installs the binary passthrough and zeroes carry/skipped — `_kv_clear` is
-just `_kv_set_pairs([])`, not a separate reset — and `_set_secret_identity`
-assigns the newly loaded doc's
-carry/skipped right after (`_apply_secret_doc` relies on that ordering — rows
-first, then identity). Don't reset the trio caller-side; pass `binary=` to
-the choke point instead. One sharp edge remains: the identity-only load
-(`_apply_identity_only`) replaces no rows, so it bypasses the choke points —
-it drops the previous secret's passthrough via `_kv_drop_binary` and then
-sets identity. When adding a fourth piece of per-secret state, wire it into
-`_kv_set_pairs`/`_kv_clear` the same way, and check the identity-only path
-separately.
+reset has a single owner, `_reset_secret_state(binary=…)`, reached from both
+paths a new secret can enter the editor by: the row-replacement choke point
+`_kv_set_pairs(pairs, binary=…)` (`_kv_clear` is just `_kv_set_pairs([])`,
+not a separate reset), and the identity-only load (`_apply_identity_only`,
+which replaces no rows and instead resets via `_kv_drop_binary`). In both,
+`_set_secret_identity` assigns the newly loaded doc's carry/skipped right
+after (rows/reset first, then identity — `_apply_secret_doc` relies on that
+ordering). Don't reset the trio caller-side; pass `binary=` to the choke
+point instead. When adding a fourth piece of per-secret state, add it to
+`_reset_secret_state` and both paths get it structurally.
 
 ### Status messaging
 

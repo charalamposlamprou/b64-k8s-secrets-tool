@@ -529,3 +529,38 @@ def test_build_secret_yaml_emits_carryover():
     doc = yaml.safe_load(core.build_secret_yaml("s", "prod", {"K": "v"}))
     assert "labels" not in doc["metadata"]
     assert "immutable" not in doc
+
+
+def test_yaml_scalar_escapes_control_chars_and_unicode_breaks():
+    # Raw C0/C1 controls aren't YAML-printable (the document fails to parse),
+    # and YAML 1.1 reads NEL/LS/PS as line breaks — folded to spaces on
+    # reparse, silently corrupting the value. All must leave as escapes and
+    # round-trip byte-exact.
+    assert core.yaml_scalar("a\x07b") == '"a\\x07b"'
+    assert core.yaml_scalar("a\x85b") == '"a\\x85b"'
+    assert core.yaml_scalar("a\u2028b") == '"a\\u2028b"'
+    for v in ("bell\x07", "nel\x85nel", "ls\u2028ls", "ps\u2029ps", "del\x7f"):
+        assert yaml.safe_load(core.yaml_scalar(v)) == v
+
+
+def test_secret_entries_coerces_non_string_keys():
+    # Hand-authored YAML can carry a numeric key (`123:`), which PyYAML
+    # parses as an int. It must come out as a string: a non-str key kept in
+    # the binary passthrough would reach yaml_scalar at Generate time and
+    # crash (re.match rejects non-strings).
+    b64 = base64.b64encode(b"\xff\xfe").decode()
+    assert core.secret_entries({"data": {123: b64},
+                                "stringData": {456: "x"}}) == [
+        ("123", b64, "binary"), ("456", "x", "text")]
+    out = core.build_secret_yaml("n", "ns", {}, raw_data={"123": b64})
+    assert yaml.safe_load(out)["data"]["123"] == b64
+
+
+def test_write_secret_file_writes_utf8_regardless_of_locale(tmp_path):
+    # The locale default (cp1252 on Windows, ASCII under LC_ALL=C) would
+    # raise UnicodeEncodeError mid-write on non-ASCII content, killing the
+    # writer thread with a truncated file on disk and no error surfaced —
+    # the write must be explicit UTF-8, mirroring _read_file_async's read.
+    p = tmp_path / "secret.yaml"
+    core.write_secret_file(str(p), "password: café\n")
+    assert p.read_bytes() == "password: café\n".encode("utf-8")
