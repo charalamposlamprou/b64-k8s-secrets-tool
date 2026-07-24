@@ -24,7 +24,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "ruff",
+    # Pinned exactly: `ruff check .` is a merge gate AND the release job's
+    # lint step, so an unpinned ruff floating to a version with a stricter
+    # default rule set breaks releases on code that passed review against
+    # an older ruff — which is exactly what happened once. Bump this
+    # deliberately (and fix any new findings in the same PR), never let it
+    # drift silently.
+    "ruff==0.15.18",
 ]
 
 [tool.setuptools]
