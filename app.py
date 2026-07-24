@@ -1991,7 +1991,10 @@ class App(tk.Tk):
         every write: YAML_H_MIN while empty so the resting layout isn't mostly
         void, growing with the content up to YAML_H_MAX, beyond which it
         scrolls."""
-        lines = int(self._yaml_out.index("end-1c").split(".")[0])
+        # splitlines(), not the "end-1c" line number: the YAML ends in a
+        # newline, and Tk counts the empty line after it, which would size the
+        # pane one row taller than its content and show a blank trailing row.
+        lines = len(self._yaml_out.get("1.0", "end-1c").splitlines())
         self._yaml_out.configure(
             height=max(YAML_H_MIN, min(lines, YAML_H_MAX)))
 

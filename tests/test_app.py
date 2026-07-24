@@ -920,9 +920,13 @@ def test_yaml_pane_sizes_to_content():
 
         win._kv_set_pairs([("A", "1")])
         win._gen_yaml()
-        lines = int(win._yaml_out.index("end-1c").split(".")[0])
+        # Content lines, not Tk's "end-1c" line number: the YAML ends in a
+        # newline and Tk counts the empty line after it, so sizing off that
+        # would leave a blank trailing row in the pane.
+        lines = len(win._yaml_out.get("1.0", "end-1c").splitlines())
         assert app.YAML_H_MIN < lines <= app.YAML_H_MAX  # grew, no clamping
         assert win._yaml_out.cget("height") == lines
+        assert int(win._yaml_out.index("end-1c").split(".")[0]) == lines + 1
 
         # Past the ceiling the pane stops growing and scrolls instead.
         win._kv_set_pairs([(f"K{i}", str(i)) for i in range(app.YAML_H_MAX)])
