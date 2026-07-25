@@ -6,6 +6,9 @@ tests in test_core.py can't reach. Skips when there is no usable display
 (e.g. CI without Xvfb); run under `xvfb-run` to exercise it headlessly.
 """
 
+import threading
+import time
+
 import pytest
 
 tk = pytest.importorskip("tkinter")
@@ -1008,6 +1011,30 @@ def test_encode_tab_spanned_cells_fit_their_columns():
         assert app.App._natural_width(btns) > 1
     finally:
         win.destroy()
+
+
+def test_run_bg_drops_its_result_when_the_app_is_gone(monkeypatch):
+    """Every run_bg caller marshals back with self.after(), which raises once
+    the interpreter is torn down. Closing the window during an in-flight
+    kubectl fetch would otherwise surface as a "main thread is not in main
+    loop" traceback out of the daemon thread — twice, since the except clause
+    calls back in turn."""
+    caught = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: caught.append(args))
+    delivered = threading.Event()
+
+    def callback(out, err, rc):
+        delivered.set()
+        raise tk.TclError("application has been destroyed")   # what after() does
+
+    app.run_bg(["echo", "hi"], callback)
+    assert delivered.wait(10), "callback never ran"
+    for _ in range(200):            # let the worker finish past the callback
+        if not any(t.name.startswith("Thread-") and t.is_alive()
+                   for t in threading.enumerate()):
+            break
+        time.sleep(0.01)
+    assert caught == [], f"escaped the worker thread: {caught}"
 
 
 def test_seal_tab_rows_share_one_grid():

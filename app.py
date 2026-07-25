@@ -168,19 +168,35 @@ WARN_DURATION_MS = 10000
 # ---------------------------------------------------------------------------
 
 def run_bg(cmd: list, callback, stdin_data: str = None, timeout: int = 15):
+    def deliver(out, err, rc):
+        """Hand the result back, dropping it if the app is already gone.
+
+        Callers marshal to the UI thread with self.after(), which raises once
+        the interpreter has been torn down: closing the window while a kubectl
+        fetch is in flight otherwise prints a "main thread is not in main loop"
+        traceback from this daemon thread — and then again from the except
+        clause below, which calls back in turn. Same guard _run_async has.
+        Narrow on purpose: every caller's callback only marshals, so nothing
+        here can swallow a failure in the landing handler, which runs later on
+        the UI thread."""
+        try:
+            callback(out, err, rc)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _worker():
         try:
             p = subprocess.run(
                 cmd, input=stdin_data, capture_output=True,
                 text=True, timeout=timeout,
             )
-            callback(p.stdout, p.stderr, p.returncode)
+            deliver(p.stdout, p.stderr, p.returncode)
         except FileNotFoundError:
-            callback("", f"Command not found: {cmd[0]}", -1)
+            deliver("", f"Command not found: {cmd[0]}", -1)
         except subprocess.TimeoutExpired:
-            callback("", "Command timed out", -2)
+            deliver("", "Command timed out", -2)
         except Exception as exc:
-            callback("", str(exc), -99)
+            deliver("", str(exc), -99)
     threading.Thread(target=_worker, daemon=True).start()
 
 
