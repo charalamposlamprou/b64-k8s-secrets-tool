@@ -909,6 +909,138 @@ def test_identity_only_binary_drop_uses_warning_severity():
         win.destroy()
 
 
+def test_encode_tab_columns_align_across_both_grids():
+    """The Encode tab's aligned rows live in two grids (the KV editor sits
+    between them and can't share their columns), so nothing makes their
+    columns agree except _align_cols. It has to pin BOTH grids to the same
+    label column and the same rail column — and the rail's minsize has to
+    include the cells' padx, or the grid whose own content is widest sizes its
+    column to button+padx while the other hands its button RAIL_PADX less,
+    giving a rail that shares a right edge but not a width."""
+    win = _make_win()
+    try:
+        g = win._load_btn.master          # File + cluster rows
+        g2 = win._sec_name.master         # Generate row
+        assert g is not g2
+
+        for col in (0, 7):
+            assert (g.columnconfigure(col, "minsize")
+                    == g2.columnconfigure(col, "minsize") != 0)
+        # Column 6 is the only one that may absorb slack, in both grids, so
+        # widening the window grows the fields and never the rail.
+        for f in (g, g2):
+            assert f.columnconfigure(6, "weight") == 1
+            assert all(f.columnconfigure(c, "weight") == 0
+                       for c in (0, 1, 2, 3, 4, 5, 7))
+
+        rail = [g.grid_slaves(row=0, column=7)[0],       # Clear
+                g.grid_slaves(row=1, column=7)[0],       # Load Template
+                g2.grid_slaves(row=0, column=7)[0]]      # Generate YAML
+        assert win._load_btn in rail
+        for b in rail:
+            assert b.grid_info()["sticky"] == "ew"  # stretch to the shared width
+        assert (g.columnconfigure(7, "minsize")
+                == max(b.winfo_reqwidth() for b in rail) + app.RAIL_PADX)
+    finally:
+        win.destroy()
+
+
+def test_encode_tab_shares_the_outer_columns_and_pins_the_rest():
+    """Only the leading-label and rail columns are shared. Sharing every
+    column instead makes each one as wide as the widest label in EITHER grid,
+    so "NS:" sits in a cell sized for "Namespace:" and its combo starts a dead
+    gap away — the columns between the outer two belong to their own row.
+
+    Every column still gets a minsize from its own grid, though: without one,
+    a window narrower than the grid squeezes whichever column carries the
+    weight down to nothing (a 2px-wide combobox) while the rest keep full
+    width, and the page canvas has no horizontal scroll to reach it."""
+    win = _make_win()
+    try:
+        g, g2 = win._load_btn.master, win._sec_name.master
+        for col in app.SHARED_COLS:
+            assert (g.columnconfigure(col, "minsize")
+                    == g2.columnconfigure(col, "minsize") != 0), col
+        for f in (g, g2):
+            # Columns holding a widget of their own. An empty column (g2 has
+            # no ⟳) legitimately stays 0 and takes no width.
+            occupied = {int(w.grid_info()["column"]) for w in f.grid_slaves()
+                        if int(w.grid_info()["columnspan"]) == 1}
+            assert occupied
+            assert all(f.columnconfigure(c, "minsize") for c in occupied)
+        # Exactly one column may carry weight. With several, the file row's
+        # spanned cells make the two grids hand out slack differently and they
+        # drift apart as the window widens.
+        weighted = [c for c in range(8) if g.columnconfigure(c, "weight")]
+        assert weighted == [app.SLACK_COL] == [
+            c for c in range(8) if g2.columnconfigure(c, "weight")]
+    finally:
+        win.destroy()
+
+
+def test_encode_tab_spanned_cells_fit_their_columns():
+    """A cell spanning several columns constrains none of them individually,
+    but it still has to fit: grid clips the overflow, and a clipped widget is
+    mapped and half-drawn rather than missing — it renders "Impor" for
+    "Import Secret…" and passes any is-it-visible check. _align_cols has to
+    widen the columns a span crosses until they add up.
+
+    The width also has to come from the span's CHILDREN: these sub-frames pack
+    their contents, and a packed frame reports a 1px requested width until Tk
+    processes idle events, which has not happened while the tab is being
+    built."""
+    win = _make_win()
+    try:
+        g, g2 = win._load_btn.master, win._sec_name.master
+        spans = [(f, w) for f in (g, g2) for w in f.grid_slaves()
+                 if int(w.grid_info()["columnspan"]) > 1]
+        assert spans, "expected the file row's path label and button pair"
+        for f, w in spans:
+            info = w.grid_info()
+            cols = range(int(info["column"]),
+                         int(info["column"]) + int(info["columnspan"]))
+            have = sum(f.columnconfigure(c, "minsize") for c in cols)
+            assert have >= app.App._natural_width(w) + app.App._cell_padx(w)
+
+        # The button pair specifically: measured from the frame itself it
+        # would come out as 1px and its buttons would be clipped.
+        btns = next(w for f, w in spans if w.winfo_children())
+        assert app.App._natural_width(btns) > 1
+    finally:
+        win.destroy()
+
+
+def test_encode_tab_min_width_fits_its_columns():
+    """Every column is pinned, so nothing can be squeezed to absorb a window
+    narrower than the grid: the page canvas has no horizontal scroll, so the
+    rail would simply be clipped off the right edge. The window's floor has to
+    cover the columns plus the chrome around them — and must still fit inside
+    the default geometry, or the app opens wider than it asks to."""
+    win = _make_win()
+    try:
+        g, g2 = win._load_btn.master, win._sec_name.master
+        need = max(sum(f.columnconfigure(c, "minsize") for c in range(8))
+                   for f in (g, g2))
+        min_w = win.minsize()[0]
+
+        # The floor has to cover the columns AND the page's own overhead —
+        # the tab frame's padding plus the scrollbar the canvas gives up.
+        # Measured from those widgets, so this fails if the overhead stops
+        # being counted; asserting against the same constant the code adds
+        # would pass even at zero.
+        page = win._nb.nametowidget(win._nb.select())      # the tab frame
+        canvas = [w for w in page.winfo_children()
+                  if w.winfo_class() == "Canvas"][0]
+        inner = canvas.winfo_children()[0]                 # the padded content
+        sb = [w for w in page.winfo_children()
+              if w.winfo_class() == "TScrollbar"][0]
+        pad = int(str(inner.cget("padding")[0])) * 2       # left + right
+        assert min_w >= need + pad + sb.winfo_reqwidth()
+        assert min_w <= app.DEFAULT_W, (min_w, app.DEFAULT_W)
+    finally:
+        win.destroy()
+
+
 def test_yaml_pane_sizes_to_content():
     """The YAML pane can't expand=True inside the scrollable page canvas, so
     _fit_yaml_out sets its height explicitly: YAML_H_MIN while empty (so the
