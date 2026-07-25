@@ -94,17 +94,22 @@ YAML_H_MAX = 18
 # with the sizing code.
 RAIL_PADX = 6
 
-# The Encode-grid columns that absorb slack, so widening the window grows the
-# file path (which spans column 1) and the secret/type field — not the empty
-# space between them. Weighting column 6 alone left the path clamped at 210px
-# at every width while the gap beside it grew to 1050px at 1800px wide.
+# The Encode-grid columns that absorb slack. Weighting column 6 alone left the
+# file path clamped at 210px at EVERY width while the gap beside it grew to
+# 1050px at 1800px wide; adding column 1, which the path spans, splits what a
+# wider window adds between the path and the secret/type field. The gap still
+# takes a share — the file row's buttons are pinned right (sticky="e") across
+# columns 4-6, so column 6's growth lands between the path and them: from
+# 880px to 1800px the path gains ~460px and the gap the other ~460px.
 #
-# Both grids must weight the SAME set: that is what keeps the rail's column
-# starting at one x, since everything left of it then totals the same in each.
-# (An earlier revision allowed only one weighted column, from back when every
-# column was shared across both grids and an uneven split moved the middle
-# fields too; with only SHARED_COLS held in common that no longer applies.)
-# The widths requested below are floors, not final sizes.
+# What keeps the rail at one x is NOT this set: it is that the rail's column
+# is last and carries no weight, so it keeps the minsize both grids share and
+# sits flush against the same right edge in each. Weight it instead and the
+# rail breaks even though both grids weight identically. Keep every weighted
+# column left of it. (An earlier revision allowed only ONE weighted column,
+# from when every column was shared across both grids and an uneven split
+# moved the middle fields too; with only SHARED_COLS in common that no longer
+# applies.) The widths requested below are floors, not final sizes.
 SLACK_COLS = (1, 6)
 
 # The Encode-grid columns held in common by both grids: the leading label and
@@ -120,10 +125,13 @@ SLACK_COLS = (1, 6)
 # grid exists to remove.
 SHARED_COLS = (0, 7)
 
-# The Seal grid's stretching column (its right-hand field). That tab's rows are
-# contiguous, so they all live in one grid and need no shared columns — a grid
-# lines up its own.
-SEAL_SLACK_COLS = (4,)
+# The Seal grid's stretching columns. Column 1 carries the cert path (clamped
+# to width=1, so it clips rather than shoving the buttons) for the same reason
+# column 1 is weighted on the Encode tab: without it a long path stayed 268px
+# at every width while column 4's slack piled up as dead space to the right of
+# ✕ — 1203px of it at 1800px wide. That tab's rows are contiguous, so they all
+# live in one grid and need no shared columns; a grid lines up its own.
+SEAL_SLACK_COLS = (1, 4)
 
 # Default window size. The width is a constant because the Encode grid's
 # minimum has to stay inside it — see test_encode_tab_min_width_fits_its_columns.
