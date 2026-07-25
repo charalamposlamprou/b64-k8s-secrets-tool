@@ -920,17 +920,26 @@ def test_yaml_pane_sizes_to_content():
 
         win._kv_set_pairs([("A", "1")])
         win._gen_yaml()
-        # Content lines, not Tk's "end-1c" line number: the YAML ends in a
-        # newline and Tk counts the empty line after it, so sizing off that
-        # would leave a blank trailing row in the pane.
-        lines = len(win._yaml_out.get("1.0", "end-1c").splitlines())
+        # DISPLAY lines, which is what height is measured in: the YAML ends in
+        # a newline and Tk's mandatory final newline renders one more line than
+        # the content has. Sizing to the content count instead leaves that row
+        # out of view, and a pane that overflows keeps _on_wheel from
+        # delegating the wheel to the page (asserted below).
+        lines = int(win._yaml_out.index("end-1c").split(".")[0])
         assert app.YAML_H_MIN < lines <= app.YAML_H_MAX  # grew, no clamping
+        # height == total display lines means the pane shows all of them and so
+        # reports yview() == (0.0, 1.0); that's what keeps _on_wheel delegating
+        # the wheel to the page instead of scrolling the pane. Asserted
+        # structurally rather than via yview(), which needs update_idletasks()
+        # — unsafe this deep into a suite that has built and torn down many
+        # App() instances in one process.
         assert win._yaml_out.cget("height") == lines
-        assert int(win._yaml_out.index("end-1c").split(".")[0]) == lines + 1
 
-        # Past the ceiling the pane stops growing and scrolls instead.
+        # Past the ceiling the pane stops growing and scrolls itself instead.
         win._kv_set_pairs([(f"K{i}", str(i)) for i in range(app.YAML_H_MAX)])
         win._gen_yaml()
+        over = int(win._yaml_out.index("end-1c").split(".")[0])
+        assert over > app.YAML_H_MAX  # genuinely overflows, by design
         assert win._yaml_out.cget("height") == app.YAML_H_MAX
 
         win._invalidate_outputs()  # clearing returns it to the resting height

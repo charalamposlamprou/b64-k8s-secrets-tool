@@ -1991,10 +1991,16 @@ class App(tk.Tk):
         every write: YAML_H_MIN while empty so the resting layout isn't mostly
         void, growing with the content up to YAML_H_MAX, beyond which it
         scrolls."""
-        # splitlines(), not the "end-1c" line number: the YAML ends in a
-        # newline, and Tk counts the empty line after it, which would size the
-        # pane one row taller than its content and show a blank trailing row.
-        lines = len(self._yaml_out.get("1.0", "end-1c").splitlines())
+        # height is in DISPLAY lines, which is what "end-1c"'s line number
+        # counts. A Tk Text always holds a mandatory final newline, so YAML
+        # ending in "\n" renders one more display line than it has content
+        # lines. Sizing to the content count instead (splitlines()) looks like
+        # it removes a blank trailing row, but it leaves that row out of view,
+        # so the pane permanently reports overflow — and _on_wheel's
+        # `yview() != (0.0, 1.0)` guard then stops delegating the wheel to the
+        # page, so scrolling over the pane no longer scrolls the tab. The
+        # trailing row is Tk's, not dead space this can reclaim.
+        lines = int(self._yaml_out.index("end-1c").split(".")[0])
         self._yaml_out.configure(
             height=max(YAML_H_MIN, min(lines, YAML_H_MAX)))
 
