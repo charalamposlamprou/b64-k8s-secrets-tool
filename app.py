@@ -128,9 +128,12 @@ SHARED_COLS = (0, 7)
 # The Seal grid's stretching columns. Column 1 carries the cert path (clamped
 # to width=1, so it clips rather than shoving the buttons) for the same reason
 # column 1 is weighted on the Encode tab: without it a long path stayed 268px
-# at every width while column 4's slack piled up as dead space to the right of
-# ✕ — 1203px of it at 1800px wide. That tab's rows are contiguous, so they all
-# live in one grid and need no shared columns; a grid lines up its own.
+# at every width while column 4's slack became dead space — 1203px of it at
+# 1800px wide. The cert buttons are pinned east in that span, so what column 4
+# adds now opens up between the path and Browse… rather than past ✕, exactly
+# as column 6 behaves on the Encode tab. That tab's rows are contiguous, so
+# they all live in one grid and need no shared columns; a grid lines up its
+# own.
 SEAL_SLACK_COLS = (1, 4)
 
 # Default window size. The width is a constant because the Encode grid's
@@ -1448,11 +1451,17 @@ class App(tk.Tk):
         self._cert_lbl = ttk.Label(sg, text="(none)", style="Dim.TLabel",
                                    anchor="w", width=1)
         self._cert_lbl.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=3)
+        # Pinned right (sticky="e"), flush with the row above's NS: field and
+        # with the Encode tab's file buttons. Left-aligned they sat mid-row
+        # with the slack behind them as dead space, since column 4 stretches.
         cr = ttk.Frame(sg)
-        cr.grid(row=2, column=2, columnspan=3, sticky="w", padx=(6, 0), pady=3)
+        cr.grid(row=2, column=2, columnspan=3, sticky="e", padx=(6, 0), pady=3)
         ttk.Button(cr, text="Browse…", command=self._browse_cert).pack(side="left")
+        # No trailing pad on the last button: symmetric padx would end the
+        # frame 3px past it, so the frame would sit flush with the NS: field
+        # above while the button you actually see fell 3px short of it.
         ttk.Button(cr, text="✕", style="Icon.TButton", width=2,
-                   command=self._clear_cert).pack(side="left", padx=3)
+                   command=self._clear_cert).pack(side="left", padx=(3, 0))
         self._cert = ""
 
         need = (self._align_cols((sg,), SEAL_SLACK_COLS)

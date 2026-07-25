@@ -1109,8 +1109,8 @@ def test_seal_tab_rows_share_one_grid():
         weighted = [c for c in range(5) if sg.columnconfigure(c, "weight")]
         assert weighted == list(app.SEAL_SLACK_COLS)
         # The cert path's column has to be one of them, or a long path clips
-        # at its minimum forever while the slack piles up as dead space right
-        # of ✕ — 268px of path against 1203px of it at 1800px wide.
+        # at its minimum forever while the slack becomes dead space beside it
+        # — 268px of path against 1203px of gap at 1800px wide.
         assert int(win._cert_lbl.grid_info()["column"]) in app.SEAL_SLACK_COLS
         occupied = {int(w.grid_info()["column"]) for w in sg.grid_slaves()
                     if int(w.grid_info()["columnspan"]) == 1}
@@ -1129,6 +1129,10 @@ def test_seal_tab_rows_share_one_grid():
         # The buttons' spanned cell has to fit the columns it crosses.
         span = next(w for w in sg.grid_slaves()
                     if int(w.grid_info()["columnspan"]) > 1)
+        # …and sits at the right of it, flush with the NS: field above. Left
+        # aligned it floated mid-row, because the column it ends in stretches
+        # and all that slack opened up behind it.
+        assert span.grid_info()["sticky"] == "e"
         cols = range(int(span.grid_info()["column"]),
                      int(span.grid_info()["column"])
                      + int(span.grid_info()["columnspan"]))
