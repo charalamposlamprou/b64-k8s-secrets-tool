@@ -664,7 +664,8 @@ class App(tk.Tk):
         # joined by "=". (The malformed-metadata warning lives in the shared
         # window chrome — see _build_status_bar — so it shows on every tab.)
         # Header text is FG, not ACCENT: the accent marks the primary action on
-        # a row (Encode →, Generate YAML, Seal →) and the section headings, so
+        # a row (Encode →, Generate YAML, Decode →, Seal →) and the section
+        # headings, so
         # spending it on a column header too would leave it meaning nothing.
         # Bold on BG3 already reads as a header. Same for the Decode table.
         kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
@@ -1165,24 +1166,31 @@ class App(tk.Tk):
         ttk.Label(p, text="Single Value Decoder", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
-        # Buttons packed right-first so they stay visible; the entry fills the gap.
-        r = ttk.Frame(p); r.pack(fill="x", pady=2)
-        ttk.Button(r, text="Decode →", command=self._sv_decode) \
-            .pack(side="right", padx=(6, 0))
-        self._dv_in = ttk.Entry(r, font=(MONO, SZ))
-        self._dv_in.pack(side="left", fill="x", expand=True)
+        # Both rows share ONE grid, mirroring the Encode tab's encoder: the two
+        # entries sit in the same column so they end on a common edge, and the
+        # row with fewer buttons spans the spare column so the rows end
+        # together too. Packed separately the entries ended 131px apart, which
+        # read as a misaligned pair.
+        dv = ttk.Frame(p); dv.pack(fill="x")
+        dv.columnconfigure(0, weight=1)
+        self._dv_in = ttk.Entry(dv, font=(MONO, SZ))
+        self._dv_in.grid(row=0, column=0, sticky="ew", pady=2)
         self._dv_in.bind("<Return>", lambda _: self._sv_decode())
+        ttk.Button(dv, text="Decode →", style="Accent.TButton",
+                   command=self._sv_decode) \
+            .grid(row=0, column=1, columnspan=2, sticky="ew", padx=(6, 0),
+                  pady=2)
 
-        r2 = ttk.Frame(p); r2.pack(fill="x", pady=2)
         self._dv_var = tk.StringVar()
-        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._dv_var.get())) \
-            .pack(side="right", padx=(6, 0))
         self._dv_shown = False
-        self._dv_tog = ttk.Button(r2, text="Show", command=self._toggle_dv)
-        self._dv_tog.pack(side="right", padx=(6, 0))
-        self._dv_out = ttk.Entry(r2, textvariable=self._dv_var, font=(MONO, SZ),
+        self._dv_out = ttk.Entry(dv, textvariable=self._dv_var, font=(MONO, SZ),
                                  state="readonly", show="•")
-        self._dv_out.pack(side="left", fill="x", expand=True)
+        self._dv_out.grid(row=1, column=0, sticky="ew", pady=2)
+        self._dv_tog = ttk.Button(dv, text="Show", command=self._toggle_dv)
+        self._dv_tog.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=2)
+        ttk.Button(dv, text="Copy",
+                   command=lambda: self._clip(self._dv_var.get())) \
+            .grid(row=1, column=2, sticky="ew", padx=(6, 0), pady=2)
 
         if not PYYAML_OK:
             ttk.Label(p, text="⚠  PyYAML not installed — YAML decode table disabled",
