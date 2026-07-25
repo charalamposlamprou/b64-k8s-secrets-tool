@@ -117,6 +117,11 @@ SLACK_COL = 6
 # grid exists to remove.
 SHARED_COLS = (0, 7)
 
+# The Seal grid's stretching column (its right-hand field). That tab's rows are
+# contiguous, so they all live in one grid and need no shared columns — a grid
+# lines up its own.
+SEAL_SLACK_COL = 4
+
 # Default window size. The width is a constant because the Encode grid's
 # minimum has to stay inside it — see test_encode_tab_min_width_fits_its_columns.
 # With all columns pinned there is nothing left to squeeze, so a window
@@ -659,8 +664,9 @@ class App(tk.Tk):
         # joined by "=". (The malformed-metadata warning lives in the shared
         # window chrome — see _build_status_bar — so it shows on every tab.)
         # Header text is FG, not ACCENT: the accent marks the primary action on
-        # a row (Encode →, Generate YAML, Seal →) and the section headings, so
-        # spending it on a column header too would leave it meaning nothing.
+        # a row (Encode →, Generate YAML, Decode →, Seal →) and the section
+        # headings, so spending it on a column header too would leave it
+        # meaning nothing.
         # Bold on BG3 already reads as a header. Same for the Decode table.
         kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
         tk.Label(kv_hdr, text="Key", bg=BG3, fg=FG, width=22, anchor="w",
@@ -715,7 +721,8 @@ class App(tk.Tk):
         # every column pinned there is nothing left to squeeze, and the page
         # canvas has no horizontal scroll, so a narrower window would just
         # clip the rail off the right edge. Raise the window's floor to fit.
-        need = self._align_cols((g, g2)) + self._page_chrome(p)
+        need = (self._align_cols((g, g2), SLACK_COL, SHARED_COLS)
+                + self._page_chrome(p))
         self.minsize(max(self.minsize()[0], need), self.minsize()[1])
 
         # YAML output — explicit height (never expand=True) so the scrollable
@@ -1159,24 +1166,31 @@ class App(tk.Tk):
         ttk.Label(p, text="Single Value Decoder", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
-        # Buttons packed right-first so they stay visible; the entry fills the gap.
-        r = ttk.Frame(p); r.pack(fill="x", pady=2)
-        ttk.Button(r, text="Decode →", command=self._sv_decode) \
-            .pack(side="right", padx=(6, 0))
-        self._dv_in = ttk.Entry(r, font=(MONO, SZ))
-        self._dv_in.pack(side="left", fill="x", expand=True)
+        # Both rows share ONE grid, mirroring the Encode tab's encoder: the two
+        # entries sit in the same column so they end on a common edge, and the
+        # row with fewer buttons spans the spare column so the rows end
+        # together too. Packed separately the entries ended 131px apart, which
+        # read as a misaligned pair.
+        dv = ttk.Frame(p); dv.pack(fill="x")
+        dv.columnconfigure(0, weight=1)
+        self._dv_in = ttk.Entry(dv, font=(MONO, SZ))
+        self._dv_in.grid(row=0, column=0, sticky="ew", pady=2)
         self._dv_in.bind("<Return>", lambda _: self._sv_decode())
+        ttk.Button(dv, text="Decode →", style="Accent.TButton",
+                   command=self._sv_decode) \
+            .grid(row=0, column=1, columnspan=2, sticky="ew", padx=(6, 0),
+                  pady=2)
 
-        r2 = ttk.Frame(p); r2.pack(fill="x", pady=2)
         self._dv_var = tk.StringVar()
-        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._dv_var.get())) \
-            .pack(side="right", padx=(6, 0))
         self._dv_shown = False
-        self._dv_tog = ttk.Button(r2, text="Show", command=self._toggle_dv)
-        self._dv_tog.pack(side="right", padx=(6, 0))
-        self._dv_out = ttk.Entry(r2, textvariable=self._dv_var, font=(MONO, SZ),
+        self._dv_out = ttk.Entry(dv, textvariable=self._dv_var, font=(MONO, SZ),
                                  state="readonly", show="•")
-        self._dv_out.pack(side="left", fill="x", expand=True)
+        self._dv_out.grid(row=1, column=0, sticky="ew", pady=2)
+        self._dv_tog = ttk.Button(dv, text="Show", command=self._toggle_dv)
+        self._dv_tog.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=2)
+        ttk.Button(dv, text="Copy",
+                   command=lambda: self._clip(self._dv_var.get())) \
+            .grid(row=1, column=2, sticky="ew", padx=(6, 0), pady=2)
 
         if not PYYAML_OK:
             ttk.Label(p, text="⚠  PyYAML not installed — YAML decode table disabled",
@@ -1346,43 +1360,67 @@ class App(tk.Tk):
         ttk.Label(p, text="Seal Kubernetes Secret", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
-        cs = ttk.Frame(p); cs.pack(fill="x", pady=2)
-        ttk.Label(cs, text="Context:").pack(side="left")
+        # Context / controller / cert share one grid, so each row's label sits
+        # on a common left edge and each row's field starts at a common x.
+        # Packed row by row they started at 81, 134 and 123 — a 53px spread.
+        # One grid is enough here (unlike the Encode tab, where the KV editor
+        # splits the rows into two), so nothing has to be shared across frames:
+        # a grid already lines up its own columns. SEAL_SLACK_COL is the only
+        # weighted one, so a wider window grows the right-hand field and
+        # nothing else.
+        sg = ttk.Frame(p); sg.pack(fill="x")
+
+        ttk.Label(sg, text="Context:").grid(row=0, column=0, sticky="w", pady=3)
         self._seal_ctx = tk.StringVar()
-        self._seal_ctx_cb = ttk.Combobox(cs, textvariable=self._seal_ctx, width=20,
+        self._seal_ctx_cb = ttk.Combobox(sg, textvariable=self._seal_ctx, width=20,
                                          state="readonly")
         self._seal_ctx_cb.bind("<<ComboboxSelected>>", self._on_seal_ctx_change)
-        self._seal_ctx_cb.pack(side="left", padx=(4, 4))
+        self._seal_ctx_cb.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=3)
         # Re-read kubeconfig: picks up a context for a cluster created after the
         # app started, without a restart.
-        ttk.Button(cs, text="⟳", style="Icon.TButton", width=2,
-                   command=self._fetch_contexts).pack(side="left", padx=(0, 14))
-        ttk.Label(cs, text="Scope:").pack(side="left")
+        ttk.Button(sg, text="⟳", style="Icon.TButton", width=2,
+                   command=self._fetch_contexts) \
+            .grid(row=0, column=2, padx=3, pady=3)
+        ttk.Label(sg, text="Scope:").grid(row=0, column=3, sticky="w",
+                                          padx=(6, 0), pady=3)
         self._seal_scope = tk.StringVar(value="strict")
-        ttk.Combobox(cs, textvariable=self._seal_scope, width=16, state="readonly",
+        ttk.Combobox(sg, textvariable=self._seal_scope, width=16, state="readonly",
                      values=["strict", "namespace-wide", "cluster-wide"]) \
-            .pack(side="left", padx=(4, 0))
+            .grid(row=0, column=4, sticky="ew", padx=(6, 0), pady=3)
 
         # Controller name / namespace — auto-detected from the cluster and shown
         # read-only (no manual entry; they refresh when the context changes).
-        ctl = ttk.Frame(p); ctl.pack(fill="x", pady=(6, 2))
-        ttk.Label(ctl, text="Controller name:").pack(side="left")
-        self._ctl_name = ttk.Entry(ctl, width=28, font=(MONO, SZ),
+        ttk.Label(sg, text="Controller name:").grid(row=1, column=0, sticky="w",
+                                                    pady=3)
+        self._ctl_name = ttk.Entry(sg, width=28, font=(MONO, SZ),
                                    state="readonly", style="RO.TEntry")
-        self._ctl_name.pack(side="left", padx=(4, 12))
-        ttk.Label(ctl, text="NS:").pack(side="left")
-        self._ctl_ns = ttk.Entry(ctl, width=16, font=(MONO, SZ),
-                                  state="readonly", style="RO.TEntry")
-        self._ctl_ns.pack(side="left", padx=(4, 0))
+        self._ctl_name.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=3)
+        ttk.Label(sg, text="NS:").grid(row=1, column=3, sticky="w",
+                                       padx=(6, 0), pady=3)
+        self._ctl_ns = ttk.Entry(sg, width=16, font=(MONO, SZ),
+                                 state="readonly", style="RO.TEntry")
+        self._ctl_ns.grid(row=1, column=4, sticky="ew", padx=(6, 0), pady=3)
 
-        cr = ttk.Frame(p); cr.pack(fill="x", pady=(6, 2))
-        ttk.Label(cr, text="Cert (optional):").pack(side="left")
-        self._cert_lbl = ttk.Label(cr, text="(none)", style="Dim.TLabel")
-        self._cert_lbl.pack(side="left", padx=6)
+        # The path gets its own cell, width=1 so a long one clips instead of
+        # growing: packed in the same cell as the buttons it pushed them past
+        # the cell's right edge, where Tk stops mapping them — Browse… and ✕
+        # both vanished, and ✕ is the only way to clear a wrong cert before
+        # sealing. Same reason the Encode tab's file path is clamped.
+        ttk.Label(sg, text="Cert (optional):").grid(row=2, column=0, sticky="w",
+                                                    pady=3)
+        self._cert_lbl = ttk.Label(sg, text="(none)", style="Dim.TLabel",
+                                   anchor="w", width=1)
+        self._cert_lbl.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=3)
+        cr = ttk.Frame(sg)
+        cr.grid(row=2, column=2, columnspan=3, sticky="w", padx=(6, 0), pady=3)
         ttk.Button(cr, text="Browse…", command=self._browse_cert).pack(side="left")
         ttk.Button(cr, text="✕", style="Icon.TButton", width=2,
                    command=self._clear_cert).pack(side="left", padx=3)
         self._cert = ""
+
+        need = (self._align_cols((sg,), SEAL_SLACK_COL)
+                + self._page_chrome(p))
+        self.minsize(max(self.minsize()[0], need), self.minsize()[1])
 
         sr = ttk.Frame(p); sr.pack(fill="x", pady=10)
         self._seal_btn = ttk.Button(sr, text="⊙  Seal →", style="Accent.TButton",
@@ -2086,7 +2124,16 @@ class App(tk.Tk):
         rather than hardcoded: a theme with a fatter scrollbar or a change to
         the tab padding would otherwise leave the window's minimum short, and
         the rail — the rightmost thing on the tab — clips first."""
-        pad = cls._padx_total({"padx": inner.cget("padding")[:1] or 0})
+        # ttk reports padding as one value, "x y", or "l t r b", and as a
+        # tuple on some builds and a string on others — take the horizontal
+        # components whichever it is. Slicing it as a sequence happens to work
+        # on a tuple and silently yields 2px from the string "10".
+        raw = inner.cget("padding")
+        parts = [int(str(v)) for v in
+                 (raw if isinstance(raw, (list, tuple)) else str(raw).split())]
+        pad = (0 if not parts
+               else parts[0] + parts[2] if len(parts) > 2
+               else 2 * parts[0])
         sb = [w for w in inner.master.master.winfo_children()
               if isinstance(w, ttk.Scrollbar)]
         return pad + (sb[0].winfo_reqwidth() if sb else 0)
@@ -2117,17 +2164,22 @@ class App(tk.Tk):
                    for c, i in zip(kids, info))
 
     @classmethod
-    def _align_cols(cls, frames):
+    def _align_cols(cls, frames, slack_col, shared_cols=()):
         """Pin `frames`' columns. Returns the width the widest of them needs.
 
-        The rows that should line up are split across two grids (the KV editor
-        sits between them and can't share their columns — see
-        _build_encode_tab), and a column's width is otherwise local to its own
-        grid. Every column gets a minsize from its OWN grid's content, and
-        SHARED_COLS additionally take the widest value across all the frames —
-        those are the two that read as misaligned when they disagree. Sharing
-        the rest as well would size each column to the widest label in either
-        grid, leaving the shorter ones a dead gap from their field.
+        `slack_col` is the single column allowed to absorb a window wider than
+        the minimum; `shared_cols` are held in common across `frames` and is
+        empty when a tab's rows all fit in one grid, which aligns its own
+        columns anyway.
+
+        A column's width is local to its own grid, so when a tab's rows are
+        split across two (the Encode tab's KV editor sits between them and
+        can't share their columns) they line up only if told to. Every column
+        gets a minsize from its OWN grid's content, and `shared_cols`
+        additionally take the widest value across all the frames — those are
+        the ones that read as misaligned when they disagree. Sharing the rest
+        as well would size each column to the widest label in either grid,
+        leaving the shorter ones a dead gap from their field.
 
         Widths come from the widgets (winfo_reqwidth() is what a widget asks
         for, available before it is mapped, so no update() is needed) plus the
@@ -2161,19 +2213,19 @@ class App(tk.Tk):
                     # All of it goes to one column, and preferably the one
                     # that already stretches. Spreading it evenly would widen
                     # the label columns in the span too, putting "Secret:" a
-                    # gap from its combo — the defect SHARED_COLS exists to
+                    # gap from its combo — the defect shared_cols exists to
                     # avoid, reintroduced from the other direction.
-                    grow = SLACK_COL if SLACK_COL in cols else max(cols)
+                    grow = slack_col if slack_col in cols else max(cols)
                     need[grow] = need.get(grow, 0) + short
             per_frame.append(need)
 
-        # Only SHARED_COLS are held in common. Sharing every column instead
+        # Only shared_cols are held in common. Sharing every column instead
         # sounds tidier and looks worse: a column would take the width of the
         # widest label in EITHER grid, so "NS:" would sit in a cell sized for
         # "Namespace:" and its combo would start a dead gap away from it. The
-        # two that must line up are the leading label and the rail; the
+        # ones that must line up are the leading label and the rail; the
         # columns between them belong to their own row's content.
-        for col in SHARED_COLS:
+        for col in shared_cols:
             shared = max(n.get(col, 0) for n in per_frame)
             for n in per_frame:
                 n[col] = shared
@@ -2183,7 +2235,7 @@ class App(tk.Tk):
         for f, need in zip(frames, per_frame):
             for col, width in need.items():
                 f.columnconfigure(col, minsize=width)
-            f.columnconfigure(SLACK_COL, weight=1)
+            f.columnconfigure(slack_col, weight=1)
         return max(sum(n.values()) for n in per_frame)
 
     def _fit_yaml_out(self):
