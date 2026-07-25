@@ -117,15 +117,6 @@ SLACK_COL = 6
 # grid exists to remove.
 SHARED_COLS = (0, 7)
 
-# Window chrome around the Encode tab's grid: notebook/frame padding plus the
-# page canvas's scrollbar. Added to the grid's own requirement to get the
-# window's minimum width (see _build_encode_tab). Measured at 20px — the
-# narrowest window that fits the grid is exactly its columns plus this — with
-# a few px of headroom, and asserted against the real widgets in
-# test_encode_tab_min_width_fits_its_columns so a theme change can't silently
-# make it a lie.
-PAGE_CHROME = 24
-
 # Default window size. The width is a constant because the Encode grid's
 # minimum has to stay inside it — see test_encode_tab_min_width_fits_its_columns.
 # With all columns pinned there is nothing left to squeeze, so a window
@@ -724,9 +715,8 @@ class App(tk.Tk):
         # every column pinned there is nothing left to squeeze, and the page
         # canvas has no horizontal scroll, so a narrower window would just
         # clip the rail off the right edge. Raise the window's floor to fit.
-        need = self._align_cols((g, g2))
-        self.minsize(max(self.minsize()[0], need + PAGE_CHROME),
-                     self.minsize()[1])
+        need = self._align_cols((g, g2)) + self._page_chrome(p)
+        self.minsize(max(self.minsize()[0], need), self.minsize()[1])
 
         # YAML output — explicit height (never expand=True) so the scrollable
         # page has a definite size; an expanding pane would fight the canvas for
@@ -2087,6 +2077,21 @@ class App(tk.Tk):
         return cls._padx_total(widget.grid_info())
 
     @classmethod
+    def _page_chrome(cls, inner):
+        """Width a scrollable page costs around its content.
+
+        The tab's content sits in a padded frame inside the page canvas, and
+        the canvas gives up room to its scrollbar, so the window has to be
+        that much wider than the grid itself. Derived from those widgets
+        rather than hardcoded: a theme with a fatter scrollbar or a change to
+        the tab padding would otherwise leave the window's minimum short, and
+        the rail — the rightmost thing on the tab — clips first."""
+        pad = cls._padx_total({"padx": inner.cget("padding")[:1] or 0})
+        sb = [w for w in inner.master.master.winfo_children()
+              if isinstance(w, ttk.Scrollbar)]
+        return pad + (sb[0].winfo_reqwidth() if sb else 0)
+
+    @classmethod
     def _natural_width(cls, widget):
         """The width a widget needs to draw in full.
 
@@ -2096,33 +2101,41 @@ class App(tk.Tk):
         so trusting it there silently sizes such a frame to nothing and the
         buttons inside get clipped. Measure the children instead; calling
         update_idletasks() during construction would be the alternative and is
-        not worth the risk this deep in a Tk app."""
+        not worth the risk this deep in a Tk app.
+
+        Only children packed side by side are summed. Anything else — a child
+        laid out by grid or place, or stacked vertically — falls back to the
+        widget's own request rather than guessing: pack_info() would raise on
+        the former, and summing would over-measure the latter."""
         kids = widget.winfo_children()
-        if not kids:
+        if not kids or any(c.winfo_manager() != "pack" for c in kids):
             return widget.winfo_reqwidth()
-        return sum(c.winfo_reqwidth() + cls._padx_total(c.pack_info())
-                   for c in kids)
+        info = [c.pack_info() for c in kids]
+        if any(i.get("side") not in ("left", "right") for i in info):
+            return widget.winfo_reqwidth()
+        return sum(c.winfo_reqwidth() + cls._padx_total(i)
+                   for c, i in zip(kids, info))
 
     @classmethod
     def _align_cols(cls, frames):
-        """Give `frames` one shared set of columns. Returns the width they need.
+        """Pin `frames`' columns. Returns the width the widest of them needs.
 
         The rows that should line up are split across two grids (the KV editor
         sits between them and can't share their columns — see
         _build_encode_tab), and a column's width is otherwise local to its own
-        grid. So EVERY column gets pinned to the widest cell in that column
-        across all the frames, not just the label and rail columns: pinning
-        only the outer two leaves the fields between them at whatever width
-        each grid's own content happens to give — which is the very
-        misalignment this method exists to remove, just moved from row-vs-row
-        to grid-vs-grid.
+        grid. Every column gets a minsize from its OWN grid's content, and
+        SHARED_COLS additionally take the widest value across all the frames —
+        those are the two that read as misaligned when they disagree. Sharing
+        the rest as well would size each column to the widest label in either
+        grid, leaving the shorter ones a dead gap from their field.
 
         Widths come from the widgets (winfo_reqwidth() is what a widget asks
         for, available before it is mapped, so no update() is needed) plus the
         cell's own padding, so this follows the platform font instead of a
-        hardcoded guess. Spanning cells are skipped — they define no single
-        column's width. sticky="ew" then stretches each cell to the shared
-        width, which is what equalises the rail buttons."""
+        hardcoded guess. Spanning cells define no single column's width, so
+        they set none, but they must still fit across the columns they cross
+        and widen them if they don't. sticky="ew" then stretches each cell to
+        its column, which is what equalises the rail buttons."""
         per_frame = []
         for f in frames:
             need, spans = {}, []
@@ -2145,10 +2158,13 @@ class App(tk.Tk):
                 cols = range(col, col + span)
                 short = want - sum(need.get(c, 0) for c in cols)
                 if short > 0:
-                    each, rem = divmod(short, span)
-                    for i, c in enumerate(cols):
-                        need[c] = (need.get(c, 0) + each
-                                   + (rem if i == span - 1 else 0))
+                    # All of it goes to one column, and preferably the one
+                    # that already stretches. Spreading it evenly would widen
+                    # the label columns in the span too, putting "Secret:" a
+                    # gap from its combo — the defect SHARED_COLS exists to
+                    # avoid, reintroduced from the other direction.
+                    grow = SLACK_COL if SLACK_COL in cols else max(cols)
+                    need[grow] = need.get(grow, 0) + short
             per_frame.append(need)
 
         # Only SHARED_COLS are held in common. Sharing every column instead

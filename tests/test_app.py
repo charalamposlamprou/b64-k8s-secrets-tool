@@ -1018,10 +1018,24 @@ def test_encode_tab_min_width_fits_its_columns():
     the default geometry, or the app opens wider than it asks to."""
     win = _make_win()
     try:
-        g = win._load_btn.master
-        need = sum(g.columnconfigure(c, "minsize") for c in range(8))
+        g, g2 = win._load_btn.master, win._sec_name.master
+        need = max(sum(f.columnconfigure(c, "minsize") for c in range(8))
+                   for f in (g, g2))
         min_w = win.minsize()[0]
-        assert min_w >= need + app.PAGE_CHROME
+
+        # The floor has to cover the columns AND the page's own overhead —
+        # the tab frame's padding plus the scrollbar the canvas gives up.
+        # Measured from those widgets, so this fails if the overhead stops
+        # being counted; asserting against the same constant the code adds
+        # would pass even at zero.
+        page = win._nb.nametowidget(win._nb.select())      # the tab frame
+        canvas = [w for w in page.winfo_children()
+                  if w.winfo_class() == "Canvas"][0]
+        inner = canvas.winfo_children()[0]                 # the padded content
+        sb = [w for w in page.winfo_children()
+              if w.winfo_class() == "TScrollbar"][0]
+        pad = int(str(inner.cget("padding")[0])) * 2       # left + right
+        assert min_w >= need + pad + sb.winfo_reqwidth()
         assert min_w <= app.DEFAULT_W, (min_w, app.DEFAULT_W)
     finally:
         win.destroy()
