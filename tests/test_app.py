@@ -1013,28 +1013,60 @@ def test_encode_tab_spanned_cells_fit_their_columns():
         win.destroy()
 
 
-def test_run_bg_drops_its_result_when_the_app_is_gone(monkeypatch):
+def _run_bg_and_wait(cmd, callback, timeout=10):
+    """Drive run_bg to completion, returning anything its thread let escape."""
+    caught, done = [], threading.Event()
+    hook = threading.excepthook
+
+    def record(args):
+        caught.append(args)
+
+    def wrapped(out, err, rc):
+        try:
+            callback(out, err, rc)
+        finally:
+            done.set()
+
+    threading.excepthook = record
+    try:
+        app.run_bg(cmd, wrapped)
+        assert done.wait(timeout), "callback never ran"
+        time.sleep(0.2)             # let the worker unwind past the callback
+    finally:
+        threading.excepthook = hook
+    return caught
+
+
+def test_run_bg_drops_its_result_when_the_app_is_gone(capsys):
     """Every run_bg caller marshals back with self.after(), which raises once
     the interpreter is torn down. Closing the window during an in-flight
     kubectl fetch would otherwise surface as a "main thread is not in main
-    loop" traceback out of the daemon thread — twice, since the except clause
-    calls back in turn."""
-    caught = []
-    monkeypatch.setattr(threading, "excepthook", lambda args: caught.append(args))
-    delivered = threading.Event()
-
+    loop" traceback out of the daemon thread."""
     def callback(out, err, rc):
-        delivered.set()
         raise tk.TclError("application has been destroyed")   # what after() does
 
-    app.run_bg(["echo", "hi"], callback)
-    assert delivered.wait(10), "callback never ran"
-    for _ in range(200):            # let the worker finish past the callback
-        if not any(t.name.startswith("Thread-") and t.is_alive()
-                   for t in threading.enumerate()):
-            break
-        time.sleep(0.01)
+    caught = _run_bg_and_wait(["echo", "hi"], callback)
     assert caught == [], f"escaped the worker thread: {caught}"
+    # Dropped, but not in silence: after() raises the same way in a LIVE app
+    # before the mainloop runs, and there the landing really is lost.
+    assert "background result dropped" in capsys.readouterr().err
+
+
+def test_run_bg_delivers_once_even_if_the_callback_raises():
+    """deliver() must sit outside the worker's try. Inside it, a callback
+    raising anything but the pair deliver() guards falls into `except
+    Exception` and delivers a SECOND time with a fabricated rc=-99 — landing a
+    real result and then a spurious error over it, which for a seal would
+    overwrite the pane and re-toggle _sealing."""
+    calls = []
+
+    def callback(out, err, rc):
+        calls.append(rc)
+        raise ValueError("landing blew up")   # NOT one of the guarded pair
+
+    caught = _run_bg_and_wait(["echo", "hi"], callback)
+    assert calls == [0], f"delivered {len(calls)}x: {calls}"
+    assert [c.exc_type for c in caught] == [ValueError]  # surfaced, not reused
 
 
 def test_seal_tab_rows_share_one_grid():
