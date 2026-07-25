@@ -1010,6 +1010,41 @@ def test_encode_tab_spanned_cells_fit_their_columns():
         win.destroy()
 
 
+def test_seal_tab_rows_share_one_grid():
+    """The Seal tab's rows are contiguous, so one grid aligns them and no
+    cross-frame sharing is needed — but only while they stay in that one grid.
+    Split them back into a frame per row (which is how they started, fields at
+    81/134/123) and each row's columns go back to being sized by that row
+    alone, with nothing to line them up."""
+    win = _make_win()
+    try:
+        sg = win._seal_ctx_cb.master
+        # Every leading label, and every first field, in the same grid.
+        for w in (win._ctl_name, win._ctl_ns):
+            assert w.master is sg
+        col0 = [sg.grid_slaves(row=r, column=0)[0] for r in range(3)]
+        assert {w.cget("text") for w in col0} == {
+            "Context:", "Controller name:", "Cert (optional):"}
+
+        weighted = [c for c in range(5) if sg.columnconfigure(c, "weight")]
+        assert weighted == [app.SEAL_SLACK_COL]
+        occupied = {int(w.grid_info()["column"]) for w in sg.grid_slaves()
+                    if int(w.grid_info()["columnspan"]) == 1}
+        assert all(sg.columnconfigure(c, "minsize") for c in occupied)
+
+        # The cert row packs its path label and buttons into one spanned cell;
+        # it has to fit the columns it crosses or its buttons render clipped.
+        span = next(w for w in sg.grid_slaves()
+                    if int(w.grid_info()["columnspan"]) > 1)
+        cols = range(int(span.grid_info()["column"]),
+                     int(span.grid_info()["column"])
+                     + int(span.grid_info()["columnspan"]))
+        assert (sum(sg.columnconfigure(c, "minsize") for c in cols)
+                >= app.App._natural_width(span) + app.App._cell_padx(span))
+    finally:
+        win.destroy()
+
+
 def test_encode_tab_min_width_fits_its_columns():
     """Every column is pinned, so nothing can be squeezed to absorb a window
     narrower than the grid: the page canvas has no horizontal scroll, so the
