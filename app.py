@@ -94,15 +94,23 @@ YAML_H_MAX = 18
 # with the sizing code.
 RAIL_PADX = 6
 
-# The one Encode-grid column allowed to absorb slack, so a window wider than
-# the minimum grows that field and nothing else. Only ONE column may carry
-# weight: the file row's spanned cells (path label, button pair) make grid
-# hand out extra space differently in that grid than in the Generate grid, so
-# with several weighted columns the two drift apart as the window widens —
-# measurably, from ~1000px up — which is the very misalignment _align_cols
-# exists to prevent. With a single weighted column they stay in lockstep at
-# every width. The widths requested below are floors, not final sizes.
-SLACK_COL = 6
+# The Encode-grid columns that absorb slack. Weighting column 6 alone left the
+# file path clamped at 210px at EVERY width while the gap beside it grew to
+# 1050px at 1800px wide; adding column 1, which the path spans, splits what a
+# wider window adds between the path and the secret/type field. The gap still
+# takes a share — the file row's buttons are pinned right (sticky="e") across
+# columns 4-6, so column 6's growth lands between the path and them: from
+# 880px to 1800px the path gains ~460px and the gap the other ~460px.
+#
+# What keeps the rail at one x is NOT this set: it is that the rail's column
+# is last and carries no weight, so it keeps the minsize both grids share and
+# sits flush against the same right edge in each. Weight it instead and the
+# rail breaks even though both grids weight identically. Keep every weighted
+# column left of it. (An earlier revision allowed only ONE weighted column,
+# from when every column was shared across both grids and an uneven split
+# moved the middle fields too; with only SHARED_COLS in common that no longer
+# applies.) The widths requested below are floors, not final sizes.
+SLACK_COLS = (1, 6)
 
 # The Encode-grid columns held in common by both grids: the leading label and
 # the action rail. Those are what read as misaligned when they disagree. The
@@ -117,10 +125,13 @@ SLACK_COL = 6
 # grid exists to remove.
 SHARED_COLS = (0, 7)
 
-# The Seal grid's stretching column (its right-hand field). That tab's rows are
-# contiguous, so they all live in one grid and need no shared columns — a grid
-# lines up its own.
-SEAL_SLACK_COL = 4
+# The Seal grid's stretching columns. Column 1 carries the cert path (clamped
+# to width=1, so it clips rather than shoving the buttons) for the same reason
+# column 1 is weighted on the Encode tab: without it a long path stayed 268px
+# at every width while column 4's slack piled up as dead space to the right of
+# ✕ — 1203px of it at 1800px wide. That tab's rows are contiguous, so they all
+# live in one grid and need no shared columns; a grid lines up its own.
+SEAL_SLACK_COLS = (1, 4)
 
 # Default window size. The width is a constant because the Encode grid's
 # minimum has to stay inside it — see test_encode_tab_min_width_fits_its_columns.
@@ -747,7 +758,7 @@ class App(tk.Tk):
         # every column pinned there is nothing left to squeeze, and the page
         # canvas has no horizontal scroll, so a narrower window would just
         # clip the rail off the right edge. Raise the window's floor to fit.
-        need = (self._align_cols((g, g2), SLACK_COL, SHARED_COLS)
+        need = (self._align_cols((g, g2), SLACK_COLS, SHARED_COLS)
                 + self._page_chrome(p))
         self.minsize(max(self.minsize()[0], need), self.minsize()[1])
 
@@ -1391,9 +1402,9 @@ class App(tk.Tk):
         # Packed row by row they started at 81, 134 and 123 — a 53px spread.
         # One grid is enough here (unlike the Encode tab, where the KV editor
         # splits the rows into two), so nothing has to be shared across frames:
-        # a grid already lines up its own columns. SEAL_SLACK_COL is the only
-        # weighted one, so a wider window grows the right-hand field and
-        # nothing else.
+        # a grid already lines up its own columns. Only SEAL_SLACK_COLS carry
+        # weight, so a wider window grows the right-hand field and nothing
+        # else.
         sg = ttk.Frame(p); sg.pack(fill="x")
 
         ttk.Label(sg, text="Context:").grid(row=0, column=0, sticky="w", pady=3)
@@ -1444,7 +1455,7 @@ class App(tk.Tk):
                    command=self._clear_cert).pack(side="left", padx=3)
         self._cert = ""
 
-        need = (self._align_cols((sg,), SEAL_SLACK_COL)
+        need = (self._align_cols((sg,), SEAL_SLACK_COLS)
                 + self._page_chrome(p))
         self.minsize(max(self.minsize()[0], need), self.minsize()[1])
 
@@ -2190,13 +2201,14 @@ class App(tk.Tk):
                    for c, i in zip(kids, info))
 
     @classmethod
-    def _align_cols(cls, frames, slack_col, shared_cols=()):
+    def _align_cols(cls, frames, slack_cols, shared_cols=()):
         """Pin `frames`' columns. Returns the width the widest of them needs.
 
-        `slack_col` is the single column allowed to absorb a window wider than
-        the minimum; `shared_cols` are held in common across `frames` and is
-        empty when a tab's rows all fit in one grid, which aligns its own
-        columns anyway.
+        `slack_cols` absorb a window wider than the minimum, and must be the
+        same for every frame so that everything left of the rail totals the
+        same in each and the rail lands at one x. `shared_cols` are held in
+        common across `frames`, and is empty when a tab's rows all fit in one
+        grid, which aligns its own columns anyway.
 
         A column's width is local to its own grid, so when a tab's rows are
         split across two (the Encode tab's KV editor sits between them and
@@ -2241,7 +2253,13 @@ class App(tk.Tk):
                     # the label columns in the span too, putting "Secret:" a
                     # gap from its combo — the defect shared_cols exists to
                     # avoid, reintroduced from the other direction.
-                    grow = slack_col if slack_col in cols else max(cols)
+                    # Rightmost stretchy column in the span, or the span's
+                    # last if none stretches. Which one only matters when a
+                    # span crosses several — no span does today — and the
+                    # rightmost keeps the widening on the side the spanned
+                    # cell's own content grows toward.
+                    stretchy = [c for c in cols if c in slack_cols]
+                    grow = stretchy[-1] if stretchy else max(cols)
                     need[grow] = need.get(grow, 0) + short
             per_frame.append(need)
 
@@ -2261,7 +2279,8 @@ class App(tk.Tk):
         for f, need in zip(frames, per_frame):
             for col, width in need.items():
                 f.columnconfigure(col, minsize=width)
-            f.columnconfigure(slack_col, weight=1)
+            for col in slack_cols:
+                f.columnconfigure(col, weight=1)
         return max(sum(n.values()) for n in per_frame)
 
     def _fit_yaml_out(self):
