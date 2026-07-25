@@ -665,8 +665,8 @@ class App(tk.Tk):
         # window chrome — see _build_status_bar — so it shows on every tab.)
         # Header text is FG, not ACCENT: the accent marks the primary action on
         # a row (Encode →, Generate YAML, Decode →, Seal →) and the section
-        # headings, so
-        # spending it on a column header too would leave it meaning nothing.
+        # headings, so spending it on a column header too would leave it
+        # meaning nothing.
         # Bold on BG3 already reads as a header. Same for the Decode table.
         kv_hdr = tk.Frame(p, bg=BG3); kv_hdr.pack(fill="x", pady=(8, 0))
         tk.Label(kv_hdr, text="Key", bg=BG3, fg=FG, width=22, anchor="w",
@@ -1401,15 +1401,18 @@ class App(tk.Tk):
                                  state="readonly", style="RO.TEntry")
         self._ctl_ns.grid(row=1, column=4, sticky="ew", padx=(6, 0), pady=3)
 
-        # The cert path and its buttons stay packed together in one cell rather
-        # than taking a column each: they read as a unit, and a column of their
-        # own would set that column's width for the rows above too.
+        # The path gets its own cell, width=1 so a long one clips instead of
+        # growing: packed in the same cell as the buttons it pushed them past
+        # the cell's right edge, where Tk stops mapping them — Browse… and ✕
+        # both vanished, and ✕ is the only way to clear a wrong cert before
+        # sealing. Same reason the Encode tab's file path is clamped.
         ttk.Label(sg, text="Cert (optional):").grid(row=2, column=0, sticky="w",
                                                     pady=3)
+        self._cert_lbl = ttk.Label(sg, text="(none)", style="Dim.TLabel",
+                                   anchor="w", width=1)
+        self._cert_lbl.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=3)
         cr = ttk.Frame(sg)
-        cr.grid(row=2, column=1, columnspan=4, sticky="w", padx=(6, 0), pady=3)
-        self._cert_lbl = ttk.Label(cr, text="(none)", style="Dim.TLabel")
-        self._cert_lbl.pack(side="left", padx=(0, 6))
+        cr.grid(row=2, column=2, columnspan=3, sticky="w", padx=(6, 0), pady=3)
         ttk.Button(cr, text="Browse…", command=self._browse_cert).pack(side="left")
         ttk.Button(cr, text="✕", style="Icon.TButton", width=2,
                    command=self._clear_cert).pack(side="left", padx=3)
@@ -2121,7 +2124,16 @@ class App(tk.Tk):
         rather than hardcoded: a theme with a fatter scrollbar or a change to
         the tab padding would otherwise leave the window's minimum short, and
         the rail — the rightmost thing on the tab — clips first."""
-        pad = cls._padx_total({"padx": inner.cget("padding")[:1] or 0})
+        # ttk reports padding as one value, "x y", or "l t r b", and as a
+        # tuple on some builds and a string on others — take the horizontal
+        # components whichever it is. Slicing it as a sequence happens to work
+        # on a tuple and silently yields 2px from the string "10".
+        raw = inner.cget("padding")
+        parts = [int(str(v)) for v in
+                 (raw if isinstance(raw, (list, tuple)) else str(raw).split())]
+        pad = (0 if not parts
+               else parts[0] + parts[2] if len(parts) > 2
+               else 2 * parts[0])
         sb = [w for w in inner.master.master.winfo_children()
               if isinstance(w, ttk.Scrollbar)]
         return pad + (sb[0].winfo_reqwidth() if sb else 0)
@@ -2160,7 +2172,7 @@ class App(tk.Tk):
         empty when a tab's rows all fit in one grid, which aligns its own
         columns anyway.
 
-A column's width is local to its own grid, so when a tab's rows are
+        A column's width is local to its own grid, so when a tab's rows are
         split across two (the Encode tab's KV editor sits between them and
         can't share their columns) they line up only if told to. Every column
         gets a minsize from its OWN grid's content, and `shared_cols`

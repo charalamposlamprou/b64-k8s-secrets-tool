@@ -1032,8 +1032,17 @@ def test_seal_tab_rows_share_one_grid():
                     if int(w.grid_info()["columnspan"]) == 1}
         assert all(sg.columnconfigure(c, "minsize") for c in occupied)
 
-        # The cert row packs its path label and buttons into one spanned cell;
-        # it has to fit the columns it crosses or its buttons render clipped.
+        # The cert path gets its OWN cell, clamped to width=1 so a long path
+        # clips. Packed into the buttons' cell it pushed them past the cell's
+        # right edge, where Tk stops mapping them: after Browse… with a long
+        # path, Browse… and ✕ both vanished — and ✕ is the only way to clear a
+        # wrong cert before sealing. A default-length "(none)" hides this, so
+        # it is pinned structurally rather than by rendering a long path.
+        assert win._cert_lbl.cget("width") == 1
+        assert win._cert_lbl.master is sg          # its own cell, not the frame
+        assert int(win._cert_lbl.grid_info()["column"]) == 1
+
+        # The buttons' spanned cell has to fit the columns it crosses.
         span = next(w for w in sg.grid_slaves()
                     if int(w.grid_info()["columnspan"]) > 1)
         cols = range(int(span.grid_info()["column"]),
@@ -1069,7 +1078,15 @@ def test_encode_tab_min_width_fits_its_columns():
         inner = canvas.winfo_children()[0]                 # the padded content
         sb = [w for w in page.winfo_children()
               if w.winfo_class() == "TScrollbar"][0]
-        pad = int(str(inner.cget("padding")[0])) * 2       # left + right
+        # ttk gives padding back as a tuple on some builds and a string on
+        # others, as one value, "x y", or "l t r b". Indexing it as a sequence
+        # reads "10" as 1 and understates the padding tenfold, so parse both
+        # forms — the point of this test is that the overhead is really
+        # counted, and it can't be if it's measured wrong here too.
+        raw = inner.cget("padding")
+        parts = [int(str(v)) for v in
+                 (raw if isinstance(raw, (list, tuple)) else str(raw).split())]
+        pad = parts[0] + parts[2] if len(parts) > 2 else 2 * parts[0]
         assert min_w >= need + pad + sb.winfo_reqwidth()
         assert min_w <= app.DEFAULT_W, (min_w, app.DEFAULT_W)
     finally:
