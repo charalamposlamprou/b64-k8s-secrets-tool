@@ -1448,8 +1448,11 @@ class App(tk.Tk):
         self._cert_lbl = ttk.Label(sg, text="(none)", style="Dim.TLabel",
                                    anchor="w", width=1)
         self._cert_lbl.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=3)
+        # Pinned right (sticky="e"), flush with the row above's NS: field and
+        # with the Encode tab's file buttons. Left-aligned they sat mid-row
+        # with the slack behind them as dead space, since column 4 stretches.
         cr = ttk.Frame(sg)
-        cr.grid(row=2, column=2, columnspan=3, sticky="w", padx=(6, 0), pady=3)
+        cr.grid(row=2, column=2, columnspan=3, sticky="e", padx=(6, 0), pady=3)
         ttk.Button(cr, text="Browse…", command=self._browse_cert).pack(side="left")
         ttk.Button(cr, text="✕", style="Icon.TButton", width=2,
                    command=self._clear_cert).pack(side="left", padx=3)

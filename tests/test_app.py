@@ -1129,6 +1129,10 @@ def test_seal_tab_rows_share_one_grid():
         # The buttons' spanned cell has to fit the columns it crosses.
         span = next(w for w in sg.grid_slaves()
                     if int(w.grid_info()["columnspan"]) > 1)
+        # …and sits at the right of it, flush with the NS: field above. Left
+        # aligned it floated mid-row, because the column it ends in stretches
+        # and all that slack opened up behind it.
+        assert span.grid_info()["sticky"] == "e"
         cols = range(int(span.grid_info()["column"]),
                      int(span.grid_info()["column"])
                      + int(span.grid_info()["columnspan"]))
