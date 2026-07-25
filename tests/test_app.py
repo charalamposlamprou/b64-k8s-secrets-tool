@@ -909,6 +909,42 @@ def test_identity_only_binary_drop_uses_warning_severity():
         win.destroy()
 
 
+def test_encode_tab_columns_align_across_both_grids():
+    """The Encode tab's aligned rows live in two grids (the KV editor sits
+    between them and can't share their columns), so nothing makes their
+    columns agree except _align_cols. It has to pin BOTH grids to the same
+    label column and the same rail column — and the rail's minsize has to
+    include the cells' padx, or the grid whose own content is widest sizes its
+    column to button+padx while the other hands its button RAIL_PADX less,
+    giving a rail that shares a right edge but not a width."""
+    win = _make_win()
+    try:
+        g = win._load_btn.master          # File + cluster rows
+        g2 = win._sec_name.master         # Generate row
+        assert g is not g2
+
+        for col in (0, 7):
+            assert (g.columnconfigure(col, "minsize")
+                    == g2.columnconfigure(col, "minsize") != 0)
+        # Column 6 is the only one that may absorb slack, in both grids, so
+        # widening the window grows the fields and never the rail.
+        for f in (g, g2):
+            assert f.columnconfigure(6, "weight") == 1
+            assert all(f.columnconfigure(c, "weight") == 0
+                       for c in (0, 1, 2, 3, 4, 5, 7))
+
+        rail = [g.grid_slaves(row=0, column=7)[0],       # Clear
+                g.grid_slaves(row=1, column=7)[0],       # Load Template
+                g2.grid_slaves(row=0, column=7)[0]]      # Generate YAML
+        assert win._load_btn in rail
+        for b in rail:
+            assert b.grid_info()["sticky"] == "ew"  # stretch to the shared width
+        assert (g.columnconfigure(7, "minsize")
+                == max(b.winfo_reqwidth() for b in rail) + app.RAIL_PADX)
+    finally:
+        win.destroy()
+
+
 def test_yaml_pane_sizes_to_content():
     """The YAML pane can't expand=True inside the scrollable page canvas, so
     _fit_yaml_out sets its height explicitly: YAML_H_MIN while empty (so the

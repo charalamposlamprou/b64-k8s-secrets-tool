@@ -89,6 +89,11 @@ SZ = 11
 YAML_H_MIN = 6
 YAML_H_MAX = 18
 
+# Gap to the left of the Encode tab's right-hand action column. Used both as
+# the rail cells' padx and in _align_cols' minsize; they have to agree, or the
+# rail buttons end up different widths.
+RAIL_PADX = 6
+
 # ---------------------------------------------------------------------------
 # Core logic lives in core.py (pure, no UI) — re-exported here so the rest of
 # the app and the test suite can keep referring to these names.
@@ -508,38 +513,80 @@ class App(tk.Tk):
         ttk.Label(p, text="Single Value Encoder", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
-        # Buttons packed right-first so they stay visible; the entry fills the gap.
+        # Both rows share ONE grid, so the entries end on a common right edge
+        # and Copy — spanning the two button columns — is exactly as wide as
+        # Show + Encode above it. Packed separately (as before) the two rows
+        # ended wherever their own button widths left them, which read as a
+        # misaligned pair. Column 0 carries the weight, so widening the window
+        # grows the entries and never the buttons.
         # The input is the plaintext secret, so mask it by default (like the
         # Decode tab masks its decoded output) with a Show/Hide toggle.
-        r = ttk.Frame(p); r.pack(fill="x", pady=2)
-        ttk.Button(r, text="Encode →", style="Accent.TButton",
-                   command=self._sv_encode) \
-            .pack(side="right", padx=(6, 0))
-        self._sv_in = ttk.Entry(r, font=(MONO, SZ), show="•")
+        # Widgets are created in visual order throughout this method so Tab
+        # follows the layout without any stacking-order fixups.
+        sv = ttk.Frame(p); sv.pack(fill="x")
+        sv.columnconfigure(0, weight=1)
+        self._sv_in = ttk.Entry(sv, font=(MONO, SZ), show="•")
         self._sv_shown = False
-        self._sv_tog = ttk.Button(r, text="Show", command=self._toggle_sv)
-        self._sv_tog.pack(side="right", padx=(6, 0))
-        self._sv_in.pack(side="left", fill="x", expand=True)
+        self._sv_in.grid(row=0, column=0, sticky="ew", pady=2)
         self._sv_in.bind("<Return>", lambda _: self._sv_encode())
+        self._sv_tog = ttk.Button(sv, text="Show", command=self._toggle_sv)
+        self._sv_tog.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=2)
+        ttk.Button(sv, text="Encode →", style="Accent.TButton",
+                   command=self._sv_encode) \
+            .grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=2)
 
-        r2 = ttk.Frame(p); r2.pack(fill="x", pady=2)
-        ttk.Button(r2, text="Copy", command=lambda: self._clip(self._sv_out.get())) \
-            .pack(side="right", padx=(6, 0))
-        self._sv_out = ttk.Entry(r2, font=(MONO, SZ), state="readonly")
-        self._sv_out.pack(side="left", fill="x", expand=True)
+        self._sv_out = ttk.Entry(sv, font=(MONO, SZ), state="readonly")
+        self._sv_out.grid(row=1, column=0, sticky="ew", pady=2)
+        ttk.Button(sv, text="Copy",
+                   command=lambda: self._clip(self._sv_out.get())) \
+            .grid(row=1, column=1, columnspan=2, sticky="ew", padx=(6, 0),
+                  pady=2)
 
         ttk.Separator(p).pack(fill="x", pady=10)
 
         ttk.Label(p, text=".env → Kubernetes Secret YAML", style="Head.TLabel") \
             .pack(anchor="w", pady=(0, 4))
 
-        # file picker — buttons live in a right-pinned sub-frame so a long file
-        # path can't push them off-screen; the path label takes the middle and
-        # clips if too long. The sub-frame keeps Tab order matching the layout.
-        fp = ttk.Frame(p); fp.pack(fill="x", pady=2)
-        ttk.Label(fp, text="File:").pack(side="left")
-        env_btns = ttk.Frame(fp); env_btns.pack(side="right")
-        ttk.Button(env_btns, text="Browse…", command=self._browse_env).pack(side="left")
+        # The File/cluster rows and the Generate row sit in two grids with an
+        # IDENTICAL column scheme, so labels share a left edge (column 0) and
+        # the primary buttons share a right edge and width (the rail, column
+        # 7). Packed row-by-row as before, each row's columns landed wherever
+        # that row's own widths put them. Column 6 carries the weight, so
+        # widening the window grows the fields and never the rail.
+        #
+        # Two grids rather than one spanning the KV editor: a grid sizes its
+        # columns to fit every cell, so putting the KV rows in it (they'd have
+        # to span all 8 columns, sitting as they do between the cluster row and
+        # the Generate row) makes THEIR natural width — much the widest thing
+        # on the tab — the floor for the whole layout, and the window's own
+        # width then squeezes real controls out of existence. _align_cols below
+        # keeps the two grids in step instead.
+        g = ttk.Frame(p); g.pack(fill="x")
+
+        # file picker — the path label is width=1 so a long path can't widen
+        # the columns and push the rail off-screen; it clips instead. (Under
+        # pack this was a right-pinned sub-frame doing the same job.)
+        # Column-0 labels and column-7 rail buttons, collected for _align_cols.
+        col0, rail = [], []
+        col0.append(ttk.Label(g, text="File:"))
+        col0[-1].grid(row=0, column=0, sticky="w", pady=3)
+        self._env_lbl = ttk.Label(g, text="(no file)", style="Dim.TLabel",
+                                  anchor="w", width=1)
+        self._env_lbl.grid(row=0, column=1, columnspan=3, sticky="ew",
+                           padx=6, pady=3)
+        # Spans columns 4-6 instead of sitting in one. In a single column this
+        # pair (~220px) would have demanded more than the combo below it, and
+        # every row's demands add into the SAME columns now — that pushed the
+        # grid's natural width past the window, so grid squeezed the pair below
+        # its request and left Import Secret… unmapped: invisible, and skipped
+        # by Tab. Spread across three columns already at least that wide, it
+        # costs nothing. Keep new widgets off their own private column for the
+        # same reason.
+        env_btns = ttk.Frame(g)
+        env_btns.grid(row=0, column=4, columnspan=3, sticky="e",
+                      padx=(6, 0), pady=3)
+        ttk.Button(env_btns, text="Browse…",
+                   command=self._browse_env).pack(side="left")
         # Import an existing Secret YAML from disk (e.g. one that never made it
         # into the cluster, so Load Template can't fetch it) to edit and re-emit.
         imp_btn = ttk.Button(env_btns, text="Import Secret…",
@@ -547,42 +594,38 @@ class App(tk.Tk):
         if not PYYAML_OK:
             imp_btn.configure(state="disabled")
         imp_btn.pack(side="left", padx=(6, 0))
-        ttk.Button(env_btns, text="Clear", command=self._clear_env) \
-            .pack(side="left", padx=(6, 0))
-        self._env_lbl = ttk.Label(fp, text="(no file)", style="Dim.TLabel", anchor="w")
-        self._env_lbl.pack(side="left", padx=6, fill="x", expand=True)
+        rail.append(ttk.Button(g, text="Clear", command=self._clear_env))
+        rail[-1].grid(row=0, column=7, sticky="ew", padx=(RAIL_PADX, 0),
+                     pady=3)
 
         # cluster fetch row
-        cf = ttk.Frame(p); cf.pack(fill="x", pady=(6, 2))
-        # Pin Load Template to the right (packed first so it reserves the right
-        # edge) so the Context/NS/Secret combos can't push it off-screen; the
-        # Secret combo expands to take the slack between them.
-        self._load_btn = ttk.Button(cf, text="Load Template",
+        col0.append(ttk.Label(g, text="Context:"))
+        col0[-1].grid(row=1, column=0, sticky="w", pady=3)
+        self._ctx_cb = ttk.Combobox(g, textvariable=self._enc_ctx, width=16,
+                                    state="readonly")
+        self._ctx_cb.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=3)
+        self._ctx_cb.bind("<<ComboboxSelected>>", self._on_ctx_change)
+        ttk.Button(g, text="⟳", style="Icon.TButton", width=2,
+                   command=self._fetch_contexts) \
+            .grid(row=1, column=2, padx=3, pady=3)
+        ttk.Label(g, text="NS:").grid(row=1, column=3, sticky="w",
+                                      padx=(6, 0), pady=3)
+        self._ns_cb = ttk.Combobox(g, textvariable=self._enc_ns, width=12,
+                                   state="readonly")
+        self._ns_cb.grid(row=1, column=4, sticky="ew", padx=(6, 0), pady=3)
+        self._ns_cb.bind("<<ComboboxSelected>>", self._on_ns_change)
+        ttk.Label(g, text="Secret:").grid(row=1, column=5, sticky="w",
+                                          padx=(6, 0), pady=3)
+        self._sec_cb = ttk.Combobox(g, textvariable=self._enc_sec, width=16,
+                                    state="readonly")
+        self._sec_cb.grid(row=1, column=6, sticky="ew", padx=(6, 0), pady=3)
+        self._load_btn = ttk.Button(g, text="Load Template",
                                     command=self._load_template)
         if not PYYAML_OK:
             self._load_btn.configure(state="disabled")
-        self._load_btn.pack(side="right", padx=(8, 0))
-
-        ttk.Label(cf, text="Context:").pack(side="left")
-        self._ctx_cb = ttk.Combobox(cf, textvariable=self._enc_ctx, width=16,
-                                    state="readonly")
-        self._ctx_cb.pack(side="left", padx=(4, 0))
-        self._ctx_cb.bind("<<ComboboxSelected>>", self._on_ctx_change)
-        ttk.Button(cf, text="⟳", style="Icon.TButton", width=2,
-                   command=self._fetch_contexts).pack(side="left", padx=3)
-        ttk.Label(cf, text="NS:").pack(side="left", padx=(6, 0))
-        self._ns_cb = ttk.Combobox(cf, textvariable=self._enc_ns, width=12,
-                                   state="readonly")
-        self._ns_cb.pack(side="left", padx=(4, 0))
-        self._ns_cb.bind("<<ComboboxSelected>>", self._on_ns_change)
-        ttk.Label(cf, text="Secret:").pack(side="left", padx=(6, 0))
-        self._sec_cb = ttk.Combobox(cf, textvariable=self._enc_sec, width=16,
-                                    state="readonly")
-        self._sec_cb.pack(side="left", padx=(4, 0), fill="x", expand=True)
-        # Load Template was created first (to reserve the right edge); raise it
-        # to the top of the stacking order so Tab reaches it last — matching its
-        # rightmost visual position rather than its creation order.
-        self._load_btn.lift()
+        self._load_btn.grid(row=1, column=7, sticky="ew",
+                            padx=(RAIL_PADX, 0), pady=3)
+        rail.append(self._load_btn)
 
         # Row-based KV editor — one row per key/value, with a multiline popup
         # (Edit…) for long values like PEM certs or JSON.
@@ -616,31 +659,35 @@ class App(tk.Tk):
         self._kv_rows = []
         self._kv_add_row()  # always keep at least one row
 
-        # Secret name / namespace / type / generate — all on one row. Generate
-        # YAML is pinned right (packed first to reserve the edge) so the fields
-        # can't push it off-screen; the Type combo expands to take the slack.
+        # Secret name / namespace / type / generate — a second grid using the
+        # same column scheme as the first, so its label lands on the same left
+        # edge as File:/Context: and Generate YAML on the same right edge and
+        # width as Clear/Load Template. _align_cols pins the two together.
         # The editable type combo lets you pick a built-in type or enter a
         # custom one; Load Template fills it from the fetched secret.
-        form = ttk.Frame(p); form.pack(fill="x", pady=(6, 2))
-        gen_btn = ttk.Button(form, text="Generate YAML", style="Accent.TButton",
-                             command=self._gen_yaml)
-        gen_btn.pack(side="right", padx=(12, 0))
-        ttk.Label(form, text="Secret name:").pack(side="left")
-        self._sec_name = ttk.Entry(form, width=16, font=(MONO, SZ))
+        g2 = ttk.Frame(p); g2.pack(fill="x", pady=(6, 2))
+        col0.append(ttk.Label(g2, text="Secret name:"))
+        col0[-1].grid(row=0, column=0, sticky="w", pady=3)
+        self._sec_name = ttk.Entry(g2, width=16, font=(MONO, SZ))
         self._sec_name.insert(0, DEF_NAME)
-        self._sec_name.pack(side="left", padx=(6, 12))
-        ttk.Label(form, text="Namespace:").pack(side="left")
-        self._sec_ns_e = ttk.Entry(form, width=10, font=(MONO, SZ))
+        self._sec_name.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=3)
+        ttk.Label(g2, text="Namespace:").grid(row=0, column=3, sticky="w",
+                                              padx=(6, 0), pady=3)
+        self._sec_ns_e = ttk.Entry(g2, width=10, font=(MONO, SZ))
         self._sec_ns_e.insert(0, DEF_NS)
-        self._sec_ns_e.pack(side="left", padx=(6, 12))
-        ttk.Label(form, text="Type:").pack(side="left")
-        self._sec_type = ttk.Combobox(form, width=18, font=(MONO, SZ),
+        self._sec_ns_e.grid(row=0, column=4, sticky="ew", padx=(6, 0), pady=3)
+        ttk.Label(g2, text="Type:").grid(row=0, column=5, sticky="w",
+                                         padx=(6, 0), pady=3)
+        self._sec_type = ttk.Combobox(g2, width=18, font=(MONO, SZ),
                                       values=SECRET_TYPES)
         self._sec_type.set("Opaque")
-        self._sec_type.pack(side="left", padx=(6, 12), fill="x", expand=True)
-        # Generate was created first to pin it right; raise it so Tab reaches it
-        # last (matching its rightmost position) rather than its creation order.
-        gen_btn.lift()
+        self._sec_type.grid(row=0, column=6, sticky="ew", padx=(6, 0), pady=3)
+        rail.append(ttk.Button(g2, text="Generate YAML",
+                               style="Accent.TButton", command=self._gen_yaml))
+        rail[-1].grid(row=0, column=7, sticky="ew", padx=(RAIL_PADX, 0),
+                     pady=3)
+
+        self._align_cols((g, g2), col0, rail)
 
         # YAML output — explicit height (never expand=True) so the scrollable
         # page has a definite size; an expanding pane would fight the canvas for
@@ -1982,6 +2029,32 @@ class App(tk.Tk):
         entry.delete(0, "end")
         entry.insert(0, value)
         entry.configure(state="readonly")
+
+    @staticmethod
+    def _align_cols(frames, col0, rail):
+        """Give `frames` a common label column (0) and action column (7).
+
+        The rows that should line up are split across two grids (the KV editor
+        sits between them and can't share their columns — see
+        _build_encode_tab), and a column's width is otherwise local to its own
+        grid. Pinning both grids' column 0 to the widest label and column 7 to
+        the widest button — measured from the widgets themselves, so it follows
+        the platform font rather than a hardcoded guess — makes the two halves
+        read as one set of columns. sticky="ew" then stretches every rail
+        button to that shared width. winfo_reqwidth() is the size the widget
+        asks for, available before it is mapped, so no update() is needed.
+
+        minsize covers the whole cell, padding included, so the rail's leading
+        padx has to be added in: without it the grid whose own content is
+        widest (Generate YAML, bold) sizes its column to button+padx while the
+        others get exactly minsize and hand their button 6px less — a rail
+        that shares a right edge but not a width."""
+        lbl_w = max(w.winfo_reqwidth() for w in col0)
+        rail_w = max(w.winfo_reqwidth() for w in rail) + RAIL_PADX
+        for f in frames:
+            f.columnconfigure(0, minsize=lbl_w)
+            f.columnconfigure(6, weight=1)   # the only column that absorbs slack
+            f.columnconfigure(7, minsize=rail_w)
 
     def _fit_yaml_out(self):
         """Size the Encode tab's YAML pane to its content.
