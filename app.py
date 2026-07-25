@@ -1394,9 +1394,9 @@ class App(tk.Tk):
         # Packed row by row they started at 81, 134 and 123 — a 53px spread.
         # One grid is enough here (unlike the Encode tab, where the KV editor
         # splits the rows into two), so nothing has to be shared across frames:
-        # a grid already lines up its own columns. SEAL_SLACK_COLS is the only
-        # weighted one, so a wider window grows the right-hand field and
-        # nothing else.
+        # a grid already lines up its own columns. Only SEAL_SLACK_COLS carry
+        # weight, so a wider window grows the right-hand field and nothing
+        # else.
         sg = ttk.Frame(p); sg.pack(fill="x")
 
         ttk.Label(sg, text="Context:").grid(row=0, column=0, sticky="w", pady=3)
@@ -2245,6 +2245,11 @@ class App(tk.Tk):
                     # the label columns in the span too, putting "Secret:" a
                     # gap from its combo — the defect shared_cols exists to
                     # avoid, reintroduced from the other direction.
+                    # Rightmost stretchy column in the span, or the span's
+                    # last if none stretches. Which one only matters when a
+                    # span crosses several — no span does today — and the
+                    # rightmost keeps the widening on the side the spanned
+                    # cell's own content grows toward.
                     stretchy = [c for c in cols if c in slack_cols]
                     grow = stretchy[-1] if stretchy else max(cols)
                     need[grow] = need.get(grow, 0) + short

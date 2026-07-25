@@ -977,9 +977,9 @@ def test_encode_tab_shares_the_outer_columns_and_pins_the_rest():
                         if int(w.grid_info()["columnspan"]) == 1}
             assert occupied
             assert all(f.columnconfigure(c, "minsize") for c in occupied)
-        # Exactly one column may carry weight. With several, the file row's
-        # spanned cells make the two grids hand out slack differently and they
-        # drift apart as the window widens.
+        # Both grids weight the SAME columns. That, not the count, is what
+        # keeps them in step: everything left of the rail then totals the same
+        # in each, so the rail lands at one x however the slack is split.
         weighted = [c for c in range(8) if g.columnconfigure(c, "weight")]
         assert weighted == list(app.SLACK_COLS) == [
             c for c in range(8) if g2.columnconfigure(c, "weight")]
@@ -1026,7 +1026,12 @@ def _run_bg_and_wait(cmd, callback, timeout=10):
     excepthook before the thread dies, so once join() returns, anything that
     escaped has already been recorded. Waiting a fixed interval instead makes
     the result depend on scheduling, and filtering by thread identity keeps an
-    unrelated daemon thread failing in the same window out of the answer."""
+    unrelated daemon thread failing in the same window out of the answer.
+
+    threading.Thread is patched process-wide for that window, and the first
+    thread created is taken as the worker — run_bg is called immediately and
+    these tests build no App, so nothing else is spawning threads; a caller
+    that did would need to capture the worker some other way."""
     caught, started = [], []
     real_thread, hook = threading.Thread, threading.excepthook
 
