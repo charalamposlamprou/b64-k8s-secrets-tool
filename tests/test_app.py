@@ -7,7 +7,6 @@ tests in test_core.py can't reach. Skips when there is no usable display
 """
 
 import threading
-import time
 
 import pytest
 
@@ -929,12 +928,19 @@ def test_encode_tab_columns_align_across_both_grids():
         for col in (0, 7):
             assert (g.columnconfigure(col, "minsize")
                     == g2.columnconfigure(col, "minsize") != 0)
-        # Column 6 is the only one that may absorb slack, in both grids, so
-        # widening the window grows the fields and never the rail.
+        # Both grids weight the SAME columns, which is what keeps the rail at
+        # one x: everything left of it then totals the same in each.
         for f in (g, g2):
-            assert f.columnconfigure(6, "weight") == 1
-            assert all(f.columnconfigure(c, "weight") == 0
-                       for c in (0, 1, 2, 3, 4, 5, 7))
+            assert [c for c in range(8)
+                    if f.columnconfigure(c, "weight")] == list(app.SLACK_COLS)
+
+        # One of them has to fall inside the file path's span, or the path is
+        # clamped at its minimum forever while the gap beside it takes every
+        # pixel a wider window adds (210px of path against a 1050px gap).
+        info = win._env_lbl.grid_info()
+        span = range(int(info["column"]),
+                     int(info["column"]) + int(info["columnspan"]))
+        assert set(span) & set(app.SLACK_COLS), (list(span), app.SLACK_COLS)
 
         rail = [g.grid_slaves(row=0, column=7)[0],       # Clear
                 g.grid_slaves(row=1, column=7)[0],       # Load Template
@@ -975,7 +981,7 @@ def test_encode_tab_shares_the_outer_columns_and_pins_the_rest():
         # spanned cells make the two grids hand out slack differently and they
         # drift apart as the window widens.
         weighted = [c for c in range(8) if g.columnconfigure(c, "weight")]
-        assert weighted == [app.SLACK_COL] == [
+        assert weighted == list(app.SLACK_COLS) == [
             c for c in range(8) if g2.columnconfigure(c, "weight")]
     finally:
         win.destroy()
@@ -1014,27 +1020,31 @@ def test_encode_tab_spanned_cells_fit_their_columns():
 
 
 def _run_bg_and_wait(cmd, callback, timeout=10):
-    """Drive run_bg to completion, returning anything its thread let escape."""
-    caught, done = [], threading.Event()
-    hook = threading.excepthook
+    """Drive run_bg to completion, returning what ITS thread let escape.
 
-    def record(args):
-        caught.append(args)
+    Joins the worker rather than sleeping: threading's bootstrap runs
+    excepthook before the thread dies, so once join() returns, anything that
+    escaped has already been recorded. Waiting a fixed interval instead makes
+    the result depend on scheduling, and filtering by thread identity keeps an
+    unrelated daemon thread failing in the same window out of the answer."""
+    caught, started = [], []
+    real_thread, hook = threading.Thread, threading.excepthook
 
-    def wrapped(out, err, rc):
-        try:
-            callback(out, err, rc)
-        finally:
-            done.set()
+    def capture(*args, **kwargs):
+        t = real_thread(*args, **kwargs)
+        started.append(t)
+        return t
 
-    threading.excepthook = record
+    threading.Thread = capture
+    threading.excepthook = lambda args: caught.append(args)
     try:
-        app.run_bg(cmd, wrapped)
-        assert done.wait(timeout), "callback never ran"
-        time.sleep(0.2)             # let the worker unwind past the callback
+        app.run_bg(cmd, callback)
+        assert started, "run_bg started no worker"
+        started[0].join(timeout)
+        assert not started[0].is_alive(), "worker did not finish"
     finally:
-        threading.excepthook = hook
-    return caught
+        threading.Thread, threading.excepthook = real_thread, hook
+    return [c for c in caught if c.thread is started[0]]
 
 
 def test_run_bg_drops_its_result_when_the_app_is_gone(capsys):
@@ -1086,7 +1096,7 @@ def test_seal_tab_rows_share_one_grid():
             "Context:", "Controller name:", "Cert (optional):"}
 
         weighted = [c for c in range(5) if sg.columnconfigure(c, "weight")]
-        assert weighted == [app.SEAL_SLACK_COL]
+        assert weighted == list(app.SEAL_SLACK_COLS)
         occupied = {int(w.grid_info()["column"]) for w in sg.grid_slaves()
                     if int(w.grid_info()["columnspan"]) == 1}
         assert all(sg.columnconfigure(c, "minsize") for c in occupied)
