@@ -168,19 +168,45 @@ WARN_DURATION_MS = 10000
 # ---------------------------------------------------------------------------
 
 def run_bg(cmd: list, callback, stdin_data: str = None, timeout: int = 15):
+    def deliver(out, err, rc):
+        """Hand the result back, dropping it if the app is already gone.
+
+        Callers marshal to the UI thread with self.after(), which raises once
+        the interpreter has been torn down: closing the window while a kubectl
+        fetch is in flight otherwise prints a "main thread is not in main loop"
+        traceback from this daemon thread. Same guard _run_async has.
+
+        Not silent, though. self.after() also raises RuntimeError in a LIVE app
+        when the mainloop isn't running yet (see the deferred _fetch_contexts
+        in App.__init__), and there the result is genuinely lost: the landing
+        never runs, so whatever it would have cleared — _sealing, _ctl_pending
+        — stays set and the UI wedges under a permanent "Sealing…" with no
+        clue why. One line of diagnosis is cheap; a traceback per dropped
+        result is what this is avoiding."""
+        try:
+            callback(out, err, rc)
+        except (tk.TclError, RuntimeError) as exc:
+            print(f"b64: background result dropped ({exc})", file=sys.stderr)
+
     def _worker():
+        # Exactly one deliver(), outside the try: called inside it, a callback
+        # raising anything but the pair deliver() guards would fall into
+        # `except Exception` and deliver a SECOND time with a fabricated
+        # rc=-99 — landing a real result and then a spurious error over it.
         try:
             p = subprocess.run(
                 cmd, input=stdin_data, capture_output=True,
                 text=True, timeout=timeout,
             )
-            callback(p.stdout, p.stderr, p.returncode)
         except FileNotFoundError:
-            callback("", f"Command not found: {cmd[0]}", -1)
+            res = ("", f"Command not found: {cmd[0]}", -1)
         except subprocess.TimeoutExpired:
-            callback("", "Command timed out", -2)
+            res = ("", "Command timed out", -2)
         except Exception as exc:
-            callback("", str(exc), -99)
+            res = ("", str(exc), -99)
+        else:
+            res = (p.stdout, p.stderr, p.returncode)
+        deliver(*res)
     threading.Thread(target=_worker, daemon=True).start()
 
 
